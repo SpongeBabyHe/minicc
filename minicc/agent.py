@@ -19,10 +19,3 @@ def agent_loop(messages):
                     "tool_use_id": block.id,
                     "content": output})
         messages.append({"role": "user", "content": results})
-
-
-if __name__ == "__main__":
-    user_prompt = str(input())
-    messages = [{"role": "user", "content": user_prompt}]
-    response = agent_loop(messages)
-    print(messages)

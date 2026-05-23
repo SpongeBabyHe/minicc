@@ -12,7 +12,7 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-minicc = "minicc.cli:main"   # wires up M2; for now cli.py can be empty
+minicc = "minicc.cli:main" 
 
 [build-system]
 requires = ["hatchling"]
