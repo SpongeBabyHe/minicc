@@ -1,0 +1,19 @@
+[project]
+name = "minicc"
+version = "0.0.1"
+description = "A tiny coding agent CLI, built for learning."
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+minicc = "minicc.cli:main"   # wires up M2; for now cli.py can be empty
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
