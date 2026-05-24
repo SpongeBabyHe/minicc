@@ -8,5 +8,5 @@ A tiny coding agent CLI — a from-scratch reimplementation of Claude Code's cor
 ```bash
 cp .env.example .env   # add your ANTHROPIC_API_KEY
 pip install -e .
-python -m minicc.agent
+python -m minicc.cli
 ```
