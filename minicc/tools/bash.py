@@ -14,10 +14,9 @@ SCHEMA = {
 
 
 def bash(command: str) -> str:
-    dangerous = []
-    for d in dangerous:
-        if d in command:
-            return f"Dangerous command."
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    if any(d in command for d in dangerous):
+        return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(
             command,

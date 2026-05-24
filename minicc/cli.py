@@ -10,11 +10,7 @@ def main():
             break
         if not query.strip():
             continue
-        if query.strip().lower() in (
-            "q",
-            "exit",
-            "quit",
-        ):
+        if query.strip().lower() in ("q", "exit", "quit",):
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
@@ -23,9 +19,7 @@ def main():
         if isinstance(response_content, list):
             # if the response_content is a list, print the text of each block
             for block in response_content:
-                if hasattr(
-                    block, "text"
-                ):
+                if hasattr(block, "text"):
                     print(block.text)
 
 
