@@ -3,13 +3,14 @@ from dotenv import load_dotenv
 from anthropic import Anthropic
 from pathlib import Path
 from minicc.tools import TOOLS
+from minicc.prompts.system import build_system_prompt
 
 load_dotenv()
 
-WORKDIR = Path.cwd()
+
 MODEL = os.environ["MODEL_ID"]
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-SYSTEM = f"You are a coding agent at {WORKDIR}. "
+SYSTEM = build_system_prompt()
 
 
 def llm_response(messages):

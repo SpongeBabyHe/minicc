@@ -12,6 +12,7 @@ def agent_loop(messages):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                print(f"---> {block.name}({block.input})")
                 handler = TOOL_HANDLERS.get(block.name)
                 if handler is None:
                     output = f"Unknown tool: {block.name}"
