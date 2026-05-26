@@ -2,6 +2,8 @@
 
 A tiny coding agent CLI — a from-scratch reimplementation of Claude Code's core loop, built as a learning project.
 
+See [PAIN.md](./PAIN.md) for known issues and dogfood observations.
+
 
 ## Run
 
