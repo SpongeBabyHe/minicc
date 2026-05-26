@@ -56,7 +56,6 @@ def confirm(tool_name: str, tool_input: dict) -> bool:
         return True
     if tool_name in _ALLOWED:
         return True
-    print(f"\n[Tool] {tool_name}")
     print(_format_args(tool_name, tool_input))
     answer = input("Approve? [yes/no/all]: ").strip().lower()
     if answer == "all":
