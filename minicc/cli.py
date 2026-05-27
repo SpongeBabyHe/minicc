@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from minicc.agent import agent_loop
+from minicc import ux
 
 
 def _git_sha() -> str:
@@ -17,18 +18,21 @@ def _git_sha() -> str:
         return "no-git"
 
 
-def _print_header():
-    print("=" * 64)
-    print(f"SESSION  {datetime.now().isoformat(timespec='seconds')}")
-    print(f"commit   {_git_sha()}")
-    print(f"model    {os.environ.get('MODEL_ID', '?')}")
-    print(f"cwd      {Path.cwd()}")
-    print(f"os       {platform.system()}")
-    print("=" * 64)
+def _session_info() -> dict:
+    """Pure data about this session — no presentation."""
+    return {
+        "SESSION": datetime.now().isoformat(timespec="seconds"),
+        "commit":  _git_sha(),
+        "model":   os.environ.get("MODEL_ID", "?"),
+        "cwd":     str(Path.cwd()),
+        "os":      platform.system(),
+    }
 
 
 def main():
-    _print_header()
+    ux.console.rule()
+    ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
+    ux.console.rule()
     history = []
     turn = 0
     while True:
@@ -42,19 +46,26 @@ def main():
             break
 
         turn += 1
-        print(f"\n{'-' * 64}")
-        print(f">>> USER (turn {turn})")
-        print(query)
+        ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
         history.append({"role": "user", "content": query})
-        agent_loop(history)
 
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            print(f"\n<<< ASSISTANT")
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        try:
+            agent_loop(history)
+        except KeyboardInterrupt:
+            ux.say("interrupted", style=ux.S_INFO)
+            continue
+        except Exception as e:
+            ux.say(f"agent error: {e!r}", style=ux.S_ERROR)
+            continue
+
+        last_content = history[-1]["content"]
+        if isinstance(last_content, list):
+            text = "\n".join(
+                b.text for b in last_content if hasattr(b, "text"))
+            if text:
+                ux.say("<<< ASSISTANT", style=ux.S_ASSISTANT)
+                ux.markdown(text)
 
 
 if __name__ == "__main__":
