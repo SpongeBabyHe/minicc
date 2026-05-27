@@ -12,5 +12,5 @@ SCHEMA = {
 
 
 def glob(pattern: str) -> str:
-    matches = sorted(str(p) for p in Path.cwd().glob(pattern))
+    matches = sorted(str(p) for p in Path('.').glob(pattern))
     return "\n".join(matches) if matches else "No matches."
