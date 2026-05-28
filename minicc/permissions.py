@@ -31,11 +31,11 @@ def _format_args(tool_name: str, tool_input: dict) -> str:
             ("preview", ux.truncate(content, 500)),
         ])
     if tool_name == "edit_file":
-        return ux.kv_block([
-            ("path", tool_input.get("path", "")),
-            ("- old", ux.truncate(tool_input.get("old_text", ""), 300)),
-            ("+ new", ux.truncate(tool_input.get("new_text", ""), 300)),
-        ])
+        return ux.diff_view(
+            tool_input.get("old_text", ""),
+            tool_input.get("new_text", ""),
+            tool_input.get("path", ""),
+        )
     return ux.kv_block(list(tool_input.items()))
 
 

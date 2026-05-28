@@ -5,16 +5,18 @@ from rich.console import Console
 from rich.spinner import Spinner
 from rich.live import Live
 from rich.markdown import Markdown
+import difflib
+from rich.syntax import Syntax
 
 
-console = Console()
+console = Console(highlight=False)
 
 # ---- style constants ----
-S_USER = "bold cyan"
-S_ASSISTANT = "bold magenta"
-S_CALL = "dim yellow"
-S_RESULT = "dim green"
-S_ERROR = "bold red"
+S_USER = "bold"
+S_ASSISTANT = "bold"
+S_CALL = "dim"
+S_RESULT = "dim"
+S_ERROR = "red"
 S_INFO = "dim"
 
 
@@ -72,3 +74,22 @@ def kv_block(items, indent: str = "  ") -> str:
 def markdown(text: str):
     """Render text as markdown."""
     console.print(Markdown(text, code_theme="ansi_light"))
+
+
+def diff_view(old: str, new: str, path: str = ""):
+    def _lines(s):
+        return [line + "\n" for line in s.splitlines()] or [""]
+
+    diff = "".join(difflib.unified_diff(
+        _lines(old),
+        _lines(new),
+        fromfile=f"{path} (before)",
+        tofile=f"{path} (after)",
+        n=2,
+    ))
+    return Syntax(
+        diff or "(no change)",
+        "diff",
+        theme="ansi_light",
+        background_color="default",
+    )
