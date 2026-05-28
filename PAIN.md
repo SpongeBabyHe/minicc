@@ -28,3 +28,12 @@
       not-found), does the model recover sensibly?
 - [ ] Is the bash fallback rate acceptable, or does the model
       escalate to bash too often when grep/glob would suffice?
+
+# From M6-M7 dogfood
+
+- **CJK language drift**: With English-only system prompt, the model
+  may switch from Chinese to Japanese mid-response when handling
+  technical content (because English code identifiers act as
+  "language reset points" and kanji/hanzi share token space).
+  Fix: anchor response language explicitly in system prompt.
+  Observed in my-claude-app first, but minicc has the same gap.
