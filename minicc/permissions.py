@@ -50,3 +50,8 @@ def confirm(tool_name: str, tool_input: dict) -> bool:
         _ALLOWED.add(tool_name)
         return True
     return answer == "yes"
+
+
+def reset():
+    """Clear the session-scoped allowed-tools set. Called by /clear."""
+    _ALLOWED.clear()

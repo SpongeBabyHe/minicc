@@ -5,6 +5,12 @@ from datetime import datetime
 from pathlib import Path
 from minicc.agent import agent_loop
 from minicc import ux
+from minicc.llm import get_usage
+from minicc import permissions
+
+# Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
+_PRICE_INPUT_PER_M = 3.0
+_PRICE_OUTPUT_PER_M = 15.0
 
 
 def _git_sha() -> str:
@@ -29,6 +35,26 @@ def _session_info() -> dict:
     }
 
 
+def _cmd_help():
+    ux.say(ux.kv_block([
+        ("/help",  "Show this help"),
+        ("/clear", "Reset conversation history and tool permissions"),
+        ("/cost",  "Show token usage and estimated cost"),
+        ("q / exit / quit", "Leave minicc"),
+    ]))
+
+
+def _cmd_cost():
+    u = get_usage()
+    cost = (u["input"] * _PRICE_INPUT_PER_M
+            + u["output"] * _PRICE_OUTPUT_PER_M) / 1_000_000
+    ux.say(ux.kv_block([
+        ("tokens in",  f"{u['input']:,}"),
+        ("tokens out", f"{u['output']:,}"),
+        ("est. cost",  f"${cost:.4f}"),
+    ]))
+
+
 def main():
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
@@ -37,13 +63,29 @@ def main():
     turn = 0
     while True:
         try:
-            query = input("\nQuery: ")
+            query = input("\nQuery: ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if not query.strip():
+
+        if not query:
             continue
-        if query.strip().lower() in ("q", "exit", "quit"):
+        if query.lower() in ("q", "exit", "quit"):
             break
+
+        if query.startswith("/"):
+            if query == "/help":
+                _cmd_help()
+            elif query == "/clear":
+                history.clear()
+                permissions.reset()
+                turn = 0
+                ux.say("conversation and permissions reset", style=ux.S_INFO)
+            elif query == "/cost":
+                _cmd_cost()
+            else:
+                ux.say(
+                    f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
+            continue
 
         turn += 1
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)

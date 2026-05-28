@@ -7,6 +7,8 @@ from minicc.prompts.system import build_system_prompt
 
 load_dotenv()
 
+_USAGE = {"input": 0, "output": 0}
+
 
 MODEL = os.environ["MODEL_ID"]
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
@@ -21,4 +23,11 @@ def llm_response(messages):
         system=SYSTEM,
         tools=TOOLS
     )
+    _USAGE["input"] = response.usage.input_tokens
+    _USAGE["output"] = response.usage.output_tokens
     return response
+
+
+def get_usage() -> dict:
+    """Cumulative token usage since process start."""
+    return dict(_USAGE)
