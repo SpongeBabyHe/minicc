@@ -1,30 +1,97 @@
 import os
+import json
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from pathlib import Path
 from minicc.tools import TOOLS
 from minicc.prompts.system import build_system_prompt
+from minicc import ux
 
 load_dotenv()
-
-_USAGE = {"input": 0, "output": 0}
-
 
 MODEL = os.environ["MODEL_ID"]
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 SYSTEM = build_system_prompt()
 
+# ─── L3: Token budget for tool_result eviction ──────────────────────────────
+# Above this estimated token count, llm_response() evicts old tool_result
+# contents to keep the request from blowing up. The number is minicc's own
+# choice (CC docs don't publish theirs) and may be tuned via dogfood.
+# set to 2000 for test triggering
+TOKEN_BUDGET = 15000
+
+# Number of most-recent tool_result blocks to keep intact when evicting.
+RECENT_TOOL_RESULTS_KEEP = 4
+
+# Placeholder content for an evicted tool_result. The model can read this
+# and decide to re-invoke the tool if it actually needs the data.
+EVICTED_MARKER = (
+    "[content omitted; was earlier in conversation — re-call the tool if needed]"
+)
+
+
+_USAGE = {"input": 0, "output": 0}
+
+
+def _estimate_tokens(messages) -> int:
+    """Rough token estimate, ~4 chars per token.
+
+    Uses JSON serialization to handle both dict-form messages and the
+    Anthropic SDK's Block objects. Overestimates slightly (JSON overhead +
+    repr of objects), which is fine for trigger decisions — evicting a turn
+    earlier than strictly needed is better than blowing the budget.
+    """
+    try:
+        return len(json.dumps(messages, default=str)) // 4
+    except Exception as e:
+        return 0
+
+
+def _evict_old_tool_result(messages) -> int:
+    """Replace `content` of old tool_result blocks with EVICTED_MARKER.
+
+    Keeps the RECENT_TOOL_RESULTS_KEEP most recent intact. Returns the count
+    of blocks evicted. Mutates `messages` in place.
+
+    Conversation structure (assistant tool_use → user tool_result) is
+    preserved. The model still sees that the tool was called; only the
+    content is gone, and it can re-call if needed.
+    """
+    candidates = []
+    for i, msg in enumerate(messages):
+        content = msg["content"]
+        if not isinstance(content, list):
+            continue
+        for j, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            if block.get("content") == EVICTED_MARKER:
+                continue
+            candidates.append((i, j))
+    if len(candidates) <= RECENT_TOOL_RESULTS_KEEP:
+        return 0
+    to_evict = candidates[:-RECENT_TOOL_RESULTS_KEEP]
+    for i, j in to_evict:
+        messages[i]["content"][j]["content"] = EVICTED_MARKER
+    return len(to_evict)
+
 
 def llm_response(messages):
+    # If the messages are too long, evict old tool_result blocks to keep the request from blowing up.
+    if _estimate_tokens(messages) > TOKEN_BUDGET:
+        evicted = _evict_old_tool_result(messages)
+        if evicted:
+            ux.say(
+                f"[evicted {evicted} old tool_results to reduce context]",
+                style=ux.S_INFO,
+            )
     response = client.messages.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=8000,
-        system=SYSTEM,
-        tools=TOOLS
+        model=MODEL, messages=messages, max_tokens=8000, system=SYSTEM, tools=TOOLS
     )
-    _USAGE["input"] = response.usage.input_tokens
-    _USAGE["output"] = response.usage.output_tokens
+    _USAGE["input"] += response.usage.input_tokens
+    _USAGE["output"] += response.usage.output_tokens
     return response
 
 

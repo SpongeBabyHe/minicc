@@ -62,3 +62,21 @@ Possible fixes (v0.2 prompt iteration):
 - Add file_stats tool (v0.3)
 
 User workaround: state exhaustiveness requirement explicitly in query.
+
+
+### 2026-06-14 — L3 eviction + re-read works as designed
+
+**Observation:** With TOKEN_BUDGET=2000, RECENT_TOOL_RESULTS_KEEP=4, dogfood on llm-kaki-heman.
+Turn 1 read 4 files. Turn 2 asked about the first file's first import — model
+RE-READ main.py instead of answering from memory. This confirms its
+tool_result was evicted and the model gracefully re-called read_file on
+seeing EVICTED_MARKER.
+
+**Significance:** Validates the L3 design's core bet — the model treats
+"[content omitted; re-call if needed]" as a signal to re-fetch, not as
+missing data to confabulate around. Counters the earlier worry (2026-05-31
+entry) about confident-but-wrong behavior.
+
+**Cost tradeoff:** Re-reading means extra tool calls + tokens. Eviction
+trades request size for occasional re-fetches. Acceptable, but worth watching
+how often re-reads happen in practice. If it is too often, means RECENT_TOOL_RESULTS_KEEP need to be larger.

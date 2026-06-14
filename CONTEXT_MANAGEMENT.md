@@ -27,7 +27,7 @@ publicly documented behavior (see [CC: How Claude Code works][cc-how] and
 | ----- | -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | L1    | 3-layer prompt cache + CLAUDE.md | ⬜ Planned     | Cache stable prefixes (system / project / tools) so cached input tokens cost ~10%. Load CLAUDE.md as project-level memory that survives `/clear`. |
 | L2    | Tool output limits               | ✅ Implemented | Prevent a single tool call from blowing up context. Bash 30K + disk save; glob 100 cap; read_file truncation notice.                              |
-| L3    | Tool_result eviction             | ⬜ Planned     | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.  |
+| L3    | Tool_result eviction             | ✅ Implemented | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.  |
 | L4    | LLM auto-compact                 | ⬜ Planned     | When eviction (L3) isn't enough, summarize the conversation via an LLM call. Replaces middle messages, preserves recent N turns.                  |
 | L5    | Thrashing protection             | ⬜ Planned     | Stop auto-compact loop after N attempts if a single tool result keeps refilling the context.                                                      |
 | L6    | User controls                    | ⬜ Planned     | `/context` (see usage), `/compact [focus]` (manual), `/recap` (summarize without mutating).                                                       |
