@@ -3,15 +3,19 @@ import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from minicc import llm
 from minicc.agent import agent_loop
 from minicc import ux
 from minicc.llm import get_usage, context_usage
 from minicc import permissions
+from minicc.prompts.system import load_project_context
 
 
 # Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
 _PRICE_INPUT_PER_M = 3.0
 _PRICE_OUTPUT_PER_M = 15.0
+_PRICE_CACHE_WRITE_PER_M = 3.75  # 1.25x input
+_PRICE_CACHE_READ_PER_M = 0.30  # 0.1x input
 
 
 def _git_sha() -> str:
@@ -29,13 +33,16 @@ def _git_sha() -> str:
 
 def _session_info() -> dict:
     """Pure data about this session — no presentation."""
-    return {
+    info = {
         "SESSION": datetime.now().isoformat(timespec="seconds"),
         "commit": _git_sha(),
         "model": os.environ.get("MODEL_ID", "?"),
         "cwd": str(Path.cwd()),
         "os": platform.system(),
     }
+    if (Path.cwd() / "CLAUDE.md").exists():
+        info["CLAUDE.md"] = "loaded"
+    return info
 
 
 def _cmd_help():
@@ -55,13 +62,20 @@ def _cmd_help():
 def _cmd_cost():
     u = get_usage()
     cost = (
-        u["input"] * _PRICE_INPUT_PER_M + u["output"] * _PRICE_OUTPUT_PER_M
+        u["input"] * _PRICE_INPUT_PER_M
+        + u["output"] * _PRICE_OUTPUT_PER_M
+        + u["cache_read"] * _PRICE_CACHE_READ_PER_M
+        + u["cache_creation"] * _PRICE_CACHE_WRITE_PER_M
     ) / 1_000_000
+    total_in = u["input"] + u["cache_read"] + u["cache_creation"]
+    hit = (u["cache_read"] / total_in * 100) if total_in else 0
     ux.say(
         ux.kv_block(
             [
-                ("tokens in", f"{u['input']:,}"),
-                ("tokens out", f"{u['output']:,}"),
+                ("uncached input", f"{u['input']:,}"),
+                ("cache read", f"{u['cache_read']:,}  ({hit:.0f}% hit rate)"),
+                ("cache write", f"{u['cache_creation']:,}"),
+                ("output", f"{u['output']:,}"),
                 ("est. cost", f"${cost:.4f}"),
             ]
         )
@@ -93,6 +107,7 @@ def _cmd_context(messages):
 
 
 def main():
+    llm.set_project_context(load_project_context())
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
     ux.console.rule()
@@ -116,7 +131,11 @@ def main():
                 history.clear()
                 permissions.reset()
                 turn = 0
-                ux.say("conversation and permissions reset", style=ux.S_INFO)
+                llm.set_project_context(load_project_context())  # reload CLAUDE.md
+                ux.say(
+                    "conversation, permissions reset; CLAUDE.md reloaded",
+                    style=ux.S_INFO,
+                )
             elif query == "/cost":
                 _cmd_cost()
             elif query == "/context":

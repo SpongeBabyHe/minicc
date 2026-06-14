@@ -58,3 +58,31 @@ def build_system_prompt() -> str:
         os=platform.system(),
         date=date.today().isoformat(),
     )
+
+
+def load_project_context() -> str:
+    """Load CLAUDE.md from cwd as project context (cache prefix layer 2).
+
+    CC behavior: first 200 lines or 25KB, whichever comes first.
+    Returns "" if no CLAUDE.md — caller skips the layer entirely.
+    """
+    claude_md = Path.cwd() / "CLAUDE.md"
+    if not claude_md.exists():
+        return ""
+    text = claude_md.read_text().strip()
+    if not text:
+        return ""
+
+    MAX_BYTES = 25 * 1024
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_BYTES:
+        text = encoded[:MAX_BYTES].decode("utf-8", errors="ignore").rstrip()
+        text += f"\n\n[CLAUDE.md truncated at 25KB; was {len(encoded):,} bytes]"
+
+    MAX_LINES = 200
+    lines = text.splitlines()
+    if len(lines) > MAX_LINES:
+        text = "\n".join(lines[:MAX_LINES])
+        text += f"\n\n[CLAUDE.md truncated at 200 lines.]"
+
+    return f"# Project context (from CLAUDE.md)\n\n{text}"

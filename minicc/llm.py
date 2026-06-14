@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from anthropic import Anthropic
 from pathlib import Path
 from minicc.tools import TOOLS
-from minicc.prompts.system import build_system_prompt
+from minicc.prompts.system import build_system_prompt, load_project_context
 from minicc import ux
 
 load_dotenv()
@@ -30,7 +30,40 @@ EVICTED_MARKER = (
 )
 
 
-_USAGE = {"input": 0, "output": 0}
+_USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+_PROJECT_CONTEXT = ""
+
+
+def set_project_context(text: str):
+    """Update project context (cache layer 2). Called on startup and /clear."""
+    global _PROJECT_CONTEXT
+    _PROJECT_CONTEXT = text
+
+
+def _build_system_block(system: str | None = None) -> list:
+    """Build the `system` param as content blocks with cache_control markers.
+
+    Three cache prefix layers (each cache_control = one breakpoint):
+      1. System prompt   — rarely changes
+      2. Project context — CLAUDE.md, changes on /clear
+      (3. Tools live in the tools= param; last tool carries its own marker)
+
+    """
+    if system:
+        return [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+
+    blocks = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    if _PROJECT_CONTEXT:
+        blocks.append(
+            {
+                "type": "text",
+                "text": _PROJECT_CONTEXT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    return blocks
 
 
 def _estimate_tokens(messages) -> int:
@@ -78,7 +111,7 @@ def _evict_old_tool_result(messages) -> int:
     return len(to_evict)
 
 
-def llm_response(messages):
+def llm_response(messages, system: str | None = None):
     # If the messages are too long, evict old tool_result blocks to keep the request from blowing up.
     if _estimate_tokens(messages) > TOKEN_BUDGET:
         evicted = _evict_old_tool_result(messages)
@@ -88,10 +121,18 @@ def llm_response(messages):
                 style=ux.S_INFO,
             )
     response = client.messages.create(
-        model=MODEL, messages=messages, max_tokens=8000, system=SYSTEM, tools=TOOLS
+        model=MODEL,
+        messages=messages,
+        max_tokens=8000,
+        system=_build_system_block(system),
+        tools=TOOLS,
     )
     _USAGE["input"] += response.usage.input_tokens
     _USAGE["output"] += response.usage.output_tokens
+    _USAGE["cache_read"] += getattr(response.usage, "cache_read_input_tokens", 0) or 0
+    _USAGE["cache_creation"] += (
+        getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+    )
     return response
 
 
