@@ -101,3 +101,28 @@ otherwise be invisible — validates L6a's purpose.
 **Open:** estimate stayed at 2994 > 1000 budget even after eviction, because
 the 2 retained recent tool_results are themselves large. Confirms L3 alone
 can't bound context when recent blocks are big — L4 (compact) needed.
+
+
+### L1 caches stable prefix only, not conversation history
+**Status:** ⏭️ v0.3 candidate  **Tags:** context, cost
+
+minicc L1 caches system+tools+project but NOT messages, to avoid L3 eviction
+thrashing the cache. CC instead caches the full conversation (the biggest part
+of the request) and accepts that compact/eviction invalidates it occasionally —
+likely the better cost tradeoff. v0.3: add an advancing cache_control breakpoint
+on recent messages, accept occasional eviction busts.
+
+
+### 2026-06-14 — CLAUDE.md injection validated; redundant read only on meta-questions
+**Status:** 🟢 validated  **Tags:** prompt, context
+
+**Observation:** Two tests:
+- Asked "what conventions does this project follow?" → model read_file'd
+  CLAUDE.md (redundant; content was already injected).
+- Asked to write path-handling code → model used pathlib + explicitly noted
+  "no os.path needed", WITHOUT reading CLAUDE.md.
+
+**Conclusion:** L1 injection works AND shapes behavior. The "no os.path needed"
+comment proves the model absorbed the "never os.path" rule from injected
+context. Redundant read happens only on meta-questions about the project,
+not during actual work — low impact.
