@@ -80,3 +80,24 @@ entry) about confident-but-wrong behavior.
 **Cost tradeoff:** Re-reading means extra tool calls + tokens. Eviction
 trades request size for occasional re-fetches. Acceptable, but worth watching
 how often re-reads happen in practice. If it is too often, means RECENT_TOOL_RESULTS_KEEP need to be larger.
+
+### 2026-06-14 — L3 eviction: model explains the mechanism unprompted
+**Status:** 🟢 validated  **Tags:** context
+
+**Observation:** With TOKEN_BUDGET=1000, KEEP=2, /context showed 6/8
+tool_results evicted. When asked "why don't you remember the content but
+read it again?", the model accurately explained: it saw the
+"[content omitted ... re-call the tool if needed]" marker, understood the
+content was stripped to save space, and chose to re-read rather than risk
+misremembering.
+
+**Significance:** The EVICTED_MARKER wording directly shaped correct behavior.
+Model treats it as an instruction, not as a void to confabulate around.
+Strongest validation yet of the L3 design bet.
+
+**Also confirmed:** /context surfaces eviction state (6 evicted) that would
+otherwise be invisible — validates L6a's purpose.
+
+**Open:** estimate stayed at 2994 > 1000 budget even after eviction, because
+the 2 retained recent tool_results are themselves large. Confirms L3 alone
+can't bound context when recent blocks are big — L4 (compact) needed.
