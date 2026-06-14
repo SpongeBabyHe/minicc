@@ -18,7 +18,7 @@ SYSTEM = build_system_prompt()
 # contents to keep the request from blowing up. The number is minicc's own
 # choice (CC docs don't publish theirs) and may be tuned via dogfood.
 # set to 2000 for test triggering
-TOKEN_BUDGET = 15000
+TOKEN_BUDGET = 150_000
 
 # Number of most-recent tool_result blocks to keep intact when evicting.
 RECENT_TOOL_RESULTS_KEEP = 4
@@ -98,3 +98,35 @@ def llm_response(messages):
 def get_usage() -> dict:
     """Cumulative token usage since process start."""
     return dict(_USAGE)
+
+
+def context_usage(messages) -> dict:
+    """Structured data about current context usage (for /context).
+
+    Note: estimated_tokens covers the conversation history ONLY — it does
+    not include the system prompt or tool definitions that also go into each
+    request. This is the number L3 eviction watches.
+    """
+    tokens = _estimate_tokens(messages)
+    pct = (tokens / TOKEN_BUDGET * 100) if TOKEN_BUDGET else 0
+
+    tool_results = 0
+    evicted = 0
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                tool_results += 1
+                if b.get("content") == EVICTED_MARKER:
+                    evicted += 1
+
+    return {
+        "estimated_tokens": tokens,
+        "budget": TOKEN_BUDGET,
+        "pct_of_budget": pct,
+        "messages": len(messages),
+        "tool_results": tool_results,
+        "evicted": evicted,
+    }

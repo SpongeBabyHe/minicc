@@ -5,8 +5,9 @@ from datetime import datetime
 from pathlib import Path
 from minicc.agent import agent_loop
 from minicc import ux
-from minicc.llm import get_usage
+from minicc.llm import get_usage, context_usage
 from minicc import permissions
+
 
 # Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
 _PRICE_INPUT_PER_M = 3.0
@@ -17,7 +18,9 @@ def _git_sha() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            timeout=2,
         ).stdout.strip()
         return out or "untracked"
     except Exception:
@@ -28,31 +31,65 @@ def _session_info() -> dict:
     """Pure data about this session — no presentation."""
     return {
         "SESSION": datetime.now().isoformat(timespec="seconds"),
-        "commit":  _git_sha(),
-        "model":   os.environ.get("MODEL_ID", "?"),
-        "cwd":     str(Path.cwd()),
-        "os":      platform.system(),
+        "commit": _git_sha(),
+        "model": os.environ.get("MODEL_ID", "?"),
+        "cwd": str(Path.cwd()),
+        "os": platform.system(),
     }
 
 
 def _cmd_help():
-    ux.say(ux.kv_block([
-        ("/help",  "Show this help"),
-        ("/clear", "Reset conversation history and tool permissions"),
-        ("/cost",  "Show token usage and estimated cost"),
-        ("q / exit / quit", "Leave minicc"),
-    ]))
+    ux.say(
+        ux.kv_block(
+            [
+                ("/help", "Show this help"),
+                ("/clear", "Reset conversation history and tool permissions"),
+                ("/context", "Show conversation token usage vs eviction budget"),
+                ("/cost", "Show token usage and estimated cost"),
+                ("q / exit / quit", "Leave minicc"),
+            ]
+        )
+    )
 
 
 def _cmd_cost():
     u = get_usage()
-    cost = (u["input"] * _PRICE_INPUT_PER_M
-            + u["output"] * _PRICE_OUTPUT_PER_M) / 1_000_000
-    ux.say(ux.kv_block([
-        ("tokens in",  f"{u['input']:,}"),
-        ("tokens out", f"{u['output']:,}"),
-        ("est. cost",  f"${cost:.4f}"),
-    ]))
+    cost = (
+        u["input"] * _PRICE_INPUT_PER_M + u["output"] * _PRICE_OUTPUT_PER_M
+    ) / 1_000_000
+    ux.say(
+        ux.kv_block(
+            [
+                ("tokens in", f"{u['input']:,}"),
+                ("tokens out", f"{u['output']:,}"),
+                ("est. cost", f"${cost:.4f}"),
+            ]
+        )
+    )
+
+
+def _cmd_context(messages):
+    """
+    Show conversation history token usage vs L3 evict budget.
+    """
+    c = context_usage(messages)
+    ux.say(
+        ux.kv_block(
+            [
+                (
+                    "estimated tokens",
+                    f"{c['estimated_tokens']:,}  (~{c['pct_of_budget']:.0f}% of evict budget)",
+                ),
+                ("evict budget", f"{c['budget']:,}  (L3 eviction triggers above this)"),
+                ("messages", str(c["messages"])),
+                ("tool_results", f"{c['tool_results']} total, {c['evicted']} evicted"),
+            ]
+        )
+    )
+    ux.say(
+        "(estimate covers conversation history only, not system prompt + tools)",
+        style=ux.S_INFO,
+    )
 
 
 def main():
@@ -82,9 +119,10 @@ def main():
                 ux.say("conversation and permissions reset", style=ux.S_INFO)
             elif query == "/cost":
                 _cmd_cost()
+            elif query == "/context":
+                _cmd_context(history)
             else:
-                ux.say(
-                    f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
+                ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             continue
 
         turn += 1
@@ -103,8 +141,7 @@ def main():
 
         last_content = history[-1]["content"]
         if isinstance(last_content, list):
-            text = "\n".join(
-                b.text for b in last_content if hasattr(b, "text"))
+            text = "\n".join(b.text for b in last_content if hasattr(b, "text"))
             if text:
                 ux.say("<<< ASSISTANT", style=ux.S_ASSISTANT)
                 ux.markdown(text)
