@@ -97,6 +97,8 @@ def _cmd_context(messages):
                 ("evict budget", f"{c['budget']:,}  (L3 eviction triggers above this)"),
                 ("messages", str(c["messages"])),
                 ("tool_results", f"{c['tool_results']} total, {c['evicted']} evicted"),
+                ("eviction events", str(c["eviction_events"])),
+                ("compaction events", str(c["compaction_events"])),
             ]
         )
     )
