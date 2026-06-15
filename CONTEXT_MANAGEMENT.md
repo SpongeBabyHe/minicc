@@ -28,9 +28,9 @@ publicly documented behavior (see [CC: How Claude Code works][cc-how] and
 | L1    | 3-layer prompt cache + CLAUDE.md | ✅ Implemented | Cache stable prefixes (system / project / tools) so cached input tokens cost ~10%. Load CLAUDE.md as project-level memory that survives `/clear`. |
 | L2    | Tool output limits               | ✅ Implemented | Prevent a single tool call from blowing up context. Bash 30K + disk save; glob 100 cap; read_file truncation notice.                              |
 | L3    | Tool_result eviction             | ✅ Implemented | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.  |
-| L4    | LLM auto-compact                 | ⬜ Planned     | When eviction (L3) isn't enough, summarize the conversation via an LLM call. Replaces middle messages, preserves recent N turns.                  |
-| L5    | Thrashing protection             | ⬜ Planned     | Stop auto-compact loop after N attempts if a single tool result keeps refilling the context.                                                      |
-| L6    | User controls                    | ⬜ Planned     | `/context` (see usage), `/compact [focus]` (manual), `/recap` (summarize without mutating).                                                       |
+| L4    | LLM auto-compact                 | ✅ Implemented | When eviction (L3) isn't enough, summarize older messages via an LLM call. Cut at an assistant boundary so tool_use/tool_result pairs stay intact. |
+| L5    | Thrashing protection             | ✅ Implemented | Stop auto-compact after MAX_COMPACT_ATTEMPTS if a single message keeps refilling the context; raise instead of looping.                            |
+| L6    | User controls                    | 🟡 Partial     | `/context` ✅ (usage + eviction/compaction event counts). `/compact [focus]` and `/recap` still planned (L6b/c).                                   |
 
 Layers run in order: L1 reduces cost passively. L2 prevents single-call bloat.
 L3 → L4 → L5 trigger sequentially when total context grows. L6 gives the user
@@ -64,12 +64,17 @@ are silent, minicc makes its own engineering choice and labels it.
 - **read_file default limit**: not added — keep existing 50K char cap with
   added truncation notice. Defer line-based pagination + offset to v0.3 unless
   dogfood shows model needs it.
-- **Token thresholds for L3 eviction / L4 compact trigger**: TBD — will fix
-  numbers when implementing L3.
-- **Number of recent messages kept after L4 compact**: TBD.
-- **L4 compact summary prompt**: minicc's own template — CC's prompt is
-  proprietary.
-- **L5 thrashing retry limit**: TBD (CC says "several").
+- **Token thresholds (L3 evict + L4 compact trigger)**: `TOKEN_BUDGET = 150_000`
+  (single threshold; eviction runs first, compaction if still over). Estimated
+  via `len(json.dumps(messages)) // 4`.
+- **Tool_results kept intact during eviction**: `RECENT_TOOL_RESULTS_KEEP = 4`.
+- **Messages kept verbatim after compaction**: `KEEP_RECENT_MESSAGES = 6` (cut
+  lands on an assistant boundary at or after this point).
+- **Summary input field cap**: `SUMMARY_FIELD_CAP = 1000` per field, so the
+  summarization call can't itself balloon.
+- **L4 compact summary prompt**: minicc's own template (Goal / Done / Key
+  findings / In progress / Open questions) — CC's prompt is proprietary.
+- **L5 thrashing retry limit**: `MAX_COMPACT_ATTEMPTS = 3` (CC says "several").
 - **`.minicc/` self-ignoring directory pattern**: minicc's choice. Writes
   `.minicc/.gitignore: "*"` so artifacts never get tracked even if user forgets
   to gitignore `.minicc/` in their project.
@@ -85,6 +90,62 @@ data.
 | MEMORY.md (auto-written memory)               | Persistent learnings across sessions                   | Requires automatic writeback; design needs dogfood data                               |
 | `/rewind` + file checkpoints                  | Roll back to earlier turn with snapshot restore        | Needs checkpoint store; not the primary pain in dogfood                               |
 | Session persistence (`--resume`/`--continue`) | Continue conversations across CLI restarts             | minicc sessions are intentionally ephemeral; revisit if needed                        |
+
+## Dogfood lessons & validation
+
+Synthesized from dogfood on llm-kaki. Raw in-the-moment jots live in `PAIN.md`;
+this section is the processed understanding.
+
+### Validated
+- **L1 cache works**: `cache_read` went 0 → 1465 across two turns (~41%
+  cumulative hit rate). The 3 prefix breakpoints (system / project / tools)
+  function as intended.
+- **L1 CLAUDE.md shapes behavior**: asked to write path-handling code, the model
+  used `pathlib` and noted "no os.path needed" *unprompted* — it absorbed
+  CLAUDE.md's "never os.path" rule. Redundant re-reads of CLAUDE.md happen only
+  on meta-questions ("what conventions?"), not during real work.
+- **L3 eviction + re-read**: the model treats `EVICTED_MARKER` as "re-fetch if
+  needed" and re-reads gracefully instead of confabulating — it even explained
+  the mechanism when asked. Tradeoff: occasional extra re-reads; raise
+  `RECENT_TOOL_RESULTS_KEEP` if they get frequent.
+- **L4 + L5 (budget=3000 test)**: turn 1 fired compaction once and completed the
+  task (L4 works); turn 2 hit a 16K-char single file > budget → 6 compaction
+  attempts then thrash (L5 failsafe works). Both verified via `/context` event
+  counters, not by hunting dim log lines.
+
+### Fixed bugs
+- **L4 cut-point**: cutting at *user-string* boundaries failed on a single long
+  turn (only `msg[0]` qualifies → no cut → straight to thrash). Fixed by cutting
+  before an *assistant* message — tool_use/tool_result pairs stay intact (the cut
+  falls between pairs, never inside one). Works mid-turn, the common shape for a
+  long single task.
+- **Summary call balloon**: `_serialize_for_summary` now caps EVERY field
+  (`SUMMARY_FIELD_CAP`), so a large write_file content can't make the
+  summarization request itself huge and re-trip the rate limit.
+
+### Design boundaries
+- **Invariant**: `TOKEN_BUDGET` must exceed the max single tool output
+  (read_file caps at 50K chars ≈ 12K tokens). Below that, one large file thrashes
+  no matter what. At the 150K production budget this can't happen.
+- **Eviction/compaction suit SEQUENTIAL tasks, not SURVEY tasks**: "read &
+  report each, move on" coexists with eviction; "hold all files at once to
+  answer" fights it (re-read churn → thrash). Don't set budget below the task's
+  working set.
+- **Compaction trades detail for space**: a follow-up needing summarized-away
+  detail makes the model re-read. Inherent; mitigated by the `## In progress`
+  section in the summary prompt and a production-sized budget.
+- **Observability**: dim log lines scroll past during heavy tool output. The
+  `/context` eviction/compaction counters made firings verifiable — kept as a
+  permanent feature, not just a test aid.
+
+### v0.3 candidates (from dogfood)
+- Cache conversation history too (CC does; minicc caches only the stable prefix
+  to avoid eviction thrashing the cache).
+- Reduce/evict large *tool_use* inputs (e.g. write_file content) — L3 only
+  touches tool_result, not tool_use, so a big write stays full until it ages
+  into the compacted portion.
+- Softer thrash recovery (auto-`/clear`, or drop the oversized block + retry)
+  instead of crashing the turn.
 
 ## Implementation order (Order B)
 
