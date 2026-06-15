@@ -23,14 +23,14 @@ publicly documented behavior (see [CC: How Claude Code works][cc-how] and
 
 ## The 6 layers
 
-| Layer | Name                             | Status        | What it does                                                                                                                                      |
-| ----- | -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| L1    | 3-layer prompt cache + CLAUDE.md | ✅ Implemented | Cache stable prefixes (system / project / tools) so cached input tokens cost ~10%. Load CLAUDE.md as project-level memory that survives `/clear`. |
-| L2    | Tool output limits               | ✅ Implemented | Prevent a single tool call from blowing up context. Bash 30K + disk save; glob 100 cap; read_file truncation notice.                              |
-| L3    | Tool_result eviction             | ✅ Implemented | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.  |
+| Layer | Name                             | Status        | What it does                                                                                                                                       |
+| ----- | -------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| L1    | 3-layer prompt cache + CLAUDE.md | ✅ Implemented | Cache stable prefixes (system / project / tools) so cached input tokens cost ~10%. Load CLAUDE.md as project-level memory that survives `/clear`.  |
+| L2    | Tool output limits               | ✅ Implemented | Prevent a single tool call from blowing up context. Bash 30K + disk save; glob 100 cap; read_file truncation notice.                               |
+| L3    | Tool_result eviction             | ✅ Implemented | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.   |
 | L4    | LLM auto-compact                 | ✅ Implemented | When eviction (L3) isn't enough, summarize older messages via an LLM call. Cut at an assistant boundary so tool_use/tool_result pairs stay intact. |
 | L5    | Thrashing protection             | ✅ Implemented | Stop auto-compact after MAX_COMPACT_ATTEMPTS if a single message keeps refilling the context; raise instead of looping.                            |
-| L6    | User controls                    | 🟡 Partial     | `/context` ✅ (usage + eviction/compaction event counts). `/compact [focus]` and `/recap` still planned (L6b/c).                                   |
+| L6    | User controls                    | ✅ Implemented | `/context` ✅ (usage + eviction/compaction event counts). `/compact [focus]` and `/recap`                                                           |
 
 Layers run in order: L1 reduces cost passively. L2 prevents single-call bloat.
 L3 → L4 → L5 trigger sequentially when total context grows. L6 gives the user
