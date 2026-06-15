@@ -6,7 +6,7 @@ from pathlib import Path
 from minicc import llm
 from minicc.agent import agent_loop
 from minicc import ux
-from minicc.llm import get_usage, context_usage
+from minicc.llm import get_usage, context_usage, compact, recap
 from minicc import permissions
 from minicc.prompts.system import load_project_context
 
@@ -53,6 +53,8 @@ def _cmd_help():
                 ("/clear", "Reset conversation history and tool permissions"),
                 ("/context", "Show conversation token usage vs eviction budget"),
                 ("/cost", "Show token usage and estimated cost"),
+                ("/compact [focus]", "Summarize older history now (optional focus)"),
+                ("/recap", "Show a summary without changing history"),
                 ("q / exit / quit", "Leave minicc"),
             ]
         )
@@ -108,6 +110,22 @@ def _cmd_context(messages):
     )
 
 
+def _cmd_compact(messages, focus: str | None = None):
+    """Manually compact history (L6b). Mutates `messages` in place."""
+    did = compact(messages, focus=focus)
+    if did:
+        ux.say("conversation history compacted", style=ux.S_INFO)
+    else:
+        ux.say("nothing to compact yet", style=ux.S_INFO)
+
+
+def _cmd_recap(messages):
+    """Show a summary of the conversation without changing it (L6c)."""
+    summary = recap(messages)
+    ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
+    ux.markdown(summary)
+
+
 def main():
     llm.set_project_context(load_project_context())
     ux.console.rule()
@@ -127,9 +145,13 @@ def main():
             break
 
         if query.startswith("/"):
-            if query == "/help":
+            # split into command word + optional argument (e.g. /compact <focus>)
+            parts = query.split(maxsplit=1)
+            cmd = parts[0]
+            arg = parts[1] if len(parts) > 1 else None
+            if cmd == "/help":
                 _cmd_help()
-            elif query == "/clear":
+            elif cmd == "/clear":
                 history.clear()
                 permissions.reset()
                 turn = 0
@@ -138,10 +160,14 @@ def main():
                     "conversation, permissions reset; CLAUDE.md reloaded",
                     style=ux.S_INFO,
                 )
-            elif query == "/cost":
+            elif cmd == "/cost":
                 _cmd_cost()
-            elif query == "/context":
+            elif cmd == "/context":
                 _cmd_context(history)
+            elif cmd == "/compact":
+                _cmd_compact(history, focus=arg)
+            elif cmd == "/recap":
+                _cmd_recap(history)
             else:
                 ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             continue

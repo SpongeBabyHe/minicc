@@ -213,7 +213,30 @@ def _find_cut_index(messages) -> int | None:
     return None
 
 
-def _compact(messages) -> bool:
+def _summarize(messages, focus: str | None = None) -> str:
+    """One LLM call returning a structured summary of `messages`.
+
+    Shared by _compact (L4) and recap (L6c). `focus`, if given, steers what the
+    summary preserves (powers `/compact <focus>`).
+    """
+    focus_line = f"\n\nFocus the summary on: {focus}" if focus else ""
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=1500,
+        system=_COMPACT_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Summarize this agent history:{focus_line}\n\n{_serialize_for_summary(messages)}",
+            }
+        ],
+    )
+    _USAGE["input"] += resp.usage.input_tokens
+    _USAGE["output"] += resp.usage.output_tokens
+    return resp.content[0].text if resp.content else "(empty summary)"
+
+
+def _compact(messages, focus: str | None = None) -> bool:
     """Summarize older messages via one LLM call; replace them in place.
 
     Returns True if compaction reduced the history, False if no safe cut.
@@ -224,21 +247,7 @@ def _compact(messages) -> bool:
 
     older, recent = messages[:cut], messages[cut:]
     ux.say("[compacting conversation history...]", style=ux.S_INFO)
-
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        system=_COMPACT_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Summarize this agent history:\n\n{_serialize_for_summary(older)}",
-            }
-        ],
-    )
-    _USAGE["input"] += resp.usage.input_tokens
-    _USAGE["output"] += resp.usage.output_tokens
-    summary = resp.content[0].text if resp.content else "(empty summary)"
+    summary = _summarize(older, focus=focus)
 
     # recent starts with an assistant message (guaranteed by _find_cut_index),
     # so prepending just the summary as a user message keeps valid alternation:
@@ -249,6 +258,22 @@ def _compact(messages) -> bool:
     _CTX_STATS["compactions"] += 1
     ux.say(f"[compacted {len(older)} messages into a summary]", style=ux.S_INFO)
     return True
+
+
+def compact(messages, focus: str | None = None) -> bool:
+    """Manual compaction entry point (for /compact). Returns True if it ran."""
+    return _compact(messages, focus=focus)
+
+
+def recap(messages, focus: str | None = None) -> str:
+    """Summarize the conversation WITHOUT mutating it (for /recap).
+
+    Cache-safe: it doesn't touch `messages`, so the conversation prefix and its
+    cache stay intact (unlike /compact, which replaces history).
+    """
+    if len(messages) < 2:
+        return "(nothing to recap yet)"
+    return _summarize(messages, focus=focus)
 
 
 def llm_response(messages, system: str | None = None):
