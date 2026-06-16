@@ -178,20 +178,14 @@ def main():
         history.append({"role": "user", "content": query})
 
         try:
-            agent_loop(history)
+            agent_loop(history)   # streams assistant text to the screen as it arrives
         except KeyboardInterrupt:
             ux.say("interrupted", style=ux.S_INFO)
             continue
         except Exception as e:
             ux.say(f"agent error: {e!r}", style=ux.S_ERROR)
             continue
-
-        last_content = history[-1]["content"]
-        if isinstance(last_content, list):
-            text = "\n".join(b.text for b in last_content if hasattr(b, "text"))
-            if text:
-                ux.say("<<< ASSISTANT", style=ux.S_ASSISTANT)
-                ux.markdown(text)
+        # No post-loop re-print: streaming already rendered the assistant text.
 
 
 if __name__ == "__main__":

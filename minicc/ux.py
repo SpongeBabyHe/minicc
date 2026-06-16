@@ -20,11 +20,46 @@ S_ERROR = "red"
 S_INFO = "dim"
 
 
+def _md(text: str) -> Markdown:
+    return Markdown(text, code_theme="ansi_light")
+
+
 @contextmanager
 def thinking(text: str = "thinking..."):
     """Wrap an LLM call: shows spinner until block exits."""
     with Live(Spinner("dots", text=text), console=console, refresh_per_second=10, transient=True):
         yield
+
+
+@contextmanager
+def streaming(text: str = "thinking..."):
+    """Spinner until the first token, then live-rendered markdown.
+
+    Yields a `render(delta)` callable. A spinner shows until the first delta
+    (covering connection + first-token latency); then a Live region re-renders
+    the accumulated text as markdown as it grows. On exit the final markdown is
+    printed permanently. A tool-only turn (no text) just drops the spinner.
+
+    Markdown (not raw print) so **bold**, lists, and code blocks render — and
+    model output like "[INFO]" is treated as text, not rich markup.
+    """
+    live = Live(Spinner("dots", text=text), console=console,
+                refresh_per_second=10, transient=True)
+    live.start()
+    acc = {"text": "", "started": False}
+
+    def render(delta: str):
+        acc["started"] = True
+        acc["text"] += delta
+        live.update(_md(acc["text"]))
+
+    try:
+        yield render
+    finally:
+        live.stop()  # clears the transient region (spinner, or the live markdown)
+        if acc["started"]:
+            # re-print the final markdown permanently (the transient region is gone)
+            console.print(_md(acc["text"]))
 
 
 def say(text: str, style: str = ""):
@@ -73,7 +108,7 @@ def kv_block(items, indent: str = "  ") -> str:
 
 def markdown(text: str):
     """Render text as markdown."""
-    console.print(Markdown(text, code_theme="ansi_light"))
+    console.print(_md(text))
 
 
 def diff_view(old: str, new: str, path: str = ""):

@@ -194,7 +194,7 @@ def test_thrash_guard_raises(monkeypatch):
     msgs = [user("x" * 100)]
     with pytest.raises(RuntimeError, match="thrashing"):
         for _ in range(llm.MAX_COMPACT_ATTEMPTS + 1):
-            llm.llm_response(msgs)
+            llm.llm_response(msgs, stream=False)
 
 
 def test_no_thrash_when_under_budget(monkeypatch):
@@ -203,6 +203,6 @@ def test_no_thrash_when_under_budget(monkeypatch):
     monkeypatch.setattr(llm, "_compact_attempts", 0)
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
     msgs = [user("hi")]
-    resp = llm.llm_response(msgs)
+    resp = llm.llm_response(msgs, stream=False)
     assert resp is not None
     assert llm._compact_attempts == 0

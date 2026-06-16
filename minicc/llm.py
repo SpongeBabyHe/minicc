@@ -276,7 +276,7 @@ def recap(messages, focus: str | None = None) -> str:
     return _summarize(messages, focus=focus)
 
 
-def llm_response(messages, system: str | None = None):
+def llm_response(messages, system: str | None = None, stream: bool = True):
     global _compact_attempts
     if _estimate_tokens(messages) <= TOKEN_BUDGET:
         _compact_attempts = 0
@@ -304,13 +304,26 @@ def llm_response(messages, system: str | None = None):
             _compact_attempts += 1
             _compact(messages)
 
-    response = client.messages.create(
+    params = dict(
         model=MODEL,
         messages=messages,
         max_tokens=8000,
         system=_build_system_block(system),
         tools=TOOLS,
     )
+    if not stream:
+        # non-streaming path: tests, scripts, subagents
+        response = client.messages.create(**params)
+    else:
+        # streaming path: spinner until first token, then print text deltas.
+        # get_final_message() returns the SAME shape create() would — so all
+        # downstream logic (tool dispatch, usage) is unchanged.
+        with ux.streaming() as render:
+            with client.messages.stream(**params) as s:
+                for delta in s.text_stream:
+                    render(delta)
+                response = s.get_final_message()
+
     _USAGE["input"] += response.usage.input_tokens
     _USAGE["output"] += response.usage.output_tokens
     _USAGE["cache_read"] += getattr(response.usage, "cache_read_input_tokens", 0) or 0

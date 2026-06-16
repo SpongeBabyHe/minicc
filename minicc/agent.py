@@ -4,10 +4,10 @@ from minicc.permissions import confirm
 from minicc import ux
 
 
-def agent_loop(messages, system: str | None = None):
+def agent_loop(messages, system: str | None = None, stream: bool = True):
     while True:
-        with ux.thinking():
-            response = llm_response(messages, system)
+        # streaming shows its own spinner-until-first-token, so no ux.thinking()
+        response = llm_response(messages, system, stream=stream)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
