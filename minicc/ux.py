@@ -5,11 +5,33 @@ from rich.console import Console
 from rich.spinner import Spinner
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.theme import Theme
+from rich.style import Style
 import difflib
 from rich.syntax import Syntax
 
 
-console = Console(highlight=False)
+# ---- markdown theme ----
+# rich's default `markdown.code` gives inline `code` a filled background — the
+# ugly dark chips. Override to a single accent color with NO background. Other
+# markdown.* keys inherit rich defaults.
+_CODE_ACCENT = "#0a7ea4"  # teal; readable on light terminals. Tweak to taste.
+MD_THEME = Theme(
+    {
+        "markdown.code": Style(color=_CODE_ACCENT, bold=False),  # inline `code`, no bg
+        "markdown.item.bullet": Style(color=_CODE_ACCENT, bold=True),
+        "markdown.h1": Style(bold=True),
+        "markdown.h2": Style(bold=True),
+        "markdown.h3": Style(bold=True),
+        "markdown.h4": Style(bold=True),
+    }
+)
+
+# Syntax theme for fenced ``` code blocks ```. ansi_light adapts to the
+# terminal palette (no forced background) — pairs with light terminals.
+_CODE_BLOCK_THEME = "ansi_light"
+
+console = Console(highlight=False, theme=MD_THEME)
 
 # ---- style constants ----
 S_USER = "bold"
@@ -21,7 +43,9 @@ S_INFO = "dim"
 
 
 def _md(text: str) -> Markdown:
-    return Markdown(text, code_theme="ansi_light")
+    """Markdown with minicc's consistent code-block theme. Inline-code style
+    comes from the console's MD_THEME (no background)."""
+    return Markdown(text, code_theme=_CODE_BLOCK_THEME)
 
 
 @contextmanager
