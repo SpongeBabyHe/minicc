@@ -112,50 +112,71 @@ exactly as today. The `→ tool(...)` / `← result` prints happen after, as now
 to render that live — it reads the final input from `get_final_message()`.)
 
 ## What we defer
-- **Live markdown during streaming** (D2) — start plain.
 - **Streaming the tool_use input** as it's generated — not useful in a terminal.
-- **Full event-generator refactor** (D1 option C) — the `on_text` callback is
-  the stepping stone; the generator comes if/when we build the GUI backend.
+- **Full event-generator refactor** (D1 option C) — internal streaming is enough
+  for a terminal; the generator comes if/when we build a GUI backend.
 
-## Risks
-- **Markdown regression** (D2): streamed replies lose M6 formatting. Accepted
-  for now; flagged for a polish pass.
-- **Ctrl-C mid-stream**: the `with client.messages.stream(...)` context manager
-  must close cleanly on `KeyboardInterrupt`; the existing cli.py interrupt
-  handling should catch it and return to the prompt.
-- **`tee` to a log**: streaming + rich control chars — same concern as M6;
-  rich's non-tty detection should degrade to plain.
+## Risks — verified during dogfood (2026-06-16)
+- **Markdown regression** (D2): ✅ resolved — went straight to live markdown
+  (rich `Live` + `Markdown`), so streamed replies keep formatting.
+- **Ctrl-C mid-stream**: ✅ interactive mode returns to a clean prompt; the
+  `ux.streaming()` `finally: live.stop()` closes the Live region (no terminal
+  mess). Piped/non-tty mode exits instead of returning — acceptable (stdin is
+  exhausted, no prompt to return to).
+  - 🔧 **Found + fixed a real bug — but only after a live test corrected my
+    first analysis.**
+    - *Wrong prediction:* "interrupt → dangling user message → consecutive user
+      messages → 400." Live test **disproved** it: the API tolerates consecutive
+      user messages (interrupt during streaming leaves history ending in a clean
+      `tool_result`; the next query worked fine).
+    - *The actual bug (live-verified):* Ctrl-C **during a slow tool** (`bash`
+      `sleep 30`) — `KeyboardInterrupt` propagates out of the handler (it's not
+      an `Exception`, so agent.py's `try/except Exception` doesn't catch it),
+      the loop exits before appending the `tool_result`, leaving an **orphaned
+      `tool_use`**. The next request 400s: *"tool_use ids were found without
+      tool_result blocks."*
+    - *Fix:* cli.py rolls back the whole turn (`del history[mark:]`) on
+      interrupt/error → history returns to a clean state.
+    - *Lesson:* my first "proof" was a simulation whose validator **encoded my
+      own assumption** (consecutive-user is invalid) — so it confirmed a false
+      belief. Only a real API call could falsify it. Reason cautiously; verify
+      empirically.
+- **`tee` to a log**: ✅ resolved — log is clean plain text; rich's non-tty
+  detection degrades the Live region to plain output.
 
-## Implementation sketch
+## Implementation (as built)
 
 ```python
 # llm.py
 def llm_response(messages, system=None, stream=True):
     # ... L3/L4 budget management unchanged ...
     if not stream:
-        response = client.messages.create(...same params...)   # tests, scripts
+        response = client.messages.create(**params)        # tests, scripts, subagents
     else:
-        with client.messages.stream(...same params...) as s:
-            with ux.streaming() as render:   # spinner until first delta, then text
+        with ux.streaming() as render:                     # spinner until first token
+            with client.messages.stream(**params) as s:
                 for delta in s.text_stream:
-                    render(delta)
-            response = s.get_final_message()
-    _USAGE[...] += response.usage...      # unchanged
+                    render(delta)                          # live markdown
+                response = s.get_final_message()
+    _USAGE[...] += response.usage...                       # unchanged
     return response
 ```
 
 ```python
-# ux.py — new
+# ux.py
 @contextmanager
 def streaming():
-    """Spinner until the first delta, then print deltas as plain text."""
-    # yields a render(delta) callable; stops the spinner on first call
+    """Spinner until first token, then a Live region re-renders
+    Markdown(accumulated); final markdown printed permanently on exit."""
     ...
 ```
 
-`agent.py` keeps calling `llm_response(messages)`; the tool-dispatch block below
-is untouched. Tests pass `stream=False` for deterministic non-streaming.
+- `agent_loop(messages, system=None, stream=True)` passes `stream` through;
+  subagents will call with `stream=False`.
+- `cli.py` drops the post-loop re-print (streaming already shows the text) and
+  rolls back the turn on interrupt/error.
+- Tests pass `stream=False` for the deterministic path.
 
 ## Status
-⬜ Planned — design only. Implement after v0.2 ship.
+✅ Implemented (Tier 1). Streaming + live markdown + theme; risks verified.
 ```

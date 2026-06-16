@@ -175,14 +175,21 @@ def main():
         turn += 1
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
+        mark = len(history)   # roll-back point if this turn is interrupted/errors
         history.append({"role": "user", "content": query})
 
         try:
             agent_loop(history)   # streams assistant text to the screen as it arrives
         except KeyboardInterrupt:
+            # Ctrl-C during a slow tool (e.g. bash) leaves an assistant tool_use
+            # with no following tool_result. The next request then 400s:
+            # "tool_use ids were found without tool_result blocks" (verified by
+            # live test). Roll back the whole turn to a clean state.
+            del history[mark:]
             ux.say("interrupted", style=ux.S_INFO)
             continue
         except Exception as e:
+            del history[mark:]   # same: don't leave a half-finished turn behind
             ux.say(f"agent error: {e!r}", style=ux.S_ERROR)
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
