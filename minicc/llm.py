@@ -276,7 +276,7 @@ def recap(messages, focus: str | None = None) -> str:
     return _summarize(messages, focus=focus)
 
 
-def llm_response(messages, system: str | None = None, stream: bool = True):
+def llm_response(messages, system: str | None = None, stream: bool = True, tools=None):
     global _compact_attempts
     if _estimate_tokens(messages) <= TOKEN_BUDGET:
         _compact_attempts = 0
@@ -309,7 +309,7 @@ def llm_response(messages, system: str | None = None, stream: bool = True):
         messages=messages,
         max_tokens=8000,
         system=_build_system_block(system),
-        tools=TOOLS,
+        tools=tools if tools is not None else TOOLS,
     )
     if not stream:
         # non-streaming path: tests, scripts, subagents
