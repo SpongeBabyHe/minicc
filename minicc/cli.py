@@ -1,9 +1,11 @@
 import argparse
 import os
 import platform
+import readline  # noqa: F401 — importing enables history + line editing for input()
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from minicc import llm
 from minicc.agent import agent_loop
 from minicc import ux
@@ -147,8 +149,37 @@ def _init_session():
     return [], sessions.new_id()
 
 
+def _setup_history():
+    """Load input history so ↑/↓ and Ctrl-R recall queries across runs."""
+    histfile = Path.cwd() / ".minicc" / "repl_history"
+    histfile.parent.mkdir(parents=True, exist_ok=True)
+    gi = histfile.parent / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n")
+    try:
+        readline.read_history_file(histfile)
+    except (FileNotFoundError, OSError):
+        pass
+    return histfile
+
+
+def _friendly_error(e: Exception) -> str:
+    """Turn an exception into a clear, actionable line (vs a raw repr)."""
+    if isinstance(e, RateLimitError):
+        return (
+            "rate limited — the API is throttling and retries were exhausted. "
+            "Wait a moment, or /compact to shrink the request."
+        )
+    if isinstance(e, (APIConnectionError, APITimeoutError)):
+        return "network error reaching the API — check your connection and retry."
+    if isinstance(e, APIStatusError):
+        return f"API error {e.status_code}: {getattr(e, 'message', '') or ''}".rstrip(": ")
+    return f"agent error: {e!r}"
+
+
 def main():
     history, session_id = _init_session()
+    histfile = _setup_history()
     llm.set_project_context(load_project_context())
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
@@ -215,12 +246,18 @@ def main():
             continue
         except Exception as e:
             del history[mark:]   # same: don't leave a half-finished turn behind
-            ux.say(f"agent error: {e!r}", style=ux.S_ERROR)
+            ux.say(_friendly_error(e), style=ux.S_ERROR)
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
 
         # persist after each successful turn so --continue/--resume can pick up here
         sessions.save(session_id, history, os.environ.get("MODEL_ID", "?"))
+
+    # loop exited (q/exit/EOF/Ctrl-C): persist input history for next run
+    try:
+        readline.write_history_file(histfile)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

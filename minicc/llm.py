@@ -10,7 +10,11 @@ from minicc import ux
 load_dotenv()
 
 MODEL = os.environ["MODEL_ID"]
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# max_retries: the SDK retries transient failures (429/500/503/connection) with
+# exponential backoff + jitter, honoring Retry-After. Bumped from the default 2
+# to ride out brief rate-limit spikes during dogfood. (Structurally-too-big
+# requests are handled by L3/L4, not retries.)
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
 SYSTEM = build_system_prompt()
 
 # ─── L3: Token budget for tool_result eviction ──────────────────────────────
