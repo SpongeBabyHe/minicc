@@ -1,3 +1,4 @@
+import argparse
 import os
 import platform
 import subprocess
@@ -8,6 +9,7 @@ from minicc.agent import agent_loop
 from minicc import ux
 from minicc.llm import get_usage, context_usage, compact, recap
 from minicc import permissions
+from minicc import sessions
 from minicc.prompts.system import load_project_context
 
 
@@ -126,12 +128,35 @@ def _cmd_recap(messages):
     ux.markdown(summary)
 
 
+def _init_session():
+    """Parse --continue/--resume and return (history, session_id)."""
+    parser = argparse.ArgumentParser(prog="minicc")
+    parser.add_argument(
+        "--continue", dest="cont", action="store_true",
+        help="resume the most recent session in this directory",
+    )
+    parser.add_argument("--resume", metavar="ID", help="resume a specific session id")
+    args = parser.parse_args()
+
+    if args.resume:
+        return sessions.load(args.resume) or [], args.resume
+    if args.cont:
+        sid = sessions.latest_id()
+        if sid:
+            return sessions.load(sid) or [], sid
+    return [], sessions.new_id()
+
+
 def main():
+    history, session_id = _init_session()
     llm.set_project_context(load_project_context())
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
+    if history:
+        ux.say(
+            f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO
+        )
     ux.console.rule()
-    history = []
     turn = 0
     while True:
         try:
@@ -193,6 +218,9 @@ def main():
             ux.say(f"agent error: {e!r}", style=ux.S_ERROR)
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
+
+        # persist after each successful turn so --continue/--resume can pick up here
+        sessions.save(session_id, history, os.environ.get("MODEL_ID", "?"))
 
 
 if __name__ == "__main__":
