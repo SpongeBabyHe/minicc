@@ -1,6 +1,6 @@
-from . import bash, read_file, write_file, edit_file, glob, grep, task
+from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write
 
-_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task]
+_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write]
 
 _TOOLS_RAW = [m.SCHEMA for m in _MODULES]
 
