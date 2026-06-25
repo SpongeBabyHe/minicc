@@ -1,11 +1,18 @@
-"""User/project settings: the model preference.
+"""User/project settings: model preference + a tool allowlist.
 
-Two optional JSON files, project overrides global:
+Two optional JSON files:
 
-    ~/.minicc/settings.json      (global — your default everywhere)
-    <cwd>/.minicc/settings.json  (project — overrides global)
+    ~/.minicc/settings.json      (global)
+    <cwd>/.minicc/settings.json  (project)
 
-Precedence: project default_model > global default_model > DEFAULT_MODEL; a session `/model X` overrides on top (in-process, not persisted).
+Keys:
+  default_model  — project overrides global, then DEFAULT_MODEL. A session
+                   `/model X` overrides on top (in-process, not persisted).
+  allowed_tools  — gated tools pre-approved without a prompt; union of global +
+                   project. bash is NOT preloadable (unbounded + irreversible —
+                   approve per session). Keep trust project-scoped. See PERMISSIONS.md.
+
+env is reserved for secrets + endpoint (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
 """
 
 import json
@@ -50,3 +57,16 @@ def set_default_model(model_id: str, scope: str = "global") -> Path:
     data["default_model"] = model_id
     path.write_text(json.dumps(data, indent=2))
     return path
+
+
+def _tool_list(d: dict) -> set:
+    v = d.get("allowed_tools", [])
+    return set(v) if isinstance(v, list) else set()
+
+
+def allowed_tools() -> list:
+    """Tools listed for pre-approval in settings (union of global + project).
+    permissions.preload decides what's actually applied (bash is excluded there).
+    minicc never auto-writes here — you opt in by editing settings.json. Keep
+    trust project-scoped. See PERMISSIONS.md."""
+    return sorted(_tool_list(_read(_global())) | _tool_list(_read(_project())))

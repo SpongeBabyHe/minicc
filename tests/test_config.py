@@ -58,3 +58,24 @@ def test_project_scope_self_ignores(monkeypatch, tmp_path):
     _, proj = _setup(monkeypatch, tmp_path)
     config.set_default_model("claude-opus-4-8", scope="project")
     assert (proj / ".minicc" / ".gitignore").read_text() == "*\n"
+
+
+def test_allowed_tools_union(monkeypatch, tmp_path):
+    home, proj = _setup(monkeypatch, tmp_path)
+    _write(home / ".minicc" / "settings.json", {"allowed_tools": ["edit_file"]})
+    _write(proj / ".minicc" / "settings.json", {"allowed_tools": ["write_file"]})
+    assert config.allowed_tools() == ["edit_file", "write_file"]   # sorted union
+
+
+def test_allowed_tools_empty_when_unset(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    assert config.allowed_tools() == []
+
+
+def test_preload_excludes_bash_and_non_gated():
+    from minicc import permissions
+    permissions.reset()
+    applied = permissions.preload(["write_file", "edit_file", "read_file", "bash", "bogus"])
+    assert applied == {"write_file", "edit_file"}     # bash excluded; read_file/bogus not gated
+    assert "bash" not in permissions._ALLOWED         # bash never pre-approved from config
+    permissions.reset()

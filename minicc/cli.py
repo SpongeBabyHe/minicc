@@ -224,9 +224,23 @@ def _friendly_error(e: Exception) -> str:
 def main():
     history, session_id = _init_session()
     histfile = _setup_history()
+    requested = config.allowed_tools()
+    pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
+    refused = sorted(set(requested) & permissions.NO_PRELOAD)
     llm.set_project_context(load_project_context())
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
+    if pre_approved:
+        ux.say(
+            f"pre-approved (no prompt) from settings: {', '.join(sorted(pre_approved))}",
+            style=ux.S_INFO,
+        )
+    if refused:
+        ux.say(
+            f"settings list {', '.join(refused)} but it can't be pre-approved "
+            "(approve per session — see PERMISSIONS.md)",
+            style=ux.S_INFO,
+        )
     if history:
         ux.say(
             f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO
@@ -254,6 +268,7 @@ def main():
             elif cmd == "/clear":
                 history.clear()
                 permissions.reset()
+                permissions.preload(config.allowed_tools())  # keep settings-trusted tools
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
                 ux.say(

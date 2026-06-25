@@ -7,29 +7,41 @@
 #     bash effectively disables all gating for network calls, package installs,
 #     git push, kill, etc. Use 'y' for bash; reserve 'a' for write_file/edit_file.
 #   - Scope escapes (paths outside cwd) are NOT detected. Add later if needed.
+#
+# Full trust model + permission-layer vs execution-layer analysis: PERMISSIONS.md
 
 
 from pathlib import Path
 from minicc import ux
 
-
+# Gated tools: these require user approval before use.
 GATED_TOOLS = ["bash", "write_file", "edit_file"]
+# session-scoped allowed tools if user answers "all" to the prompt
 _ALLOWED = set()
+
+# Gated tools that may NOT be pre-approved from config (preload). bash's effect is
+# unbounded + irreversible and the gate is its ONLY boundary, so trusting it must
+# stay a per-session decision, never a persistent settings entry. See PERMISSIONS.md.
+NO_PRELOAD = {"bash"}
 
 
 def _format_args(tool_name: str, tool_input: dict) -> str:
     if tool_name == "bash":
-        return ux.kv_block([
-            ("cwd", Path.cwd()),
-            ("cmd", tool_input.get("command", "")),
-        ])
+        return ux.kv_block(
+            [
+                ("cwd", Path.cwd()),
+                ("cmd", tool_input.get("command", "")),
+            ]
+        )
     if tool_name == "write_file":
         content = tool_input.get("content", "")
-        return ux.kv_block([
-            ("path", tool_input.get("path", "")),
-            ("size", f"{len(content)} bytes"),
-            ("preview", ux.truncate(content, 500)),
-        ])
+        return ux.kv_block(
+            [
+                ("path", tool_input.get("path", "")),
+                ("size", f"{len(content)} bytes"),
+                ("preview", ux.truncate(content, 500)),
+            ]
+        )
     if tool_name == "edit_file":
         return ux.diff_view(
             tool_input.get("old_text", ""),
@@ -55,3 +67,12 @@ def confirm(tool_name: str, tool_input: dict) -> bool:
 def reset():
     """Clear the session-scoped allowed-tools set. Called by /clear."""
     _ALLOWED.clear()
+
+
+def preload(tools) -> set:
+    """Pre-approve gated tools from config at startup (re-applied after /clear).
+    Excludes NO_PRELOAD (bash) and non-gated names. Returns the set applied, so
+    the caller can surface which tools now skip the prompt."""
+    applied = {t for t in tools if t in GATED_TOOLS and t not in NO_PRELOAD}
+    _ALLOWED.update(applied)
+    return applied
