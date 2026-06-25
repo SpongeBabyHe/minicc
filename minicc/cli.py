@@ -1,5 +1,4 @@
 import argparse
-import os
 import platform
 import readline  # noqa: F401 — importing enables history + line editing for input()
 import subprocess
@@ -12,6 +11,7 @@ from minicc import ux
 from minicc.llm import get_usage, context_usage, compact, recap
 from minicc import permissions
 from minicc import sessions
+from minicc import config
 from minicc.prompts.system import load_project_context
 
 
@@ -40,7 +40,7 @@ def _session_info() -> dict:
     info = {
         "SESSION": datetime.now().isoformat(timespec="seconds"),
         "commit": _git_sha(),
-        "model": os.environ.get("MODEL_ID", "?"),
+        "model": llm.get_model(),
         "cwd": str(Path.cwd()),
         "os": platform.system(),
     }
@@ -57,6 +57,7 @@ def _cmd_help():
                 ("/clear", "Reset conversation history and tool permissions"),
                 ("/context", "Show conversation token usage vs eviction budget"),
                 ("/cost", "Show token usage and estimated cost"),
+                ("/model [default] [id]", "Show / switch session / set persistent default model"),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
                 ("q / exit / quit", "Leave minicc"),
@@ -128,6 +129,49 @@ def _cmd_recap(messages):
     summary = recap(messages)
     ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
     ux.markdown(summary)
+
+
+# Short aliases for ergonomics; /model also accepts any raw model id.
+_MODEL_ALIASES = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+    "fable": "claude-fable-5",
+}
+
+
+def _cmd_model(arg: str | None):
+    """Show the model, switch it for this session, or set the persistent default.
+
+      /model                 → show current (session) + default (persisted) + aliases
+      /model <alias|id>      → switch for this session only (reverts on restart)
+      /model default <a|id>  → set the persistent default (global settings) + switch
+    """
+    if not arg:
+        cur = llm.get_model()
+        rows = [("current (session)", cur), ("default (persisted)", config.resolve_model())]
+        rows += [(alias, mid) for alias, mid in _MODEL_ALIASES.items()]
+        ux.say(ux.kv_block(rows))
+        ux.say("usage: /model <alias|id>  ·  /model default <alias|id>", style=ux.S_INFO)
+        return
+
+    parts = arg.split(maxsplit=1)
+    if parts[0] == "default":
+        if len(parts) < 2:
+            ux.say("usage: /model default <alias|id>", style=ux.S_ERROR)
+            return
+        target = _MODEL_ALIASES.get(parts[1].strip(), parts[1].strip())
+        # always global for now. config.set_default_model supports scope="project"
+        # and resolve_model already reads project > global, but there's no command
+        # surface (e.g. --project) to write a per-project default yet — deferred.
+        config.set_default_model(target)
+        llm.set_model(target)
+        ux.say(f"default model → {target}  (persisted globally + switched)", style=ux.S_INFO)
+        return
+
+    target = _MODEL_ALIASES.get(arg.strip(), arg.strip())
+    llm.set_model(target)
+    ux.say(f"model → {target}  (this session)", style=ux.S_INFO)
 
 
 def _init_session():
@@ -218,6 +262,8 @@ def main():
                 )
             elif cmd == "/cost":
                 _cmd_cost()
+            elif cmd == "/model":
+                _cmd_model(arg)
             elif cmd == "/context":
                 _cmd_context(history)
             elif cmd == "/compact":
@@ -251,7 +297,7 @@ def main():
         # No post-loop re-print: streaming already rendered the assistant text.
 
         # persist after each successful turn so --continue/--resume can pick up here
-        sessions.save(session_id, history, os.environ.get("MODEL_ID", "?"))
+        sessions.save(session_id, history, llm.get_model())
 
     # loop exited (q/exit/EOF/Ctrl-C): persist input history for next run
     try:

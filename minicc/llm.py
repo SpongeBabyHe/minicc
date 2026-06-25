@@ -6,16 +6,28 @@ from pathlib import Path
 from minicc.tools import TOOLS
 from minicc.prompts.system import build_system_prompt, load_project_context
 from minicc import ux
+from minicc import config
 
-load_dotenv()
-
-MODEL = os.environ["MODEL_ID"]
+load_dotenv()  # ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL only; model lives in config
+MODEL = config.resolve_model()
 # max_retries: the SDK retries transient failures (429/500/503/connection) with
 # exponential backoff + jitter, honoring Retry-After. Bumped from the default 2
 # to ride out brief rate-limit spikes during dogfood. (Structurally-too-big
 # requests are handled by L3/L4, not retries.)
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
 SYSTEM = build_system_prompt()
+
+
+def get_model() -> str:
+    """The model id used for inference — single source of truth (see /model)."""
+    return MODEL
+
+
+def set_model(model_id: str) -> None:
+    """Switch the model for in-session."""
+    global MODEL
+    MODEL = model_id
+
 
 # ─── L3: Token budget for tool_result eviction ──────────────────────────────
 # Above this estimated token count, llm_response() evicts old tool_result
