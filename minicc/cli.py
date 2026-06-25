@@ -21,6 +21,16 @@ _PRICE_OUTPUT_PER_M = 15.0
 _PRICE_CACHE_WRITE_PER_M = 3.75  # 1.25x input
 _PRICE_CACHE_READ_PER_M = 0.30  # 0.1x input
 
+# /init: a canned instruction run as a normal agent turn — the model explores with
+# its own tools and writes CLAUDE.md. No special machinery; just a good prompt.
+_INIT_PROMPT = (
+    "Analyze this project and write a concise CLAUDE.md at the repo root to help an "
+    "AI assistant work here effectively. First explore the structure with "
+    "glob/grep/read_file (build/test/run commands, layout, key files, conventions). "
+    "If CLAUDE.md already exists, read it and improve it in place rather than "
+    "duplicating. Keep it tight and high-signal — no filler. Write it with write_file."
+)
+
 
 def _git_sha() -> str:
     try:
@@ -55,6 +65,7 @@ def _cmd_help():
             [
                 ("/help", "Show this help"),
                 ("/clear", "Reset conversation history and tool permissions"),
+                ("/init", "Scan the project and write/refresh CLAUDE.md"),
                 ("/context", "Show conversation token usage vs eviction budget"),
                 ("/cost", "Show token usage and estimated cost"),
                 ("/model [default] [id]", "Show / switch session / set persistent default model"),
@@ -258,7 +269,11 @@ def main():
         if query.lower() in ("q", "exit", "quit"):
             break
 
-        if query.startswith("/"):
+        if query.strip() == "/init":
+            ux.say("scanning the project to write CLAUDE.md ...", style=ux.S_INFO)
+            query = _INIT_PROMPT
+            # fall through: run as a normal agent turn (tools + streaming + persist)
+        elif query.startswith("/"):
             # split into command word + optional argument (e.g. /compact <focus>)
             parts = query.split(maxsplit=1)
             cmd = parts[0]
