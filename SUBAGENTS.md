@@ -109,6 +109,34 @@ A subagent could loop forever (read → read → ...). Cap it:
 `SUBAGENT_MAX_TURNS = 15`. When hit, the subagent stops and returns whatever it
 has, with a note. Prevents a delegated task from burning unbounded tokens.
 
+### D8. Subagent model — a cheaper model for read-only exploration (own choice, planned)
+
+Today a subagent runs on the **same model** as the parent (`agent_loop` →
+`llm_response` reads the global `MODEL`). CC runs its Explore subagents on
+**Haiku** — read-only exploration doesn't need the flagship, and Haiku is ~5×
+cheaper ($1/$5 per M vs Sonnet's $3/$15).
+
+minicc's `task` is a **separate `agent_loop`**, which makes this a clean fit:
+
+- Switching the **main** loop's model mid-session would invalidate its prompt
+  cache (the cached prefix is model-scoped). A subagent is a **separate request
+  stream**, so running it on Haiku **doesn't touch the parent's cached prefix** —
+  exactly why CC spawns a subagent rather than swapping the main model.
+- Two independent savings then stack: **(D5) context isolation** — the
+  exploration never bloats parent context — **+ (D8) cheaper model** — the
+  exploration itself costs ~5× less.
+
+**Decision:** the subagent defaults to a cheaper model (Haiku); the parent stays
+on the configured model.
+
+**Implementation note:** `MODEL` is a module global and `set_model()` mutates it —
+using that for the subagent would change the **parent's** model too. Thread a
+per-call `model` override through `agent_loop` → `llm_response` → the API params
+(don't mutate the global), alongside the `tools`/`max_turns` params the subagent
+already passes.
+
+**Status: designed, not implemented.**
+
 ## Interactions
 
 ### With context management (L1–L6) — synergistic
@@ -121,7 +149,8 @@ has, with a note. Prevents a delegated task from burning unbounded tokens.
 
 ### With usage / cost — counts toward the same totals
 The subagent makes real API calls → tracked in the same `_USAGE`. `/cost`
-reflects subagent spend (it's all the same bill).
+reflects subagent spend (it's all the same bill). Once D8 lands (subagent on
+Haiku), that spend drops ~5×, still counted in the same totals.
 
 ### With streaming
 Subagent internal turns need **not** stream to the terminal (they're dimmed
