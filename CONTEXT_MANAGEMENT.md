@@ -147,6 +147,77 @@ this section is the processed understanding.
 - Softer thrash recovery (auto-`/clear`, or drop the oversized block + retry)
   instead of crashing the turn.
 
+## Token economy: caching the conversation history (designed, planned)
+
+Two different goals both touch `messages`, and it's worth keeping them apart:
+
+- **Context-window management (L1–L6 above) = size.** Keep history small enough
+  to fit the window and rate limits.
+- **Token economy = cost.** Pay less for what you *do* send. Caching doesn't
+  shrink the history — it makes re-sending it ~10× cheaper.
+
+At a glance — token-saving levers, CC vs minicc:
+
+| Lever | CC | minicc | Gap |
+| ----- | -- | ------ | --- |
+| Stable-prefix cache (system / tools / CLAUDE.md) | ✅ | ✅ L1 | none — `Date:` is per-day, caches within a session |
+| **Cache the conversation history** | ✅ | ❌ | **#1 gap** — history re-sent at full price every turn |
+| Truncate large tool output | ✅ | ✅ L2 | roughly at parity |
+| Evict stale `tool_result` (context editing) | ✅ | ✅ L3 | minor — fights history caching (see below) |
+| Compaction | ✅ `/compact` + server-side beta | ✅ L4 (self-rolled summary call) | self-rolled adds a round-trip; server-side `compact-2026-01-12` is an option |
+| **Don't re-send large `tool_use` inputs** | ✅ | ❌ | a big `write_file` body is re-sent full-price forever (L3 only touches `tool_result`) |
+| Lower `effort` | xhigh default | unset (uses `high` default) | could set `medium` to cut tokens (quality tradeoff) |
+
+(Subagent-side levers — running read-only exploration on a cheaper model — live
+in [SUBAGENTS.md](SUBAGENTS.md) D8, not this table.)
+
+**Current state.** L1 caches only the *stable prefix* (system / CLAUDE.md /
+tools). The **conversation history is re-sent at full input price every turn** —
+deliberately, to avoid L3 eviction mutating a cached block and invalidating the
+cache (see the v0.3 candidate above). On a long session the growing uncached
+history dominates cost; a large `tool_use` input (e.g. a big `write_file`'s
+content) is the worst case — it sits in an assistant block and is re-sent
+full-price forever.
+
+**Gap vs CC.** CC caches the conversation history too. The fix is the standard
+multi-turn pattern: put a `cache_control` breakpoint on the **last block of the
+most-recent turn**; the next request reads the entire prior history from cache
+at ~0.1× input price.
+
+**Economics** (from the Claude API: cache write 1.25× input, read **0.1×**,
+break-even at 2 requests). A 50K-token history on Sonnet ($3/M in) is ~$0.15/turn
+uncached vs ~$0.015/turn cached — ~90% off the history portion; the 1.25× write
+is paid once. It **compounds**: a cheaper turn makes every later turn (and all
+dogfood) cheaper.
+
+**The L1×L3 tension (why this needs care).** L3 eviction mutates old
+`tool_result` content **in place** → changes the cached prefix bytes →
+invalidates the cache from that point. Incremental eviction and history-caching
+pull against each other. Resolution:
+
+- L3 only fires above `TOKEN_BUDGET` (150K). **Below that — the common dogfood
+  session — history caching is clean** and L3 never runs. Land caching for the
+  common case first.
+- L4 compaction is an **intentional reset point**: it replaces history with a
+  summary (one cache re-write), then the new shorter prefix caches cleanly again.
+  Compaction + caching coexist.
+- Only L3 *incremental* eviction × caching needs coordination, and only at large
+  scale (already near the rate-limit wall). Defer it: place the breakpoint before
+  the region L3 would touch, or accept one re-write per eviction event.
+
+**Large tool_use inputs.** History caching solves most of this for free (the big
+content reads at 0.1× once cached). If still hot, cap/evict `tool_use` inputs as
+a separate measure (L3 only touches `tool_result` today).
+
+**L4 → server-side compaction (option).** minicc's L4 rolls its own
+summarization (an extra LLM round-trip). The API now offers server-side
+compaction (`compact-2026-01-12` beta) — it summarizes server-side and returns a
+compaction block to pass back, cheaper than a separate call. A possible L4
+replacement.
+
+**Status: designed, not implemented.** First target — the biggest cost lever, a
+direct CC-parity gap, and it makes all later dogfood cheaper.
+
 ## Implementation order (Order B)
 
 Justified in detail elsewhere; tl;dr is "smallest commit + most urgent dogfood
