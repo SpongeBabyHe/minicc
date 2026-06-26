@@ -139,8 +139,7 @@ this section is the processed understanding.
   permanent feature, not just a test aid.
 
 ### v0.3 candidates (from dogfood)
-- Cache conversation history too (CC does; minicc caches only the stable prefix
-  to avoid eviction thrashing the cache).
+- ~~Cache conversation history~~ — **done** (`_cacheable`; see § Token economy).
 - Reduce/evict large *tool_use* inputs (e.g. write_file content) — L3 only
   touches tool_result, not tool_use, so a big write stays full until it ages
   into the compacted portion.
@@ -161,11 +160,11 @@ At a glance — token-saving levers, CC vs minicc:
 | Lever | CC | minicc | Gap |
 | ----- | -- | ------ | --- |
 | Stable-prefix cache (system / tools / CLAUDE.md) | ✅ | ✅ L1 | none — `Date:` is per-day, caches within a session |
-| **Cache the conversation history** | ✅ | ❌ | **#1 gap** — history re-sent at full price every turn |
+| **Cache the conversation history** | ✅ | ✅ `_cacheable` | **closed** — breakpoint on the last turn's last block; prior history reads at ~0.1× |
 | Truncate large tool output | ✅ | ✅ L2 | roughly at parity |
-| Evict stale `tool_result` (context editing) | ✅ | ✅ L3 | minor — fights history caching (see below) |
+| Evict stale `tool_result` (context editing) | ✅ | ✅ L3 | minor — fights history caching above 150K (see below) |
 | Compaction | ✅ `/compact` + server-side beta | ✅ L4 (self-rolled summary call) | self-rolled adds a round-trip; server-side `compact-2026-01-12` is an option |
-| **Don't re-send large `tool_use` inputs** | ✅ | ❌ | a big `write_file` body is re-sent full-price forever (L3 only touches `tool_result`) |
+| Don't re-send large `tool_use` inputs | ✅ | ~✅ | mostly covered by history caching now (read at ~0.1×); a separate cap only if still hot |
 | Lower `effort` | xhigh default | unset (uses `high` default) | could set `medium` to cut tokens (quality tradeoff) |
 
 (Subagent-side levers — running read-only exploration on a cheaper model — live
@@ -215,8 +214,12 @@ compaction (`compact-2026-01-12` beta) — it summarizes server-side and returns
 compaction block to pass back, cheaper than a separate call. A possible L4
 replacement.
 
-**Status: designed, not implemented.** First target — the biggest cost lever, a
-direct CC-parity gap, and it makes all later dogfood cheaper.
+**Status: ✅ implemented** — `_cacheable()` in `llm.py` adds the breakpoint on the
+last turn's last block and normalizes string content to a stable text block (so a
+message's bytes match whether it's the last turn or mid-history); the stored
+history stays clean (eviction L3 + serialization unaffected). Remaining as
+*options*, not needed for the common session: a server-side compaction
+replacement for L4, and L3×caching coordination above the 150K budget.
 
 ## Implementation order (Order B)
 

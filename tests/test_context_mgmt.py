@@ -206,3 +206,47 @@ def test_no_thrash_when_under_budget(monkeypatch):
     resp = llm.llm_response(msgs, stream=False)
     assert resp is not None
     assert llm._compact_attempts == 0
+
+
+# ─── L1: conversation-history caching ────────────────────────────────────────
+def test_cacheable_string_last_gets_breakpoint():
+    msgs = [user("hello")]
+    out = llm._cacheable(msgs)
+    assert out[-1]["content"] == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert msgs[0]["content"] == "hello"                     # input untouched
+
+
+def test_cacheable_list_last_block_gets_breakpoint():
+    msgs = [tool_result("t1", "body")]
+    out = llm._cacheable(msgs)
+    assert out[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in msgs[0]["content"][0]      # input untouched
+
+
+def test_cacheable_only_last_message_is_marked():
+    msgs = [user("q1"), assistant_call("t1"), tool_result("t1"), user("q2")]
+    out = llm._cacheable(msgs)
+    assert "cache_control" not in out[0]["content"][0]       # q1 normalized, not marked
+    assert out[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}  # q2 marked
+    assert out[1] is msgs[1]                                 # assistant passed through
+
+
+def test_cacheable_does_not_mutate_input():
+    msgs = [user("q1"), tool_result("t1")]
+    llm._cacheable(msgs)
+    assert msgs[0]["content"] == "q1"                        # string untouched
+    assert "cache_control" not in msgs[1]["content"][0]      # tool_result untouched
+
+
+def test_llm_response_caches_the_history(monkeypatch):
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.client.messages, "create", capture)
+    llm.llm_response([user("hi")], stream=False)
+    assert captured["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}

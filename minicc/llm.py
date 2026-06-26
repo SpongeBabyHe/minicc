@@ -293,9 +293,48 @@ def recap(messages, focus: str | None = None) -> str:
     return _summarize(messages, focus=focus)
 
 
-def llm_response(messages, system: str | None = None, stream: bool = True, tools=None,
-                 model: str | None = None):
-    m = model if model is not None else MODEL   # per-call override (sub-agents); else global MODEL
+def _cacheable(messages):
+    """Request-time copy of `messages` with a `cache_control` breakpoint on the
+    last block of the last message — the API then reads the prior conversation
+    from cache (~0.1x input) instead of re-paying full price each turn.
+
+    String user content is normalized to a text block so a message's bytes are
+    identical whether it's the last turn or sunk into mid-history; otherwise the
+    cached prefix wouldn't match across turns. Does NOT mutate the stored history
+    (eviction L3 + serialization keep the clean form). See CONTEXT_MANAGEMENT.md
+    § Token economy. (cache_control is a marker, not content, so the breakpoint
+    moving forward each turn doesn't invalidate earlier cache writes.)
+    """
+    # not deepcopy, only normalize string content to a text block, keep the rest of the message as is and as where it is.
+    out = [
+        (
+            {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+            if isinstance(m.get("content"), str)
+            else m
+        )
+        for m in messages
+    ]
+    if out:
+        last = out[-1]
+        c = last["content"]
+        if isinstance(c, list) and c and isinstance(c[-1], dict):
+            out[-1] = {
+                **last,
+                "content": c[:-1] + [{**c[-1], "cache_control": {"type": "ephemeral"}}],
+            }
+    return out
+
+
+def llm_response(
+    messages,
+    system: str | None = None,
+    stream: bool = True,
+    tools=None,
+    model: str | None = None,
+):
+    m = (
+        model if model is not None else MODEL
+    )  # per-call override (sub-agents); else global MODEL
     global _compact_attempts
     if _estimate_tokens(messages) <= TOKEN_BUDGET:
         _compact_attempts = 0
@@ -325,7 +364,7 @@ def llm_response(messages, system: str | None = None, stream: bool = True, tools
 
     params = dict(
         model=m,
-        messages=messages,
+        messages=_cacheable(messages),  # L1: cache the conversation history too
         max_tokens=8000,
         system=_build_system_block(system),
         tools=tools if tools is not None else TOOLS,
