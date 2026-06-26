@@ -12,6 +12,7 @@ from minicc.llm import get_usage, context_usage, compact, recap
 from minicc import permissions
 from minicc import sessions
 from minicc import config
+from minicc import checkpoints
 from minicc.prompts.system import load_project_context
 
 
@@ -71,6 +72,7 @@ def _cmd_help():
                 ("/model [default] [id]", "Show / switch session / set persistent default model"),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
+                ("/rewind [N]", "List restore points, or revert files to restore point N"),
                 ("q / exit / quit", "Leave minicc"),
             ]
         )
@@ -185,6 +187,44 @@ def _cmd_model(arg: str | None):
     ux.say(f"model → {target}  (this session)", style=ux.S_INFO)
 
 
+def _cmd_rewind(history, arg: str | None):
+    """List restore points, or `/rewind N` to revert files to restore point N.
+    N is the position in the /rewind list (contiguous 1..N over file-changing
+    turns only) — not an internal turn number, which has gaps from read-only turns.
+    Code-only: files revert, the conversation is kept (a notice tells the model)."""
+    points = checkpoints.restore_points()   # [(turn, query)], oldest→newest
+    if arg is None:
+        if not points:
+            ux.say("nothing to rewind — no file changes yet", style=ux.S_INFO)
+            return
+        ux.say(ux.kv_block([(f"[{i}]", ux.truncate(q, 60)) for i, (_, q) in enumerate(points, 1)]))
+        ux.say(
+            "usage: /rewind <n> — revert files to restore point n (conversation kept); "
+            "bash-made changes aren't tracked.",
+            style=ux.S_INFO,
+        )
+        return
+    try:
+        n = int(arg)
+    except ValueError:
+        ux.say("usage: /rewind <n>  (n from the /rewind list)", style=ux.S_ERROR)
+        return
+    if not (1 <= n <= len(points)):
+        ux.say(f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
+        return
+    restored, failed = checkpoints.restore_files(points[n - 1][0])   # map index → internal turn
+    history.append(
+        {
+            "role": "user",
+            "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
+        }
+    )
+    msg = f"reverted {restored} file change(s) to restore point {n}; conversation kept"
+    if failed:
+        msg += f"  — {len(failed)} could not be restored: {', '.join(failed)}"
+    ux.say(msg, style=ux.S_INFO)
+
+
 def _init_session():
     """Parse --continue/--resume and return (history, session_id)."""
     parser = argparse.ArgumentParser(prog="minicc")
@@ -235,6 +275,7 @@ def _friendly_error(e: Exception) -> str:
 def main():
     history, session_id = _init_session()
     histfile = _setup_history()
+    checkpoints.reset()  # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
     requested = config.allowed_tools()
     pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
@@ -284,6 +325,7 @@ def main():
                 history.clear()
                 permissions.reset()
                 permissions.preload(config.allowed_tools())  # keep settings-trusted tools
+                checkpoints.reset()
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
                 ux.say(
@@ -300,6 +342,8 @@ def main():
                 _cmd_compact(history, focus=arg)
             elif cmd == "/recap":
                 _cmd_recap(history)
+            elif cmd == "/rewind":
+                _cmd_rewind(history, arg)
             else:
                 ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             continue
@@ -309,6 +353,7 @@ def main():
 
         mark = len(history)   # roll-back point if this turn is interrupted/errors
         history.append({"role": "user", "content": query})
+        checkpoints.start(turn, query)   # snapshot files this turn touches, for /rewind
 
         try:
             agent_loop(history)   # streams assistant text to the screen as it arrives

@@ -2,6 +2,7 @@ from minicc.llm import llm_response
 from minicc.tools import TOOLS, TOOL_HANDLERS
 from minicc.permissions import confirm
 from minicc import ux
+from minicc import checkpoints
 
 
 def agent_loop(
@@ -46,6 +47,8 @@ def agent_loop(
                 elif not confirm(block.name, block.input):  # harness permission
                     output = f"User declined to run {block.name}."
                 else:
+                    if block.name in ("write_file", "edit_file"):
+                        checkpoints.before_write(block.input.get("path"))  # for /rewind
                     try:
                         output = handler(**block.input)
                     except Exception as e:
