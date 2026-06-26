@@ -10,6 +10,12 @@ from minicc import ux
 
 SUBAGENT_MAX_TURNS = 15
 
+# Read-only exploration doesn't need the flagship model — run the sub-agent on a
+# cheaper one (~5x cheaper than Sonnet). It's a separate request stream, so it
+# never touches the parent's prompt cache (see SUBAGENTS.md D8). Could become
+# config-driven later.
+SUBAGENT_MODEL = "claude-haiku-4-5-20251001"
+
 SUBAGENT_PROMPT = """You are a focused sub-agent handling a read-only exploration \
 subtask for a parent agent.
 
@@ -74,6 +80,7 @@ def task(description: str) -> str:
         tools=READ_ONLY_TOOLS,
         max_turns=SUBAGENT_MAX_TURNS,
         indent="  ",                  # nest its tool lines under the parent
+        model=SUBAGENT_MODEL,         # cheaper model; doesn't touch the parent's cache
     )
     ux.say("  [sub-agent done]", style=ux.S_INFO)
     return _final_text(sub)

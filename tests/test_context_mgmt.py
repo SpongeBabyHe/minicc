@@ -187,7 +187,7 @@ def test_thrash_guard_raises(monkeypatch):
     MAX_COMPACT_ATTEMPTS instead of looping forever."""
     monkeypatch.setattr(llm, "TOKEN_BUDGET", 1)          # everything is "over"
     monkeypatch.setattr(llm, "_evict_old_tool_result", lambda m: 0)
-    monkeypatch.setattr(llm, "_compact", lambda m: False)  # reduction impossible
+    monkeypatch.setattr(llm, "_compact", lambda m, **kw: False)  # reduction impossible (now takes model=)
     monkeypatch.setattr(llm, "_compact_attempts", 0)
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
 

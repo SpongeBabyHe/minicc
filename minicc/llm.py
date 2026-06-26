@@ -229,15 +229,16 @@ def _find_cut_index(messages) -> int | None:
     return None
 
 
-def _summarize(messages, focus: str | None = None) -> str:
+def _summarize(messages, focus: str | None = None, model: str | None = None) -> str:
     """One LLM call returning a structured summary of `messages`.
 
     Shared by _compact (L4) and recap (L6c). `focus`, if given, steers what the
-    summary preserves (powers `/compact <focus>`).
+    summary preserves (powers `/compact <focus>`). `model` lets a sub-agent's
+    compaction run on the sub-agent's model; defaults to the global MODEL.
     """
     focus_line = f"\n\nFocus the summary on: {focus}" if focus else ""
     resp = client.messages.create(
-        model=MODEL,
+        model=model if model is not None else MODEL,
         max_tokens=1500,
         system=_COMPACT_PROMPT,
         messages=[
@@ -252,7 +253,7 @@ def _summarize(messages, focus: str | None = None) -> str:
     return resp.content[0].text if resp.content else "(empty summary)"
 
 
-def _compact(messages, focus: str | None = None) -> bool:
+def _compact(messages, focus: str | None = None, model: str | None = None) -> bool:
     """Summarize older messages via one LLM call; replace them in place.
 
     Returns True if compaction reduced the history, False if no safe cut.
@@ -263,7 +264,7 @@ def _compact(messages, focus: str | None = None) -> bool:
 
     older, recent = messages[:cut], messages[cut:]
     ux.say("[compacting conversation history...]", style=ux.S_INFO)
-    summary = _summarize(older, focus=focus)
+    summary = _summarize(older, focus=focus, model=model)
 
     # recent starts with an assistant message (guaranteed by _find_cut_index),
     # so prepending just the summary as a user message keeps valid alternation:
@@ -292,7 +293,9 @@ def recap(messages, focus: str | None = None) -> str:
     return _summarize(messages, focus=focus)
 
 
-def llm_response(messages, system: str | None = None, stream: bool = True, tools=None):
+def llm_response(messages, system: str | None = None, stream: bool = True, tools=None,
+                 model: str | None = None):
+    m = model if model is not None else MODEL   # per-call override (sub-agents); else global MODEL
     global _compact_attempts
     if _estimate_tokens(messages) <= TOKEN_BUDGET:
         _compact_attempts = 0
@@ -318,10 +321,10 @@ def llm_response(messages, system: str | None = None, stream: bool = True, tools
                 )
                 raise RuntimeError("compact thrashing")
             _compact_attempts += 1
-            _compact(messages)
+            _compact(messages, model=m)
 
     params = dict(
-        model=MODEL,
+        model=m,
         messages=messages,
         max_tokens=8000,
         system=_build_system_block(system),

@@ -12,6 +12,7 @@ def agent_loop(
     tools=None,
     max_turns: int | None = None,
     indent: str = "",
+    model: str | None = None,
 ):
     """Run the agent loop until the model stops requesting tools.
 
@@ -21,6 +22,9 @@ def agent_loop(
                 runaway exploration can't loop forever).
     indent    : prefix for tool-call/result lines, so a sub-agent's activity
                 nests visually under the parent's `task(...)` call.
+    model     : per-call model override (sub-agents run on a cheaper model);
+                None = the global MODEL. Threaded to llm_response without
+                mutating the global, so the parent's cache/model are untouched.
     """
     tools = tools if tools is not None else TOOLS
     allowed = {t["name"] for t in tools}   # guard: model can't call un-advertised tools
@@ -30,7 +34,7 @@ def agent_loop(
             return
         turns += 1
         # streaming shows its own spinner-until-first-token, so no ux.thinking()
-        response = llm_response(messages, system, stream=stream, tools=tools)
+        response = llm_response(messages, system, stream=stream, tools=tools, model=model)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
