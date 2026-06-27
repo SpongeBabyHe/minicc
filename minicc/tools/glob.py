@@ -7,7 +7,12 @@ SCHEMA = {
     "description": "Find files matching a glob pattern (e.g. '**/*.py', 'src/*.ts'). Returns up to 100 matching paths, sorted by modification time (most recent first). If more than 100 match, the result includes a truncation flag — narrow your pattern. Use this instead of 'bash find' or 'bash ls' for locating files by name pattern.",
     "input_schema": {
         "type": "object",
-        "properties": {"pattern": {"type": "string"}},
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern, e.g. '**/*.py' or 'src/*.ts'. Relative to the current directory.",
+            }
+        },
         "required": ["pattern"],
     },
 }
