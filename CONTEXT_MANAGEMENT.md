@@ -1,250 +1,217 @@
 # Context management
 
-minicc's strategy for keeping the conversation history within Anthropic's
-context window and rate limits. **Inspired by Claude Code's documented design,
-not a 1:1 copy.**
+An LLM agent re-sends its **entire** conversation on every API call, and that
+history only grows — each tool call and its output joins it. Two distinct
+pressures follow, and minicc keeps them apart because the fixes are different:
 
-## Background
+- **Size** — the history must fit the model's context window and per-minute rate
+  limits.
+- **Cost** — input tokens are billed every turn, so a long history is paid for
+  again and again.
 
-LLM agents accumulate context turn by turn:
-- Tool calls and their outputs (often kilobytes per call) go into history
-- Every API request sends the **full** history
-- Long sessions or large tool outputs cause:
-  - **Cost**: input tokens scale linearly with conversation length
-  - **Rate limits**: per-minute token quotas get hit
-  - **Context window overflow**: hard cap at the model's window size
+The load-bearing distinction: **caching cuts cost without shrinking anything;
+eviction and compaction cut size.** You need both. The design mirrors Claude
+Code's documented behavior — where CC publishes specifics minicc follows them,
+where it's silent minicc makes (and labels) its own choice.
 
-The strategy below uses a layered defense, mostly modeled on Claude Code's
-publicly documented behavior (see [CC: How Claude Code works][cc-how] and
-[CC: prompt caching][cc-cache]).
-
-[cc-how]: https://code.claude.com/docs/en/how-claude-code-works
 [cc-cache]: https://code.claude.com/docs/en/prompt-caching
+[cache-tool]: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching
 
-## The 6 layers
+## The layers at a glance
 
-| Layer | Name                             | Status        | What it does                                                                                                                                       |
-| ----- | -------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| L1    | 3-layer prompt cache + CLAUDE.md | ✅ Implemented | Cache stable prefixes (system / project / tools) so cached input tokens cost ~10%. Load CLAUDE.md as project-level memory that survives `/clear`.  |
-| L2    | Tool output limits               | ✅ Implemented | Prevent a single tool call from blowing up context. Bash 30K + disk save; glob 100 cap; read_file truncation notice.                               |
-| L3    | Tool_result eviction             | ✅ Implemented | When history exceeds threshold, blank out content of old `tool_result` messages (keep structure so model knows it called the tool). No LLM call.   |
-| L4    | LLM auto-compact                 | ✅ Implemented | When eviction (L3) isn't enough, summarize older messages via an LLM call. Cut at an assistant boundary so tool_use/tool_result pairs stay intact. |
-| L5    | Thrashing protection             | ✅ Implemented | Stop auto-compact after MAX_COMPACT_ATTEMPTS if a single message keeps refilling the context; raise instead of looping.                            |
-| L6    | User controls                    | ✅ Implemented | `/context` ✅ (usage + eviction/compaction event counts). `/compact [focus]` and `/recap`                                                           |
+| Layer | Concern | What it does |
+| ----- | ------- | ------------ |
+| **L1** | cost | Prompt cache: stable prefix (system+tools, project) **and** conversation history. CLAUDE.md as project memory. |
+| **L2** | size | Cap each tool's output at the source so one call can't flood the history. |
+| **L3** | size | Above a token budget, blank out old `tool_result` content (keep the structure). No LLM call. |
+| **L4** | size | If eviction isn't enough, summarize the history with one LLM call. |
+| **L5** | safety | Stop compacting after N attempts if a single message keeps refilling the window. |
+| **L6** | control | `/context`, `/compact [focus]`, `/recap` — visibility and manual control. |
 
-Layers run in order: L1 reduces cost passively. L2 prevents single-call bloat.
-L3 → L4 → L5 trigger sequentially when total context grows. L6 gives the user
-visibility and manual control.
+L1 runs passively on every turn; L2 on every tool call; **L3 → L4 → L5** trigger
+in sequence as the history grows past `TOKEN_BUDGET`; L6 is the user's hand on
+the wheel.
 
-## Verified vs minicc's own choice
+## Cost: prompt caching (L1)
 
-Where Claude Code's docs publish specifics, minicc follows them. Where docs
-are silent, minicc makes its own engineering choice and labels it.
+The API caches by **exact prefix match**: mark a block with `cache_control` and
+the server stores the processed state of everything up to that block, keyed by a
+hash; a later request whose prefix is byte-identical reads it back at ~0.1× input
+price instead of recomputing. The request renders in a fixed hierarchy —
+**`tools → system → messages`** — and a change at any level invalidates that
+level and everything after it (the [invalidation table][cache-tool] proves the
+order: changing tools busts system+messages too, but changing system leaves the
+tools cache intact).
 
-### Verified from Claude Code docs
+minicc places breakpoints to match how often each region changes:
 
-- **Bash output cap**: 30,000 chars default, 150,000 hard ceiling. Beyond cap,
-  save full output to file + return path + preview. (L2)
-- **Glob match cap**: 100 results, sorted by mtime descending, with truncation
-  flag. (L2)
-- **Read pagination semantics**: `PARTIAL view` notice + `offset`/`limit`
-  parameters. (L2, partial)
-- **Auto-compact strategy**: clear older tool outputs first, then summarize
-  conversation if needed. (L3 → L4 order)
-- **Thrashing error**: literal message `Autocompact is thrashing: the context
-  refilled to the limit...`. (L5)
-- **Cache prefix layers**: System / Project context (CLAUDE.md) / Conversation.
-  (L1)
-- **CLAUDE.md size**: first 200 lines or 25KB, whichever first. (L1)
-- **`/compact [focus]` argument**: user can steer what's preserved. (L6)
-- **`/recap` doesn't mutate history**: cache-safe. (L6)
+- **Stable prefix** — one breakpoint on the last `system` block. Because tools
+  render *before* system, that breakpoint's prefix already covers the tool
+  definitions, so they cache together as one "system + tools" layer (the way CC
+  groups them). A separate tools breakpoint would only help if system changed
+  while tools didn't — which never happens within a session, since the system
+  prompt is frozen at construction.
+- **Project context** — a second breakpoint after CLAUDE.md (first 200 lines /
+  25 KB). It changes only on `/clear`, so keeping it separate lets a CLAUDE.md
+  reload re-cache while the system+tools layer survives.
+- **Conversation history** — `_cacheable` marks the last block of the most-recent
+  message every turn (the standard rolling-breakpoint pattern). The next turn
+  reads the whole prior history from cache; only the new exchange is fresh.
 
-### minicc's own choices
+That is three of the API's **four** breakpoints per request, leaving one free.
+The spare is reserved for a future *conversation anchor* — a second history
+breakpoint to stay within the API's 20-block cache lookback when one turn appends
+many blocks (≈10+ parallel tool calls). It's deferred, not built: minicc re-marks
+the last message on every call, so consecutive requests differ by only a couple
+of blocks and the common case is already inside the lookback window.
 
-- **read_file default limit**: not added — keep existing 50K char cap with
-  added truncation notice. Defer line-based pagination + offset to v0.3 unless
-  dogfood shows model needs it.
-- **Token thresholds (L3 evict + L4 compact trigger)**: `TOKEN_BUDGET = 150_000`
-  (single threshold; eviction runs first, compaction if still over). Estimated
-  via `len(json.dumps(messages)) // 4`.
-- **Tool_results kept intact during eviction**: `RECENT_TOOL_RESULTS_KEEP = 4`.
-- **Messages kept verbatim after compaction**: `KEEP_RECENT_MESSAGES = 6` (cut
-  lands on an assistant boundary at or after this point).
-- **Summary input field cap**: `SUMMARY_FIELD_CAP = 1000` per field, so the
-  summarization call can't itself balloon.
-- **L4 compact summary prompt**: minicc's own template (Goal / Done / Key
-  findings / In progress / Open questions) — CC's prompt is proprietary.
-- **L5 thrashing retry limit**: `MAX_COMPACT_ATTEMPTS = 3` (CC says "several").
-- **`.minicc/` self-ignoring directory pattern**: minicc's choice. Writes
-  `.minicc/.gitignore: "*"` so artifacts never get tracked even if user forgets
-  to gitignore `.minicc/` in their project.
+**Economics.** Cache write costs 1.25× input, read 0.1×, break-even at two
+requests. A 50K-token history on Sonnet ($3/M in) is ~$0.15/turn uncached vs
+~$0.015 cached — ~90% off the history, the write paid once. It compounds: every
+later turn (and all dogfood) gets cheaper.
 
-## What minicc does NOT implement
+**The tension with eviction.** L3 rewrites old `tool_result` content *in place*,
+changing the cached prefix bytes and invalidating the cache from that point —
+caching and incremental eviction pull against each other. Resolved by keeping
+eviction rare and coarse:
 
-Claude Code has these; minicc v0.2 doesn't. Deferred to v0.3+ based on dogfood
-data.
+- L3 fires only above `TOKEN_BUDGET` (150K); below that — the common session —
+  caching is clean and L3 never runs.
+- L4 compaction is an intentional reset: it replaces the history with a summary
+  (one re-write), then the shorter prefix caches cleanly again.
+- Only L3's incremental eviction needs real coordination, and only near the
+  rate-limit wall. CC's server-side context editing names the knob —
+  `clear_at_least`: break the cache only when eviction frees enough to be worth
+  the re-write. A cheap thing minicc could adopt; today it accepts one re-write
+  per eviction event.
 
-| Feature                                       | Why CC has it                                          | Why minicc defers                                                                     |
-| --------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- |
-| Subagents (isolated context window)           | Token-heavy exploration without polluting main context | Significant architectural addition; will design based on observed need during dogfood |
-| MEMORY.md (auto-written memory)               | Persistent learnings across sessions                   | Requires automatic writeback; design needs dogfood data                               |
-| `/rewind` + file checkpoints                  | Roll back to earlier turn with snapshot restore        | Needs checkpoint store; not the primary pain in dogfood                               |
-| Session persistence (`--resume`/`--continue`) | Continue conversations across CLI restarts             | minicc sessions are intentionally ephemeral; revisit if needed                        |
+## Size: caps, eviction, compaction (L2–L5)
 
-## Dogfood lessons & validation
+**L2 — cap output at the source.** Every tool bounds what it returns so a single
+call can't flood the history: bash 30K chars (full output saved to
+`.minicc/bash_outputs/` + a 2K preview), glob 100 matches, grep 100/file + 50K,
+read_file 50K with a truncation notice and `offset`/`limit` for windowed reads.
+This is the first and cheapest defense — it keeps junk *out* of the history
+rather than removing it later.
 
-Synthesized from dogfood on llm-kaki. Raw in-the-moment jots live in `PAIN.md`;
-this section is the processed understanding.
+**L3 — evict stale tool results.** When the estimated history
+(`len(json.dumps(messages)) // 4`) exceeds `TOKEN_BUDGET` (150K), the oldest
+`tool_result` contents are replaced with a marker, keeping the
+`RECENT_TOOL_RESULTS_KEEP = 4` most recent intact. The assistant tool_use → user
+tool_result structure stays, so the model still sees that a tool ran and can
+re-call it; only the bytes are gone. No LLM call.
 
-### Validated
-- **L1 cache works**: `cache_read` went 0 → 1465 across two turns (~41%
-  cumulative hit rate). The 3 prefix breakpoints (system / project / tools)
-  function as intended.
-- **L1 CLAUDE.md shapes behavior**: asked to write path-handling code, the model
-  used `pathlib` and noted "no os.path needed" *unprompted* — it absorbed
-  CLAUDE.md's "never os.path" rule. Redundant re-reads of CLAUDE.md happen only
-  on meta-questions ("what conventions?"), not during real work.
-- **L3 eviction + re-read**: the model treats `EVICTED_MARKER` as "re-fetch if
-  needed" and re-reads gracefully instead of confabulating — it even explained
-  the mechanism when asked. Tradeoff: occasional extra re-reads; raise
-  `RECENT_TOOL_RESULTS_KEEP` if they get frequent.
-- **L4 + L5 (budget=3000 test)**: turn 1 fired compaction once and completed the
-  task (L4 works); turn 2 hit a 16K-char single file > budget → 6 compaction
-  attempts then thrash (L5 failsafe works). Both verified via `/context` event
+**L4 — compaction.** If eviction isn't enough, compaction summarizes the older
+history into a fixed-shape note (Goal / Done / Key findings / In progress / Open
+questions) and replaces it, keeping `KEEP_RECENT_MESSAGES = 6` recent messages
+verbatim. Concretely, the messages before the cut collapse into a single
+`[Earlier conversation summary]` user message, prepended to the kept tail:
+
+```
+before:  system+tools │ older messages (msg_0 … cut) │ recent
+after:   system+tools │ summary                       │ recent
+```
+
+This touches the cache at **two moments that are easy to conflate**:
+
+1. *Generating the summary is cheap.* The summarization call runs on the
+   **full, pre-replacement** history — `_summarize` re-sends the same system +
+   tools + history with the instruction appended as a final user message (the way
+   CC does it), so its prefix matches the live conversation and **reads the
+   existing history cache**; only the appended instruction is new. (The old
+   approach — flattening history to capped text in a fresh request — re-paid for
+   the whole history.) The hit holds unless L3 rewrote the prefix earlier this
+   same turn, in which case it degrades to a normal same-sized request.
+2. *Living with the result is a fresh, shorter cache.* The next real turn sends
+   the new `[summary] + recent` history. That prefix no longer matches the old
+   one, so the conversation cache is rebuilt once — only system + tools carry over
+   — and every later turn reuses the new short prefix. This is the **intentional
+   reset** that defuses the L1×L3 tension: compaction discards the old history *by
+   design* (that is the shrinking), then caches cleanly again.
+
+A structural rule keeps the replacement valid: the cut lands on an **assistant
+boundary**, so the kept tail starts with an assistant message and prepending the
+summary (a user message) preserves role alternation without splitting any
+tool_use/tool_result pair. (Cutting at a user tool_result would orphan it — the
+original cause of a thrash bug on long single turns.)
+
+**L5 — thrash guard.** If the history is still over budget after
+`MAX_COMPACT_ATTEMPTS = 3` compactions in a row, minicc raises (with a pointer to
+`/clear` or smaller chunks) instead of looping forever.
+
+*Is L5 even reachable?* In the normal 150K range, essentially not — the upstream
+layers bound every block that L3 + L4 would need to shrink:
+
+- **Tool outputs** are capped at the source (read_file/grep 50K chars ≈ 12K
+  tokens, bash 30K + disk) and evicted by L3 once old — far under budget.
+- **Tool-use inputs** (e.g. a big `write_file` content) escape L2 and L3, but the
+  model emits them under `max_tokens = 8000`, so a single one is ≤ ~32K chars —
+  also far under budget.
+- The kept-recent window (`KEEP_RECENT_MESSAGES = 6`) is bounded by those same
+  per-message limits.
+
+So L3 + L4 can always pull accumulated history below 150K. The one path that
+stays open is a **single, irreducible, oversized message**, and the only
+unbounded source of one is **user input**: L2 caps tool *output* but not what the
+user types, L3 only touches `tool_result`, and L4 can't cut the most-recent turn
+(`_find_cut_index` cuts *before* it). A pasted 200K-char message can't be shrunk
+by any layer, so after three futile compactions L5 raises.
+
+L5 is therefore a real failsafe, not dead code — it backstops exactly the input
+the capacity layers don't bound. Closing that gap (a source cap / chunking on
+user messages, or evicting oversized `tool_use` inputs) would push L5 toward
+never firing.
+
+## User controls (L6)
+
+- **`/context`** — current usage plus durable eviction/compaction event counters,
+  so you can see L3/L4 fire without hunting dim log lines.
+- **`/compact [focus]`** — manual compaction; the optional focus steers what the
+  summary preserves.
+- **`/recap`** — summarizes the conversation *without* mutating it, so the cached
+  prefix stays intact.
+
+## Verified from CC vs minicc's own choices
+
+**Following CC** (where it publishes specifics): bash output cap + disk save;
+glob 100 by mtime; read `offset`/`limit` pagination; clear tool outputs before
+summarizing (L3 → L4); cache layers system / project / conversation; CLAUDE.md
+first 200 lines or 25 KB; `/compact [focus]`; `/recap` is cache-safe.
+
+**minicc's own** (CC silent): `TOKEN_BUDGET = 150_000` as a single threshold,
+estimated via `len(json) // 4`; `RECENT_TOOL_RESULTS_KEEP = 4`;
+`KEEP_RECENT_MESSAGES = 6`; the summary template; `MAX_COMPACT_ATTEMPTS = 3`; the
+`.minicc/` self-ignoring directory (`.minicc/.gitignore: "*"`, so artifacts never
+get tracked even if the project forgets to ignore them).
+
+## Not yet implemented
+
+| Feature | Why CC has it | Why minicc defers |
+| ------- | ------------- | ----------------- |
+| MEMORY.md (auto-written memory) | learnings persist across sessions | needs automatic writeback; design wants dogfood data |
+| Server-side compaction (`compact-2026-01-12` beta) | summarize server-side, no extra round-trip | L4's self-rolled (now prefix-shared) summary suffices for now |
+| L3×caching coordination (`clear_at_least`) | break the cache only when eviction pays off | accept one re-write per eviction event; only bites near the budget wall |
+
+(Subagents, `/rewind` + file checkpoints, and session persistence — once on this
+list — are now implemented; see [SUBAGENTS.md](SUBAGENTS.md),
+[CHECKPOINT.md](CHECKPOINT.md), and `sessions.py`.)
+
+## Dogfood lessons
+
+From dogfood on llm-kaki (raw in-the-moment jots in `PAIN.md`):
+
+- **Caching works** — `cache_read` went 0 → 1465 across two turns (~41%
+  cumulative hit); the stable-prefix breakpoints behave as intended.
+- **CLAUDE.md shapes behavior** — asked to write path code, the model reached for
+  `pathlib` and noted "no os.path needed" *unprompted*; it had absorbed
+  CLAUDE.md's rule. Redundant re-reads happen only on meta-questions, not real work.
+- **Eviction is graceful** — the model treats the evicted marker as "re-fetch if
+  needed" and re-reads instead of confabulating. Tradeoff: occasional extra
+  reads; raise `RECENT_TOOL_RESULTS_KEEP` if they get frequent.
+- **The thrash failsafe fires** — at a 3K test budget, a 16K-char single file
+  drove 6 compaction attempts then a clean L5 raise. Verified via the `/context`
   counters, not by hunting dim log lines.
-
-### Fixed bugs
-- **L4 cut-point**: cutting at *user-string* boundaries failed on a single long
-  turn (only `msg[0]` qualifies → no cut → straight to thrash). Fixed by cutting
-  before an *assistant* message — tool_use/tool_result pairs stay intact (the cut
-  falls between pairs, never inside one). Works mid-turn, the common shape for a
-  long single task.
-- **Summary call balloon**: `_serialize_for_summary` now caps EVERY field
-  (`SUMMARY_FIELD_CAP`), so a large write_file content can't make the
-  summarization request itself huge and re-trip the rate limit.
-
-### Design boundaries
-- **Invariant**: `TOKEN_BUDGET` must exceed the max single tool output
-  (read_file caps at 50K chars ≈ 12K tokens). Below that, one large file thrashes
-  no matter what. At the 150K production budget this can't happen.
-- **Eviction/compaction suit SEQUENTIAL tasks, not SURVEY tasks**: "read &
+- **Eviction/compaction suit SEQUENTIAL tasks, not SURVEY tasks** — "read &
   report each, move on" coexists with eviction; "hold all files at once to
-  answer" fights it (re-read churn → thrash). Don't set budget below the task's
-  working set.
-- **Compaction trades detail for space**: a follow-up needing summarized-away
-  detail makes the model re-read. Inherent; mitigated by the `## In progress`
-  section in the summary prompt and a production-sized budget.
-- **Observability**: dim log lines scroll past during heavy tool output. The
-  `/context` eviction/compaction counters made firings verifiable — kept as a
-  permanent feature, not just a test aid.
-
-### v0.3 candidates (from dogfood)
-- ~~Cache conversation history~~ — **done** (`_cacheable`; see § Token economy).
-- Reduce/evict large *tool_use* inputs (e.g. write_file content) — L3 only
-  touches tool_result, not tool_use, so a big write stays full until it ages
-  into the compacted portion.
-- Softer thrash recovery (auto-`/clear`, or drop the oversized block + retry)
-  instead of crashing the turn.
-
-## Token economy: caching the conversation history (designed, planned)
-
-Two different goals both touch `messages`, and it's worth keeping them apart:
-
-- **Context-window management (L1–L6 above) = size.** Keep history small enough
-  to fit the window and rate limits.
-- **Token economy = cost.** Pay less for what you *do* send. Caching doesn't
-  shrink the history — it makes re-sending it ~10× cheaper.
-
-At a glance — token-saving levers, CC vs minicc:
-
-| Lever | CC | minicc | Gap |
-| ----- | -- | ------ | --- |
-| Stable-prefix cache (system / tools / CLAUDE.md) | ✅ | ✅ L1 | none — `Date:` is per-day, caches within a session |
-| **Cache the conversation history** | ✅ | ✅ `_cacheable` | **closed** — breakpoint on the last turn's last block; prior history reads at ~0.1× |
-| Truncate large tool output | ✅ | ✅ L2 | roughly at parity |
-| Evict stale `tool_result` (context editing) | ✅ | ✅ L3 | minor — fights history caching above 150K (see below) |
-| Compaction | ✅ `/compact` + server-side beta | ✅ L4 (self-rolled summary call) | self-rolled adds a round-trip; server-side `compact-2026-01-12` is an option |
-| Don't re-send large `tool_use` inputs | ✅ | ~✅ | mostly covered by history caching now (read at ~0.1×); a separate cap only if still hot |
-| Lower `effort` | xhigh default | unset (uses `high` default) | could set `medium` to cut tokens (quality tradeoff) |
-
-(Subagent-side levers — running read-only exploration on a cheaper model — live
-in [SUBAGENTS.md](SUBAGENTS.md) D8, not this table.)
-
-**Current state.** L1 caches only the *stable prefix* (system / CLAUDE.md /
-tools). The **conversation history is re-sent at full input price every turn** —
-deliberately, to avoid L3 eviction mutating a cached block and invalidating the
-cache (see the v0.3 candidate above). On a long session the growing uncached
-history dominates cost; a large `tool_use` input (e.g. a big `write_file`'s
-content) is the worst case — it sits in an assistant block and is re-sent
-full-price forever.
-
-**Gap vs CC.** CC caches the conversation history too. The fix is the standard
-multi-turn pattern: put a `cache_control` breakpoint on the **last block of the
-most-recent turn**; the next request reads the entire prior history from cache
-at ~0.1× input price.
-
-**Economics** (from the Claude API: cache write 1.25× input, read **0.1×**,
-break-even at 2 requests). A 50K-token history on Sonnet ($3/M in) is ~$0.15/turn
-uncached vs ~$0.015/turn cached — ~90% off the history portion; the 1.25× write
-is paid once. It **compounds**: a cheaper turn makes every later turn (and all
-dogfood) cheaper.
-
-**The L1×L3 tension (why this needs care).** L3 eviction mutates old
-`tool_result` content **in place** → changes the cached prefix bytes →
-invalidates the cache from that point. Incremental eviction and history-caching
-pull against each other. Resolution:
-
-- L3 only fires above `TOKEN_BUDGET` (150K). **Below that — the common dogfood
-  session — history caching is clean** and L3 never runs. Land caching for the
-  common case first.
-- L4 compaction is an **intentional reset point**: it replaces history with a
-  summary (one cache re-write), then the new shorter prefix caches cleanly again.
-  Compaction + caching coexist.
-- Only L3 *incremental* eviction × caching needs coordination, and only at large
-  scale (already near the rate-limit wall). Defer it: place the breakpoint before
-  the region L3 would touch, or accept one re-write per eviction event.
-
-**Large tool_use inputs.** History caching solves most of this for free (the big
-content reads at 0.1× once cached). If still hot, cap/evict `tool_use` inputs as
-a separate measure (L3 only touches `tool_result` today).
-
-**L4 → server-side compaction (option).** minicc's L4 rolls its own
-summarization (an extra LLM round-trip). The API now offers server-side
-compaction (`compact-2026-01-12` beta) — it summarizes server-side and returns a
-compaction block to pass back, cheaper than a separate call. A possible L4
-replacement.
-
-**Status: ✅ implemented** — `_cacheable()` in `llm.py` adds the breakpoint on the
-last turn's last block and normalizes string content to a stable text block (so a
-message's bytes match whether it's the last turn or mid-history); the stored
-history stays clean (eviction L3 + serialization unaffected). Remaining as
-*options*, not needed for the common session: a server-side compaction
-replacement for L4, and L3×caching coordination above the 150K budget.
-
-## Implementation order (Order B)
-
-Justified in detail elsewhere; tl;dr is "smallest commit + most urgent dogfood
-relief first":
-
-1. **L2** (commit) — tools/ only; immediate rate-limit relief from single-call
-   bloat
-2. **L3** (commit) — llm.py only; accumulated history defense
-3. **L6a `/context`** (commit) — cli.py only; user visibility
-4. **L1** (commit) — 5 files; cost optimization + CLAUDE.md project memory
-5. **L4** (commit) — llm.py only; LLM-based summarization as L3 fallback
-6. **L5** (commit) — llm.py only; thrashing safety net on L4
-7. **L6b `/compact` + L6c `/recap`** (commit) — cli.py only; expose L4 to user
-
-After all 7: tag `v0.2`.
-
-## Updating this doc
-
-When implementing a layer:
-1. Flip ⬜ Planned → ✅ Implemented in the table
-2. Fill in any TBD numbers under "minicc's own choices"
-3. Reference this doc by section in the commit message:
-   ```
-   M7 L3: tool_result eviction
-   
-   See CONTEXT_MANAGEMENT.md#the-6-layers for L1-L6 overview.
-   ```
+  answer" fights it (re-read churn → thrash). Don't set the budget below the
+  task's working set.
