@@ -7,7 +7,8 @@ These are deterministic and make NO real API calls — the Anthropic client's
 - L4 _compact: produces an API-valid message list (no orphaned tool_result,
   valid role alternation, first message is user, tool_use/tool_result pairs
   intact)
-- L4 _serialize_for_summary: every field bounded
+- L4 _summarize: CC-style — shares the live prefix (same system + tools) and
+  appends the instruction as a final user message
 - L3 _evict_old_tool_result: keeps the recent N
 - L5 thrashing guard: raises after MAX_COMPACT_ATTEMPTS instead of looping
 """
@@ -148,18 +149,52 @@ def test_compact_keeps_recent_pairs_intact(monkeypatch):
     assert_api_valid(msgs)
 
 
-# ─── L4: _serialize_for_summary bounding ─────────────────────────────────────
-def test_serialize_caps_every_field():
-    big = "X" * 50_000
-    msgs = [
-        user(big),
-        {"role": "assistant", "content": [FakeToolUse("t0", "write_file", {"content": big})]},
-        tool_result("t0", big),
-    ]
-    out = llm._serialize_for_summary(msgs)
-    # no single field may exceed the cap by much (allow for labels/formatting)
-    for line in out.splitlines():
-        assert len(line) < llm.SUMMARY_FIELD_CAP + 200, "field not capped"
+# ─── L4: _summarize shares the live prefix (CC-style compaction) ─────────────
+def test_summarize_shares_prefix_and_appends_instruction(monkeypatch):
+    captured = {}
+
+    def capture_create(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(llm.client.messages, "create", capture_create)
+    msgs = single_turn(3)
+    out = llm._summarize(msgs)
+
+    assert "summary" in out.lower()
+    # same prefix as a live turn: real system blocks + the full tool set, so the
+    # call reads cache instead of reprocessing the history.
+    assert captured["tools"] is llm.TOOLS
+    assert isinstance(captured["system"], list) and captured["system"]
+    # the instruction rides as the FINAL user message after the whole history.
+    sent = captured["messages"]
+    assert len(sent) == len(msgs) + 1
+    assert sent[-1]["role"] == "user"
+    assert "## Goal" in sent[-1]["content"][-1]["text"]      # _COMPACT_PROMPT body
+
+
+# ─── Prompt-caching breakpoint budget (CC-style grouping) ────────────────────
+def test_tools_carry_no_cache_breakpoint():
+    """Tools are cached via the system-prompt breakpoint (tools render first), so
+    none of them carry their own cache_control — keeping us inside the 4/request
+    budget. See tools/__init__.py."""
+    from minicc.tools import TOOLS, READ_ONLY_TOOLS
+
+    assert all("cache_control" not in t for t in TOOLS)
+    assert all("cache_control" not in t for t in READ_ONLY_TOOLS)
+
+
+def test_request_stays_within_four_breakpoints(monkeypatch):
+    """system (+ project context) + the rolling conversation marker must total
+    <= 4 cache breakpoints, the API's hard limit."""
+    llm.set_project_context("# Project context\nstuff")
+    try:
+        system_blocks = llm._build_system_block()
+        sys_bps = sum(1 for b in system_blocks if "cache_control" in b)
+        convo_bps = 1  # _cacheable marks the last message
+        assert sys_bps + convo_bps <= 4
+    finally:
+        llm.set_project_context("")
 
 
 # ─── L3: eviction keeps recent N ─────────────────────────────────────────────

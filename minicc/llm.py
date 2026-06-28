@@ -61,10 +61,6 @@ _CTX_STATS = {"evictions": 0, "compactions": 0}
 # _find_cut_index), keeping tool_use/tool_result pairs intact.
 KEEP_RECENT_MESSAGES = 6
 
-# Per-field cap when flattening history for the summarization call, so the
-# summary request itself can't balloon (e.g. a big write_file content).
-SUMMARY_FIELD_CAP = 1000
-
 # ─── L5: thrashing guard ────────────────────────────────────────────────────
 # If we're still over budget after this many compactions in a row, a single
 # message is too large to compact away — stop and error instead of looping.
@@ -100,11 +96,12 @@ def set_project_context(text: str):
 def _build_system_block(system: str | None = None) -> list:
     """Build the `system` param as content blocks with cache_control markers.
 
-    Three cache prefix layers (each cache_control = one breakpoint):
-      1. System prompt   — rarely changes
-      2. Project context — CLAUDE.md, changes on /clear
-      (3. Tools live in the tools= param; last tool carries its own marker)
-
+    Cache prefix layers (each cache_control = one breakpoint), CC-style grouping:
+      1. System prompt — rarely changes. Its breakpoint's prefix is `tools +
+         system` (tools render first), so this single marker caches the tool
+         definitions too — no separate tools breakpoint needed (see tools/__init__).
+      2. Project context — CLAUDE.md, changes on /clear.
+    That leaves budget (max 4/request) for the conversation breakpoint (_cacheable).
     """
     if system:
         return [
@@ -168,44 +165,6 @@ def _evict_old_tool_result(messages) -> int:
     return len(to_evict)
 
 
-def _serialize_for_summary(messages) -> str:
-    """Flatten messages to plain text for the summarization call.
-
-    Handles both dict-form messages and SDK Block objects. EVERY field is
-    capped at SUMMARY_FIELD_CAP so the summary call's own input stays bounded —
-    without this, a large write_file content (in a tool_use input) or a long
-    answer would make the summarization request itself huge, risking the very
-    rate limit we are compacting to avoid.
-    """
-    CAP = SUMMARY_FIELD_CAP
-    parts = []
-    for m in messages:
-        role = m.get("role", "?")
-        content = m.get("content")
-        if isinstance(content, str):  # user query
-            parts.append(f"[{role}] {content[:CAP]}")
-        elif isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict):  # tool result appears as a dict
-                    if b.get("type") == "tool_result":
-                        parts.append(
-                            f"[{role} tool_result] {str(b.get('content'))[:CAP]}"
-                        )
-                    elif b.get("type") == "text":
-                        parts.append(f"[{role} text] {str(b.get('text', ''))[:CAP]}")
-                else:  # response from LLM is SDK object [ToolUseBlock, TextBlock]
-                    bt = getattr(b, "type", None)
-                    if bt == "text":
-                        parts.append(
-                            f"[{role} text] {str(getattr(b, 'text', ''))[:CAP]}"
-                        )
-                    elif bt == "tool_use":
-                        parts.append(
-                            f"[{role} tool_use] {getattr(b, 'name', '')}({str(getattr(b, 'input', {}))[:CAP]})"
-                        )
-    return "\n".join(parts)
-
-
 def _find_cut_index(messages) -> int | None:
     """Find a safe cut point: summarize messages[:cut], keep messages[cut:].
 
@@ -232,25 +191,39 @@ def _find_cut_index(messages) -> int | None:
 def _summarize(messages, focus: str | None = None, model: str | None = None) -> str:
     """One LLM call returning a structured summary of `messages`.
 
-    Shared by _compact (L4) and recap (L6c). `focus`, if given, steers what the
-    summary preserves (powers `/compact <focus>`). `model` lets a sub-agent's
-    compaction run on the sub-agent's model; defaults to the global MODEL.
+    Claude Code-style compaction: rather than flattening history to text and
+    sending a fresh (uncached) request, we re-send the SAME system + tools +
+    history and append the summary instruction as a final user message. Because
+    that prefix matches the live conversation, the call READS the existing cache
+    (~0.1x) instead of reprocessing the whole history, and it summarizes the
+    full-fidelity content (no per-field truncation). The cache hit holds when the
+    prefix is still warm and L3 eviction hasn't just rewritten it this turn (then
+    it falls back to a normal — same-sized — request). See CONTEXT_MANAGEMENT.md.
+
+    `focus` steers what to preserve (`/compact <focus>`). `model` lets a
+    sub-agent's compaction run on its own model; defaults to the global MODEL.
     """
     focus_line = f"\n\nFocus the summary on: {focus}" if focus else ""
+    instruction = {"role": "user", "content": _COMPACT_PROMPT + focus_line}
     resp = client.messages.create(
         model=model if model is not None else MODEL,
         max_tokens=1500,
-        system=_COMPACT_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Summarize this agent history:{focus_line}\n\n{_serialize_for_summary(messages)}",
-            }
-        ],
+        system=_build_system_block(),       # same prefix as the live turn -> cache read
+        tools=TOOLS,
+        messages=_cacheable(list(messages) + [instruction]),
     )
     _USAGE["input"] += resp.usage.input_tokens
     _USAGE["output"] += resp.usage.output_tokens
-    return resp.content[0].text if resp.content else "(empty summary)"
+    _USAGE["cache_read"] += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
+    _USAGE["cache_creation"] += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+    # The instruction is explicit, but tools are in scope, so guard against a
+    # leading non-text block by taking the first text block.
+    text = next(
+        (getattr(b, "text", None) for b in resp.content
+         if getattr(b, "type", None) == "text"),
+        None,
+    )
+    return text or "(empty summary)"
 
 
 def _compact(messages, focus: str | None = None, model: str | None = None) -> bool:
@@ -262,9 +235,12 @@ def _compact(messages, focus: str | None = None, model: str | None = None) -> bo
     if not cut:  # None or 0 → nothing safe to compact
         return False
 
-    older, recent = messages[:cut], messages[cut:]
+    recent = messages[cut:]
     ux.say("[compacting conversation history...]", style=ux.S_INFO)
-    summary = _summarize(older, focus=focus, model=model)
+    # Summarize the FULL history (not just messages[:cut]) so the call's prefix
+    # matches the live conversation and reads from cache; `recent` is still kept
+    # verbatim below, so the mild overlap costs nothing structurally.
+    summary = _summarize(messages, focus=focus, model=model)
 
     # recent starts with an assistant message (guaranteed by _find_cut_index),
     # so prepending just the summary as a user message keeps valid alternation:
@@ -273,7 +249,7 @@ def _compact(messages, focus: str | None = None, model: str | None = None) -> bo
         {"role": "user", "content": f"[Earlier conversation summary]\n\n{summary}"},
     ] + recent
     _CTX_STATS["compactions"] += 1
-    ux.say(f"[compacted {len(older)} messages into a summary]", style=ux.S_INFO)
+    ux.say(f"[compacted {cut} messages into a summary]", style=ux.S_INFO)
     return True
 
 
