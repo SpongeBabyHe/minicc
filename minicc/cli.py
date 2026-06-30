@@ -4,7 +4,12 @@ import readline  # noqa: F401 — importing enables history + line editing for i
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
 from minicc import llm
 from minicc.agent import agent_loop
 from minicc import ux
@@ -67,12 +72,18 @@ def _cmd_help():
                 ("/help", "Show this help"),
                 ("/clear", "Reset conversation history and tool permissions"),
                 ("/init", "Scan the project and write/refresh CLAUDE.md"),
-                ("/context", "Show conversation token usage vs eviction budget"),
+                ("/context", "Show context token usage vs the compaction budget"),
                 ("/cost", "Show token usage and estimated cost"),
-                ("/model [default] [id]", "Show / switch session / set persistent default model"),
+                (
+                    "/model [default] [id]",
+                    "Show / switch session / set persistent default model",
+                ),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
-                ("/rewind [N]", "List restore points, or revert files to restore point N"),
+                (
+                    "/rewind [N]",
+                    "List restore points, or revert files to restore point N",
+                ),
                 ("q / exit / quit", "Leave minicc"),
             ]
         )
@@ -104,17 +115,17 @@ def _cmd_cost():
 
 def _cmd_context(messages):
     """
-    Show conversation history token usage vs L3 evict budget.
+    Show context token usage vs the compaction budget.
     """
     c = context_usage(messages)
     ux.say(
         ux.kv_block(
             [
                 (
-                    "estimated tokens",
-                    f"{c['estimated_tokens']:,}  (~{c['pct_of_budget']:.0f}% of evict budget)",
+                    "context tokens",
+                    f"{c['estimated_tokens']:,}  (~{c['pct_of_budget']:.0f}% of compaction budget)",
                 ),
-                ("evict budget", f"{c['budget']:,}  (L3 eviction triggers above this)"),
+                ("compaction budget", f"{c['budget']:,}  (auto-compaction triggers above this)"),
                 ("messages", str(c["messages"])),
                 ("tool_results", f"{c['tool_results']} total, {c['evicted']} evicted"),
                 ("eviction events", str(c["eviction_events"])),
@@ -156,16 +167,21 @@ _MODEL_ALIASES = {
 def _cmd_model(arg: str | None):
     """Show the model, switch it for this session, or set the persistent default.
 
-      /model                 → show current (session) + default (persisted) + aliases
-      /model <alias|id>      → switch for this session only (reverts on restart)
-      /model default <a|id>  → set the persistent default (global settings) + switch
+    /model                 → show current (session) + default (persisted) + aliases
+    /model <alias|id>      → switch for this session only (reverts on restart)
+    /model default <a|id>  → set the persistent default (global settings) + switch
     """
     if not arg:
         cur = llm.get_model()
-        rows = [("current (session)", cur), ("default (persisted)", config.resolve_model())]
+        rows = [
+            ("current (session)", cur),
+            ("default (persisted)", config.resolve_model()),
+        ]
         rows += [(alias, mid) for alias, mid in _MODEL_ALIASES.items()]
         ux.say(ux.kv_block(rows))
-        ux.say("usage: /model <alias|id>  ·  /model default <alias|id>", style=ux.S_INFO)
+        ux.say(
+            "usage: /model <alias|id>  ·  /model default <alias|id>", style=ux.S_INFO
+        )
         return
 
     parts = arg.split(maxsplit=1)
@@ -179,7 +195,10 @@ def _cmd_model(arg: str | None):
         # surface (e.g. --project) to write a per-project default yet — deferred.
         config.set_default_model(target)
         llm.set_model(target)
-        ux.say(f"default model → {target}  (persisted globally + switched)", style=ux.S_INFO)
+        ux.say(
+            f"default model → {target}  (persisted globally + switched)",
+            style=ux.S_INFO,
+        )
         return
 
     target = _MODEL_ALIASES.get(arg.strip(), arg.strip())
@@ -192,12 +211,16 @@ def _cmd_rewind(history, arg: str | None):
     N is the position in the /rewind list (contiguous 1..N over file-changing
     turns only) — not an internal turn number, which has gaps from read-only turns.
     Code-only: files revert, the conversation is kept (a notice tells the model)."""
-    points = checkpoints.restore_points()   # [(turn, query)], oldest→newest
+    points = checkpoints.restore_points()  # [(turn, query)], oldest→newest
     if arg is None:
         if not points:
             ux.say("nothing to rewind — no file changes yet", style=ux.S_INFO)
             return
-        ux.say(ux.kv_block([(f"[{i}]", ux.truncate(q, 60)) for i, (_, q) in enumerate(points, 1)]))
+        ux.say(
+            ux.kv_block(
+                [(f"[{i}]", ux.truncate(q, 60)) for i, (_, q) in enumerate(points, 1)]
+            )
+        )
         ux.say(
             "usage: /rewind <n> — revert files to restore point n (conversation kept); "
             "bash-made changes aren't tracked.",
@@ -212,7 +235,9 @@ def _cmd_rewind(history, arg: str | None):
     if not (1 <= n <= len(points)):
         ux.say(f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
         return
-    restored, failed = checkpoints.restore_files(points[n - 1][0])   # map index → internal turn
+    restored, failed = checkpoints.restore_files(
+        points[n - 1][0]
+    )  # map index → internal turn
     history.append(
         {
             "role": "user",
@@ -229,7 +254,9 @@ def _init_session():
     """Parse --continue/--resume and return (history, session_id)."""
     parser = argparse.ArgumentParser(prog="minicc")
     parser.add_argument(
-        "--continue", dest="cont", action="store_true",
+        "--continue",
+        dest="cont",
+        action="store_true",
         help="resume the most recent session in this directory",
     )
     parser.add_argument("--resume", metavar="ID", help="resume a specific session id")
@@ -268,7 +295,9 @@ def _friendly_error(e: Exception) -> str:
     if isinstance(e, (APIConnectionError, APITimeoutError)):
         return "network error reaching the API — check your connection and retry."
     if isinstance(e, APIStatusError):
-        return f"API error {e.status_code}: {getattr(e, 'message', '') or ''}".rstrip(": ")
+        return f"API error {e.status_code}: {getattr(e, 'message', '') or ''}".rstrip(
+            ": "
+        )
     return f"agent error: {e!r}"
 
 
@@ -324,7 +353,9 @@ def main():
             elif cmd == "/clear":
                 history.clear()
                 permissions.reset()
-                permissions.preload(config.allowed_tools())  # keep settings-trusted tools
+                permissions.preload(
+                    config.allowed_tools()
+                )  # keep settings-trusted tools
                 checkpoints.reset()
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
@@ -351,12 +382,12 @@ def main():
         turn += 1
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
-        mark = len(history)   # roll-back point if this turn is interrupted/errors
+        mark = len(history)  # roll-back point if this turn is interrupted/errors
         history.append({"role": "user", "content": query})
-        checkpoints.start(turn, query)   # snapshot files this turn touches, for /rewind
+        checkpoints.start(turn, query)  # snapshot files this turn touches, for /rewind
 
         try:
-            agent_loop(history)   # streams assistant text to the screen as it arrives
+            agent_loop(history)  # streams assistant text to the screen as it arrives
         except KeyboardInterrupt:
             # Ctrl-C during a slow tool (e.g. bash) leaves an assistant tool_use
             # with no following tool_result. The next request then 400s:
@@ -366,7 +397,7 @@ def main():
             ux.say("interrupted", style=ux.S_INFO)
             continue
         except Exception as e:
-            del history[mark:]   # same: don't leave a half-finished turn behind
+            del history[mark:]  # same: don't leave a half-finished turn behind
             ux.say(_friendly_error(e), style=ux.S_ERROR)
             continue
         # No post-loop re-print: streaming already rendered the assistant text.

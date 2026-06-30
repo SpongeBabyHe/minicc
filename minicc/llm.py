@@ -1,7 +1,7 @@
 import os
 import json
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from pathlib import Path
 from minicc.tools import TOOLS
 from minicc.prompts.system import build_system_prompt, load_project_context
@@ -29,18 +29,36 @@ def set_model(model_id: str) -> None:
     MODEL = model_id
 
 
-# ─── L3: Token budget for tool_result eviction ──────────────────────────────
-# Above this estimated token count, llm_response() evicts old tool_result
-# contents to keep the request from blowing up. The number is minicc's own
-# choice (CC docs don't publish theirs) and may be tuned via dogfood.
-# set to 2_000 for test triggering
-TOKEN_BUDGET = 150_000
+# ─── L4: compaction trigger (window-relative, like Claude Code) ─────────────
+# CC compacts as it nears the model's context window. minicc does the same, but
+# clamps to a safe ceiling because its endpoint has a real ~450K single-request
+# wall (PAIN.md). effective budget = min(95% of the window, the ceiling).
+WINDOW_FRACTION = 0.95
+SAFE_REQUEST_CEILING = 350_000
 
-# Number of most-recent tool_result blocks to keep intact when evicting.
-RECENT_TOOL_RESULTS_KEEP = 4
+# Context window (input tokens) by model-id prefix; ids may carry a date suffix.
+_MODEL_WINDOWS = {
+    "claude-haiku-4-5": 200_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-fable-5": 1_000_000,
+}
+_DEFAULT_WINDOW = 200_000          # conservative fallback for an unmapped model
 
-# Placeholder content for an evicted tool_result. The model can read this
-# and decide to re-invoke the tool if it actually needs the data.
+# Real input size of the LAST request (from response.usage). The compaction
+# trigger compares against this rather than a char-estimate — accurate, and the
+# same basis CC's /context reports; one turn stale, which the headroom absorbs.
+_LAST_INPUT_TOKENS = 0
+
+# ─── L3: incremental tool_result eviction (CC's context-editing) ────────────
+# Above CLEAR_TRIGGER (but below the compaction budget) minicc blanks the oldest
+# tool_result contents each turn — CC's `clear_tool_uses`. `clear_at_least` guards
+# the prompt cache: in-place eviction rewrites mid-history and breaks the cache, so
+# only do it when it frees at least CLEAR_AT_LEAST tokens (worth the re-write).
+# Mirrors CC's trigger / keep / clear_at_least.
+CLEAR_TRIGGER = 100_000             # start clearing tool outputs above this (CC default)
+CLEAR_AT_LEAST = 5_000             # ...but only if it frees ≥ this (don't nibble the cache)
+RECENT_TOOL_RESULTS_KEEP = 4       # keep this many recent tool_results intact (CC: 3)
 EVICTED_MARKER = (
     "[content omitted; was earlier in conversation — re-call the tool if needed]"
 )
@@ -134,15 +152,39 @@ def _estimate_tokens(messages) -> int:
         return 0
 
 
-def _evict_old_tool_result(messages) -> int:
+def _model_window(model: str) -> int:
+    """Context window (tokens) for a model id (tolerates a date suffix)."""
+    for prefix, window in _MODEL_WINDOWS.items():
+        if model.startswith(prefix):
+            return window
+    return _DEFAULT_WINDOW
+
+
+def _effective_budget(model: str) -> int:
+    """Compaction threshold: the smaller of 95% of the model window and the safe
+    request ceiling (minicc's endpoint has a real ~450K single-request wall)."""
+    return min(int(WINDOW_FRACTION * _model_window(model)), SAFE_REQUEST_CEILING)
+
+
+def _context_size(messages) -> int:
+    """Best read of the next request's input size: the last response's REAL usage
+    (one turn stale), or the char-estimate on the cold first turn before any."""
+    return _LAST_INPUT_TOKENS or _estimate_tokens(messages)
+
+
+def _evict_old_tool_result(messages, min_free: int = 0) -> int:
     """Replace `content` of old tool_result blocks with EVICTED_MARKER.
 
-    Keeps the RECENT_TOOL_RESULTS_KEEP most recent intact. Returns the count
-    of blocks evicted. Mutates `messages` in place.
+    Keeps the RECENT_TOOL_RESULTS_KEEP most recent intact. Returns the count of
+    blocks evicted (0 if none). Mutates `messages` in place.
 
-    Conversation structure (assistant tool_use → user tool_result) is
-    preserved. The model still sees that the tool was called; only the
-    content is gone, and it can re-call if needed.
+    `min_free` is the `clear_at_least` guard: if the eviction would free fewer
+    than `min_free` estimated tokens, skip it entirely (return 0) — don't break the
+    prompt cache for a gain too small to be worth the re-write. This is what makes
+    per-turn incremental eviction cache-safe (CC's `clear_at_least`).
+
+    Conversation structure (assistant tool_use → user tool_result) is preserved;
+    the model still sees the tool was called and can re-call if needed.
     """
     candidates = []
     for i, msg in enumerate(messages):
@@ -160,6 +202,10 @@ def _evict_old_tool_result(messages) -> int:
     if len(candidates) <= RECENT_TOOL_RESULTS_KEEP:
         return 0
     to_evict = candidates[:-RECENT_TOOL_RESULTS_KEEP]
+    # clear_at_least: only break the cache if this frees enough to be worth it.
+    freed = sum(len(str(messages[i]["content"][j].get("content", ""))) for i, j in to_evict) // 4
+    if freed < min_free:
+        return 0
     for i, j in to_evict:
         messages[i]["content"][j]["content"] = EVICTED_MARKER
     return len(to_evict)
@@ -188,8 +234,14 @@ def _find_cut_index(messages) -> int | None:
     return None
 
 
-def _summarize(messages, focus: str | None = None, model: str | None = None) -> str:
-    """One LLM call returning a structured summary of `messages`.
+def _summarize(
+    messages,
+    focus: str | None = None,
+    model: str | None = None,
+    system: str | None = None,
+    tools=None,
+) -> str | None:
+    """One LLM call returning a structured summary of `messages`, or None.
 
     Claude Code-style compaction: rather than flattening history to text and
     sending a fresh (uncached) request, we re-send the SAME system + tools +
@@ -200,36 +252,49 @@ def _summarize(messages, focus: str | None = None, model: str | None = None) -> 
     prefix is still warm and L3 eviction hasn't just rewritten it this turn (then
     it falls back to a normal — same-sized — request). See CONTEXT_MANAGEMENT.md.
 
-    `focus` steers what to preserve (`/compact <focus>`). `model` lets a
-    sub-agent's compaction run on its own model; defaults to the global MODEL.
+    `system`/`tools` MUST match the caller's live turn (a sub-agent passes its own
+    SUBAGENT_PROMPT + READ_ONLY_TOOLS) — otherwise the prefix mismatches and the
+    call both misses the cache and summarizes under the wrong context. `focus`
+    steers what to preserve (`/compact <focus>`); `model` lets a sub-agent's
+    compaction run on its own model. Returns None if the model produced no text
+    (e.g. it emitted only a tool_use), so the caller can refuse to destroy history.
     """
     focus_line = f"\n\nFocus the summary on: {focus}" if focus else ""
     instruction = {"role": "user", "content": _COMPACT_PROMPT + focus_line}
     resp = client.messages.create(
         model=model if model is not None else MODEL,
         max_tokens=1500,
-        system=_build_system_block(),       # same prefix as the live turn -> cache read
-        tools=TOOLS,
+        system=_build_system_block(system),                  # match the live prefix
+        tools=tools if tools is not None else TOOLS,
         messages=_cacheable(list(messages) + [instruction]),
     )
     _USAGE["input"] += resp.usage.input_tokens
     _USAGE["output"] += resp.usage.output_tokens
     _USAGE["cache_read"] += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
     _USAGE["cache_creation"] += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
-    # The instruction is explicit, but tools are in scope, so guard against a
-    # leading non-text block by taking the first text block.
-    text = next(
+    # tools are in scope, so the model *could* answer with a tool_use and no text.
+    # Return the first text block, or None — never a fake summary (a caller that
+    # replaces history with an empty summary would silently destroy context).
+    return next(
         (getattr(b, "text", None) for b in resp.content
          if getattr(b, "type", None) == "text"),
         None,
     )
-    return text or "(empty summary)"
 
 
-def _compact(messages, focus: str | None = None, model: str | None = None) -> bool:
+def _compact(
+    messages,
+    focus: str | None = None,
+    model: str | None = None,
+    system: str | None = None,
+    tools=None,
+) -> bool:
     """Summarize older messages via one LLM call; replace them in place.
 
-    Returns True if compaction reduced the history, False if no safe cut.
+    Returns True if compaction reduced the history, False if there's no safe cut
+    OR the summary call produced no text (in which case the history is left
+    untouched — never replaced with an empty summary). `system`/`tools` are
+    threaded to _summarize so a sub-agent compacts under its own prefix.
     """
     cut = _find_cut_index(messages)
     if not cut:  # None or 0 → nothing safe to compact
@@ -240,7 +305,12 @@ def _compact(messages, focus: str | None = None, model: str | None = None) -> bo
     # Summarize the FULL history (not just messages[:cut]) so the call's prefix
     # matches the live conversation and reads from cache; `recent` is still kept
     # verbatim below, so the mild overlap costs nothing structurally.
-    summary = _summarize(messages, focus=focus, model=model)
+    summary = _summarize(messages, focus=focus, model=model, system=system, tools=tools)
+    if not summary:
+        # The model answered with no text (e.g. a tool_use). Do NOT replace the
+        # history with an empty summary — leave it intact and let L5/caller decide.
+        ux.say("[compaction skipped: no summary produced]", style=ux.S_ERROR)
+        return False
 
     # recent starts with an assistant message (guaranteed by _find_cut_index),
     # so prepending just the summary as a user message keeps valid alternation:
@@ -266,7 +336,7 @@ def recap(messages, focus: str | None = None) -> str:
     """
     if len(messages) < 2:
         return "(nothing to recap yet)"
-    return _summarize(messages, focus=focus)
+    return _summarize(messages, focus=focus) or "(no summary produced)"
 
 
 def _cacheable(messages):
@@ -301,6 +371,20 @@ def _cacheable(messages):
     return out
 
 
+def _send_request(params: dict, stream: bool):
+    """Issue one Messages request and return the final message. Streaming shows a
+    spinner + text deltas; both paths return the same shape create() would, so
+    downstream tool-dispatch/usage logic is identical. Kept separate so the
+    reactive-413 path can retry it without duplicating the stream plumbing."""
+    if not stream:
+        return client.messages.create(**params)   # tests, scripts, sub-agents
+    with ux.streaming() as render:
+        with client.messages.stream(**params) as s:
+            for delta in s.text_stream:
+                render(delta)
+            return s.get_final_message()
+
+
 def llm_response(
     messages,
     system: str | None = None,
@@ -311,32 +395,38 @@ def llm_response(
     m = (
         model if model is not None else MODEL
     )  # per-call override (sub-agents); else global MODEL
-    global _compact_attempts
-    if _estimate_tokens(messages) <= TOKEN_BUDGET:
-        _compact_attempts = 0
-    else:
-        # L3: evict old tool_result blocks to keep the request from blowing up.
-        evicted = _evict_old_tool_result(messages)
-        if evicted:
-            _CTX_STATS["evictions"] += 1
+    global _compact_attempts, _LAST_INPUT_TOKENS
+    size = _context_size(messages)              # real (last usage) or cold estimate
+    budget = _effective_budget(m)
+    if size > budget:
+        # Over the compaction budget → L4 compaction (the bigger reset). We do NOT
+        # also evict this turn: compaction replaces the old messages anyway, and
+        # skipping eviction keeps the summary call on a warm cache.
+        if _compact_attempts >= MAX_COMPACT_ATTEMPTS:  # L5 thrash guard
             ux.say(
-                f"[evicted {evicted} old tool_results to reduce context]",
-                style=ux.S_INFO,
+                "[Autocompact is thrashing: still over budget after "
+                f"{MAX_COMPACT_ATTEMPTS} compactions. A single message is likely "
+                "too large. Try /clear, or read large files in smaller chunks "
+                "(offset/limit).]",
+                style=ux.S_ERROR,
             )
-        # L4: LLM compaction when eviction (L3) isn't enough.
-        if _estimate_tokens(messages) > TOKEN_BUDGET:
-            # L5: thrashing guard.
-            if _compact_attempts >= MAX_COMPACT_ATTEMPTS:
+            raise RuntimeError("compact thrashing")
+        _compact_attempts += 1
+        # Thread system/tools so a sub-agent compacts under ITS prefix.
+        _compact(messages, model=m, system=system, tools=tools)
+    else:
+        _compact_attempts = 0
+        # L3: CC-style incremental tool_result eviction between CLEAR_TRIGGER and
+        # the compaction budget — cheap (no LLM call), guarded by clear_at_least so
+        # it only breaks the cache when it frees ≥ CLEAR_AT_LEAST tokens.
+        if size > CLEAR_TRIGGER:
+            evicted = _evict_old_tool_result(messages, min_free=CLEAR_AT_LEAST)
+            if evicted:
+                _CTX_STATS["evictions"] += 1
                 ux.say(
-                    "[Autocompact is thrashing: still over budget after "
-                    f"{MAX_COMPACT_ATTEMPTS} compactions. A single message is "
-                    "likely too large. Try /clear, or read large files in "
-                    "smaller chunks (offset/limit).]",
-                    style=ux.S_ERROR,
+                    f"[evicted {evicted} old tool_results to reclaim context]",
+                    style=ux.S_INFO,
                 )
-                raise RuntimeError("compact thrashing")
-            _compact_attempts += 1
-            _compact(messages, model=m)
 
     params = dict(
         model=m,
@@ -345,25 +435,29 @@ def llm_response(
         system=_build_system_block(system),
         tools=tools if tools is not None else TOOLS,
     )
-    if not stream:
-        # non-streaming path: tests, scripts, subagents
-        response = client.messages.create(**params)
-    else:
-        # streaming path: spinner until first token, then print text deltas.
-        # get_final_message() returns the SAME shape create() would — so all
-        # downstream logic (tool dispatch, usage) is unchanged.
-        with ux.streaming() as render:
-            with client.messages.stream(**params) as s:
-                for delta in s.text_stream:
-                    render(delta)
-                response = s.get_final_message()
+    try:
+        response = _send_request(params, stream)
+    except APIStatusError as e:
+        # Reactive compaction (CC-style fallback): a 413 means the proactive
+        # trigger under-fired (token-estimate drift) or a single turn exceeded the
+        # ceiling. The SDK does NOT auto-retry 413, so force one compaction and
+        # retry once; a second 413 (e.g. one un-compactable huge message) surfaces.
+        if getattr(e, "status_code", None) != 413:
+            raise
+        ux.say("[request too large — compacting and retrying]", style=ux.S_ERROR)
+        if not _compact(messages, model=m, system=system, tools=tools):
+            raise  # nothing compactable → let the error surface
+        params["messages"] = _cacheable(messages)
+        response = _send_request(params, stream)
 
+    cache_r = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+    cache_c = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
     _USAGE["input"] += response.usage.input_tokens
     _USAGE["output"] += response.usage.output_tokens
-    _USAGE["cache_read"] += getattr(response.usage, "cache_read_input_tokens", 0) or 0
-    _USAGE["cache_creation"] += (
-        getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-    )
+    _USAGE["cache_read"] += cache_r
+    _USAGE["cache_creation"] += cache_c
+    # Real total input of THIS request → the next turn's compaction trigger.
+    _LAST_INPUT_TOKENS = response.usage.input_tokens + cache_r + cache_c
     return response
 
 
@@ -375,12 +469,13 @@ def get_usage() -> dict:
 def context_usage(messages) -> dict:
     """Structured data about current context usage (for /context).
 
-    Note: estimated_tokens covers the conversation history ONLY — it does
-    not include the system prompt or tool definitions that also go into each
-    request. This is the number L3 eviction watches.
+    `estimated_tokens` is the real input size of the last request
+    (response.usage), or a char-estimate before the first response. `budget` is
+    the compaction trigger: min(95% of the model window, the safe ceiling).
     """
-    tokens = _estimate_tokens(messages)
-    pct = (tokens / TOKEN_BUDGET * 100) if TOKEN_BUDGET else 0
+    tokens = _context_size(messages)
+    budget = _effective_budget(MODEL)
+    pct = (tokens / budget * 100) if budget else 0
 
     tool_results = 0
     evicted = 0
@@ -396,7 +491,7 @@ def context_usage(messages) -> dict:
 
     return {
         "estimated_tokens": tokens,
-        "budget": TOKEN_BUDGET,
+        "budget": budget,
         "pct_of_budget": pct,
         "messages": len(messages),
         "tool_results": tool_results,
