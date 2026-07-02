@@ -7,6 +7,7 @@ from minicc.tools import TOOLS
 from minicc.prompts.system import build_system_prompt, load_project_context
 from minicc import ux
 from minicc import config
+from minicc import sessions
 
 load_dotenv()  # ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL only; model lives in config
 MODEL = config.resolve_model()
@@ -302,6 +303,7 @@ def _compact(
     model: str | None = None,
     system: str | None = None,
     tools=None,
+    session_id: str | None = None,
 ) -> bool:
     """Summarize older messages via one LLM call; replace them in place.
 
@@ -333,13 +335,17 @@ def _compact(
         {"role": "user", "content": f"[Earlier conversation summary]\n\n{summary}"},
     ] + recent
     _CTX_STATS["compactions"] += 1
+    # Record the boundary to the transcript so a resume reconstructs [summary]+tail
+    # instead of re-inflating the raw log (main session only; sub-agents pass None).
+    if session_id:
+        sessions.log_compaction(session_id, messages)
     ux.say(f"[compacted {cut} messages into a summary]", style=ux.S_INFO)
     return True
 
 
-def compact(messages, focus: str | None = None) -> bool:
+def compact(messages, focus: str | None = None, session_id: str | None = None) -> bool:
     """Manual compaction entry point (for /compact). Returns True if it ran."""
-    return _compact(messages, focus=focus)
+    return _compact(messages, focus=focus, session_id=session_id)
 
 
 def recap(messages, focus: str | None = None) -> str:
@@ -405,6 +411,7 @@ def llm_response(
     stream: bool = True,
     tools=None,
     model: str | None = None,
+    session_id: str | None = None,
 ):
     m = (
         model if model is not None else MODEL
@@ -426,8 +433,9 @@ def llm_response(
             )
             raise RuntimeError("compact thrashing")
         _compact_attempts += 1
-        # Thread system/tools so a sub-agent compacts under ITS prefix.
-        _compact(messages, model=m, system=system, tools=tools)
+        # Thread system/tools so a sub-agent compacts under ITS prefix; session_id
+        # so the main session records the compaction boundary to its transcript.
+        _compact(messages, model=m, system=system, tools=tools, session_id=session_id)
     else:
         _compact_attempts = 0
         # L3: CC-style incremental tool_result eviction between CLEAR_TRIGGER and
@@ -466,7 +474,7 @@ def llm_response(
         if code == 429 and _estimate_tokens(messages) <= CLEAR_TRIGGER:
             raise
         ux.say("[request rejected — compacting and retrying]", style=ux.S_ERROR)
-        if not _compact(messages, model=m, system=system, tools=tools):
+        if not _compact(messages, model=m, system=system, tools=tools, session_id=session_id):
             raise  # nothing compactable → let the error surface
         params["messages"] = _cacheable(messages)
         response = _send_request(params, stream)

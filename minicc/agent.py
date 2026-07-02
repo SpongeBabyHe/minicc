@@ -3,6 +3,7 @@ from minicc.tools import TOOLS, TOOL_HANDLERS
 from minicc.permissions import confirm
 from minicc import ux
 from minicc import checkpoints
+from minicc import sessions
 
 
 def agent_loop(
@@ -13,6 +14,7 @@ def agent_loop(
     max_turns: int | None = None,
     indent: str = "",
     model: str | None = None,
+    session_id: str | None = None,
 ):
     """Run the agent loop until the model stops requesting tools.
 
@@ -34,9 +36,14 @@ def agent_loop(
             return
         turns += 1
         # streaming shows its own spinner-until-first-token, so no ux.thinking()
-        response = llm_response(messages, system, stream=stream, tools=tools, model=model)
-        messages.append({"role": "assistant", "content": response.content})
+        response = llm_response(
+            messages, system, stream=stream, tools=tools, model=model, session_id=session_id
+        )
+        assistant_msg = {"role": "assistant", "content": response.content}
+        messages.append(assistant_msg)
         if response.stop_reason != "tool_use":
+            if session_id:                        # terminal assistant → record alone
+                sessions.append_message(session_id, assistant_msg)
             return
         results = []
         for block in response.content:
@@ -63,4 +70,10 @@ def agent_loop(
                 results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": output}
                 )
-        messages.append({"role": "user", "content": results})
+        tool_msg = {"role": "user", "content": results}
+        messages.append(tool_msg)
+        # Record assistant + its tool_results together, only now that both exist —
+        # so a Ctrl-C mid-tool never persists a dangling tool_use to the transcript.
+        if session_id:
+            sessions.append_message(session_id, assistant_msg)
+            sessions.append_message(session_id, tool_msg)

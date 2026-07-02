@@ -1,17 +1,18 @@
 # Session persistence (Tier 1) — focused note
 
 Save the conversation to disk so a session can be resumed after quitting (or a
-crash). Daily-use value is high (don't lose a long working session); demo value
-is low — so this is a focused note, not a full design doc. It has exactly **one**
-non-obvious decision: serializing the messages list.
+crash). Daily-use value is high (don't lose a long working session). Two
+non-obvious decisions: **(1)** serializing the messages list (below), and **(2)**
+an **append-only transcript** so in-session compaction doesn't lose history on disk
+(see "Append-only transcript").
 
 ## The one real decision: serializing `history` for a safe round-trip
 
 The whole feature is one round-trip:
 
 ```
-save:    history ──serialize──► JSON file on disk
-resume:  JSON file ──load──► history ──► client.messages.create(messages=history)
+record:  each message ──serialize──► appended to a JSONL transcript on disk
+resume:  JSONL ──replay──► working set ──► client.messages.create(messages=...)
 ```
 
 The hard part is the last arrow: the loaded data is sent **back to the API**, so
@@ -105,15 +106,37 @@ mixed history works everywhere.
 - **Untested**: whether plain `model_dump()` (with `caller:None`) would 400.
   Not claimed — `exclude_none` removes the need to know.
 
+## Append-only transcript (compaction stays lossless)
+
+Storage is a **JSONL event log** (`<id>.jsonl`), one event per line, never
+rewritten. Two event kinds: `{"t":"msg","m":<message>}` and
+`{"t":"compact","state":[...]}`. `load` replays: a `msg` appends; a `compact`
+RESETS the working set to its recorded state (summary + kept tail).
+
+**Why not overwrite a single JSON each turn (the old design)?** In-session L4
+compaction rewrites `history` in place (summary + recent), so overwriting on save
+persisted the *compacted* history — the raw pre-compaction messages were silently
+lost. An append-only log fixes this: the raw `msg` events stay on disk (line count
+only grows), while the `compact` event lets a resume reconstruct the small working
+set instead of re-inflating the whole raw log. Mirrors Claude Code's JSONL
+transcript + `compact_boundary`. See docs/CC_ALIGNMENT_PLAN.md (item A).
+
+**Recording points** (`session_id` threaded `agent_loop → llm_response → _compact`;
+sub-agents pass `None`, so their isolated context is never recorded):
+- the user message — appended before the turn runs;
+- assistant + its tool_results — appended **together, only after both exist**, so a
+  Ctrl-C mid-tool never persists a dangling `tool_use` (which would 400 on resume);
+- a `compact` event — written from inside `_compact`, in conversation order.
+
 ## Routine decisions (no design depth)
 
-- **Storage**: `.minicc/sessions/<id>.json` in the cwd. Reuses the self-ignoring
-  `.minicc/` dir convention. One file per session; per-project by construction
-  (sessions live under the project's cwd).
+- **Storage**: `.minicc/sessions/<id>.jsonl` in the cwd (append-only; see above).
+  Reuses the self-ignoring `.minicc/` dir convention. One file per session;
+  per-project by construction (sessions live under the project's cwd).
 - **Session id**: startup timestamp, e.g. `20260616_143022`.
-- **Auto-save**: after each *successful* turn (overwrite the session file). A
-  crash/quit loses at most the in-flight turn. Interrupted turns are rolled back
-  (cli.py `del history[mark:]`), so the saved state is always API-valid.
+- **Recording**: incremental, as the turn happens (no turn-end overwrite). A
+  crash/quit loses at most the in-flight turn; the interrupt-safe recording order
+  means the transcript never ends on a dangling `tool_use`.
 - **Resume interface**: CLI flags (resume must happen at startup, before the
   loop — a flag is more natural than a slash command):
   - `--continue` → resume the most recent session in this cwd.
@@ -121,14 +144,16 @@ mixed history works everywhere.
   - no flag → fresh session.
 - **On resume**: load history, reload CLAUDE.md fresh (same as startup), continue.
 
-## MVP scope (for the deadline)
-- ✅ serialize/save/load + `--continue` + `--resume <id>`
+## Scope
+- ✅ serialize + append-only transcript + `--continue` + `--resume <id>`
+- ✅ `/clear` rotates to a new session id — the pre-clear transcript stays on disk;
+  new turns record to a fresh `<id>.jsonl`.
 - ⬜ session listing UI / picker — defer (just `--continue` for the common case)
-- ⬜ `/clear` rotating to a new session id — for MVP `/clear` just empties the
-  current session; the pre-clear history is overwritten on next save. (Known
-  simplification.)
+- ⬜ conversation-level `/rewind` to a boundary — the transcript now makes this
+  possible (raw events on disk); not yet wired.
 
 ## Status
-✅ Implemented (Tier 1). serialize/save/load + `--continue`/`--resume`; 6 unit
-tests for the round-trip; live-tested via `--continue` (14-message session incl.
-a tool_use turn resumed without a 400).
+✅ Implemented. serialize + append-only transcript + `--continue`/`--resume`;
+`/clear` rotates sessions; compaction records a boundary so a resume reconstructs
+`[summary]+tail` losslessly. Unit tests cover the serialize round-trip, boundary
+reconstruction, and append-only losslessness.

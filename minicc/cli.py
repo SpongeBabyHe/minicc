@@ -139,9 +139,9 @@ def _cmd_context(messages):
     )
 
 
-def _cmd_compact(messages, focus: str | None = None):
+def _cmd_compact(messages, focus: str | None = None, session_id: str | None = None):
     """Manually compact history (L6b). Mutates `messages` in place."""
-    did = compact(messages, focus=focus)
+    did = compact(messages, focus=focus, session_id=session_id)
     if did:
         ux.say("conversation history compacted", style=ux.S_INFO)
     else:
@@ -206,7 +206,7 @@ def _cmd_model(arg: str | None):
     ux.say(f"model → {target}  (this session)", style=ux.S_INFO)
 
 
-def _cmd_rewind(history, arg: str | None):
+def _cmd_rewind(history, arg: str | None, session_id: str | None = None):
     """List restore points, or `/rewind N` to revert files to restore point N.
     N is the position in the /rewind list (contiguous 1..N over file-changing
     turns only) — not an internal turn number, which has gaps from read-only turns.
@@ -238,12 +238,13 @@ def _cmd_rewind(history, arg: str | None):
     restored, failed = checkpoints.restore_files(
         points[n - 1][0]
     )  # map index → internal turn
-    history.append(
-        {
-            "role": "user",
-            "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
-        }
-    )
+    notice = {
+        "role": "user",
+        "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
+    }
+    history.append(notice)
+    if session_id:
+        sessions.append_message(session_id, notice)
     msg = f"reverted {restored} file change(s) to restore point {n}; conversation kept"
     if failed:
         msg += f"  — {len(failed)} could not be restored: {', '.join(failed)}"
@@ -352,6 +353,7 @@ def main():
                 _cmd_help()
             elif cmd == "/clear":
                 history.clear()
+                session_id = sessions.new_id()  # fresh transcript; old one kept on disk
                 permissions.reset()
                 permissions.preload(
                     config.allowed_tools()
@@ -370,11 +372,11 @@ def main():
             elif cmd == "/context":
                 _cmd_context(history)
             elif cmd == "/compact":
-                _cmd_compact(history, focus=arg)
+                _cmd_compact(history, focus=arg, session_id=session_id)
             elif cmd == "/recap":
                 _cmd_recap(history)
             elif cmd == "/rewind":
-                _cmd_rewind(history, arg)
+                _cmd_rewind(history, arg, session_id=session_id)
             else:
                 ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             continue
@@ -383,11 +385,13 @@ def main():
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
         mark = len(history)  # roll-back point if this turn is interrupted/errors
-        history.append({"role": "user", "content": query})
+        user_msg = {"role": "user", "content": query}
+        history.append(user_msg)
+        sessions.append_message(session_id, user_msg)  # append-only transcript
         checkpoints.start(turn, query)  # snapshot files this turn touches, for /rewind
 
         try:
-            agent_loop(history)  # streams assistant text to the screen as it arrives
+            agent_loop(history, session_id=session_id)  # streams; records incrementally
         except KeyboardInterrupt:
             # Ctrl-C during a slow tool (e.g. bash) leaves an assistant tool_use
             # with no following tool_result. The next request then 400s:
@@ -401,9 +405,8 @@ def main():
             ux.say(_friendly_error(e), style=ux.S_ERROR)
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
-
-        # persist after each successful turn so --continue/--resume can pick up here
-        sessions.save(session_id, history, llm.get_model())
+        # The transcript is written incrementally (sessions.append_message +
+        # llm.log_compaction) as the turn happens — no turn-end save() needed.
 
     # loop exited (q/exit/EOF/Ctrl-C): persist input history for next run
     try:

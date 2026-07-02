@@ -17,7 +17,7 @@ def test_agent_loop_threads_model_to_llm_response(monkeypatch):
 
     captured = {}
 
-    def fake_llm_response(messages, system=None, stream=True, tools=None, model=None):
+    def fake_llm_response(messages, system=None, stream=True, tools=None, model=None, session_id=None):
         captured["model"] = model
         return _blk(stop_reason="end_turn", content=[_blk(type="text", text="done")])
 

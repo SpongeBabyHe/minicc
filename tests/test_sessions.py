@@ -59,10 +59,11 @@ def test_unknown_block_fails_loud():
         sessions._serialize_messages([{"role": "assistant", "content": [object()]}])
 
 
-def test_save_load_round_trip(tmp_path, monkeypatch):
+def test_append_load_round_trip(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)                       # sessions write under cwd/.minicc
     sid = "20260616_120000"
-    sessions.save(sid, _history(), "test-model")
+    for m in _history():
+        sessions.append_message(sid, m)
 
     loaded = sessions.load(sid)
     assert loaded == sessions._serialize_messages(_history())
@@ -70,11 +71,48 @@ def test_save_load_round_trip(tmp_path, monkeypatch):
     assert (tmp_path / ".minicc" / ".gitignore").read_text() == "*\n"
 
 
+def test_compaction_boundary_reconstructs(tmp_path, monkeypatch):
+    """load replays: msg events append, a compact event RESETS to its state — so
+    resume yields [summary] + kept tail + anything appended after the boundary."""
+    monkeypatch.chdir(tmp_path)
+    sid = "s1"
+    sessions.append_message(sid, {"role": "user", "content": "m0"})
+    sessions.append_message(sid, {"role": "assistant", "content": "a0"})
+    sessions.append_message(sid, {"role": "user", "content": "m1"})
+    post = [                                          # post-compaction working set
+        {"role": "user", "content": "[Earlier conversation summary]\n\nS"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "m1"},
+    ]
+    sessions.log_compaction(sid, post)
+    sessions.append_message(sid, {"role": "assistant", "content": "a1"})
+
+    assert sessions.load(sid) == post + [{"role": "assistant", "content": "a1"}]
+
+
+def test_compaction_is_append_only_lossless(tmp_path, monkeypatch):
+    """A compaction only APPENDS a boundary event — the raw msg events stay on disk
+    (line count only grows), unlike the old overwrite-on-save that dropped them."""
+    monkeypatch.chdir(tmp_path)
+    sid = "s2"
+    for i in range(3):
+        sessions.append_message(sid, {"role": "user", "content": f"m{i}"})
+    path = tmp_path / ".minicc" / "sessions" / f"{sid}.jsonl"
+    before = len(path.read_text().splitlines())
+
+    sessions.log_compaction(sid, [{"role": "user", "content": "S"}])
+    after = len(path.read_text().splitlines())
+
+    assert after == before + 1                        # only grew
+    text = path.read_text()
+    assert '"m0"' in text and '"m1"' in text and '"m2"' in text  # raw events intact
+
+
 def test_latest_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert sessions.latest_id() is None
-    sessions.save("20260616_100000", _history(), "m")
-    sessions.save("20260616_110000", _history(), "m")
+    sessions.append_message("20260616_100000", {"role": "user", "content": "a"})
+    sessions.append_message("20260616_110000", {"role": "user", "content": "b"})
     assert sessions.latest_id() == "20260616_110000"
 
 
