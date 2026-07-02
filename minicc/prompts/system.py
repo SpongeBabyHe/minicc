@@ -1,13 +1,9 @@
 import platform
+import subprocess
 from datetime import date
 from pathlib import Path
 
 _TEMPLATE = """You are a coding agent working in the user's project, from the terminal.
-
-Environment:
-- Working directory: {cwd}
-- OS: {os}
-- Date: {date}
 
 Language: reply in the user's most recent language; don't mix languages in one response.
 
@@ -33,11 +29,52 @@ works — try it on a small case; about breaking compatibility — ask.
 
 
 def build_system_prompt() -> str:
-    return _TEMPLATE.format(
-        cwd=Path.cwd(),
-        os=platform.system(),
-        date=date.today().isoformat(),
-    )
+    """The static instruction prefix (cache layer 1). No env here — that lives in
+    build_session_context (layer 3, volatile-last) so this block stays byte-stable
+    across sessions and can be cached globally, the way Claude Code groups it."""
+    return _TEMPLATE
+
+
+def _git_snapshot() -> str:
+    """Branch + dirty/clean at session start, or "" if not a git repo. Brief on
+    purpose — the agent runs `git status` via bash for live detail when it matters."""
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if branch.returncode != 0:
+            return ""  # not a git repo
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=2,
+        )
+        dirty = len([ln for ln in status.stdout.splitlines() if ln.strip()])
+        state = f"{dirty} uncommitted change(s)" if dirty else "clean"
+        return (
+            f"- Git: branch {branch.stdout.strip()}, {state} "
+            "(at session start; run `git status` for live state)"
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def build_session_context() -> str:
+    """Session context (cache prefix layer 3): environment fixed at session start,
+    with the volatile bit (git status) LAST so the stable prefix above stays
+    byte-identical. Captured once at startup / on /clear — mirrors CC's env block.
+    """
+    lines = [
+        "# Session context",
+        "",
+        f"- Working directory: {Path.cwd()}",
+        f"- Platform: {platform.system()} ({platform.machine()})",
+        f"- Date: {date.today().isoformat()}",
+    ]
+    git = _git_snapshot()
+    if git:
+        lines += ["", git]  # volatile-last
+    return "\n".join(lines)
 
 
 def load_project_context() -> str:

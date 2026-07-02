@@ -226,16 +226,53 @@ def test_tools_carry_no_cache_breakpoint():
 
 
 def test_request_stays_within_four_breakpoints(monkeypatch):
-    """system (+ project context) + the rolling conversation marker must total
-    <= 4 cache breakpoints, the API's hard limit."""
+    """system + project + session + the rolling conversation marker = exactly the
+    API's 4 cache breakpoints, and never more."""
     llm.set_project_context("# Project context\nstuff")
+    llm.set_session_context("# Session context\n- cwd: /x")
     try:
         system_blocks = llm._build_system_block()
         sys_bps = sum(1 for b in system_blocks if "cache_control" in b)
         convo_bps = 1  # _cacheable marks the last message
-        assert sys_bps + convo_bps <= 4
+        assert sys_bps == 3                 # system + project + session
+        assert sys_bps + convo_bps == 4     # the full budget, not over it
     finally:
         llm.set_project_context("")
+        llm.set_session_context("")
+
+
+def test_session_context_is_volatile_last(monkeypatch):
+    """Session context is the LAST system block (so a change never busts the static
+    prefix above it) and carries its own cache breakpoint; static SYSTEM stays first."""
+    llm.set_project_context("# Project\nx")
+    llm.set_session_context("# Session context\n- Date: 2026-07-01")
+    try:
+        blocks = llm._build_system_block()
+        assert blocks[0]["text"] == llm.SYSTEM                     # static first
+        assert blocks[-1]["text"].startswith("# Session context")  # volatile last
+        assert "cache_control" in blocks[-1]
+    finally:
+        llm.set_project_context("")
+        llm.set_session_context("")
+
+
+def test_no_session_block_when_unset():
+    """Unset (e.g. sub-agents / tests) → no session block appears."""
+    llm.set_project_context("")
+    llm.set_session_context("")
+    blocks = llm._build_system_block()
+    assert len(blocks) == 1 and blocks[0]["text"] == llm.SYSTEM
+
+
+def test_build_session_context_has_env(monkeypatch, tmp_path):
+    """build_session_context reports cwd/platform/date; git line is skipped cleanly
+    in a non-repo directory."""
+    from minicc.prompts.system import build_session_context
+    monkeypatch.chdir(tmp_path)
+    ctx = build_session_context()
+    assert ctx.startswith("# Session context")
+    assert str(tmp_path) in ctx
+    assert "Date:" in ctx and "Platform:" in ctx
 
 
 # ─── L3: eviction keeps recent N ─────────────────────────────────────────────

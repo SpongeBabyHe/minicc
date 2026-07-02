@@ -18,7 +18,7 @@ from minicc import permissions
 from minicc import sessions
 from minicc import config
 from minicc import checkpoints
-from minicc.prompts.system import load_project_context
+from minicc.prompts.system import load_project_context, build_session_context
 
 
 # Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
@@ -310,6 +310,7 @@ def main():
     pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
     llm.set_project_context(load_project_context())
+    llm.set_session_context(build_session_context())  # env + git snapshot (layer 3)
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
     if pre_approved:
@@ -361,6 +362,7 @@ def main():
                 checkpoints.reset()
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
+                llm.set_session_context(build_session_context())  # refresh env/git
                 ux.say(
                     "conversation, permissions reset; CLAUDE.md reloaded",
                     style=ux.S_INFO,
