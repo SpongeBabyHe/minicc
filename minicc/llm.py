@@ -70,6 +70,7 @@ EVICTED_MARKER = (
 _USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
 _PROJECT_CONTEXT = ""
 _SESSION_CONTEXT = ""
+_MEMORY_INDEX = ""
 
 # Durable counters for context-management activity this session. Surfaced via
 # /context so you can tell whether L3/L4 fired without hunting for dim log
@@ -134,6 +135,13 @@ def set_session_context(text: str):
     _SESSION_CONTEXT = text
 
 
+def set_memory_index(text: str):
+    """Update the auto-memory index (MEMORY.md). It rides the project-context cache
+    layer next to CLAUDE.md. Loaded at startup and on /clear."""
+    global _MEMORY_INDEX
+    _MEMORY_INDEX = text
+
+
 def _build_system_block(system: str | None = None) -> list:
     """Build the `system` param as content blocks with cache_control markers.
 
@@ -142,13 +150,15 @@ def _build_system_block(system: str | None = None) -> list:
       1. System prompt — rarely changes. Its breakpoint's prefix is `tools +
          system` (tools render first), so this single marker caches the tool
          definitions too — no separate tools breakpoint needed (see tools/__init__).
-      2. Project context — CLAUDE.md, changes on /clear.
+      2. Project context — CLAUDE.md + the auto-memory MEMORY.md index, changes on
+         /clear. Both are project-scoped and reload together, so they share one
+         block / breakpoint.
       3. Session context — env + git snapshot, VOLATILE-LAST so a change here (only
          on /clear) never busts layers 1–2; spends the 4th breakpoint.
     That leaves one breakpoint (of 4/request) for the conversation (_cacheable).
 
     A sub-agent passes its own `system` string → a single isolated block (no
-    project/session layers; its context is deliberately its own).
+    project/session/memory layers; its context is deliberately its own).
     """
     if system:
         return [
@@ -156,11 +166,12 @@ def _build_system_block(system: str | None = None) -> list:
         ]
 
     blocks = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
-    if _PROJECT_CONTEXT:
+    project_layer = "\n\n".join(t for t in (_PROJECT_CONTEXT, _MEMORY_INDEX) if t)
+    if project_layer:
         blocks.append(
             {
                 "type": "text",
-                "text": _PROJECT_CONTEXT,
+                "text": project_layer,
                 "cache_control": {"type": "ephemeral"},
             }
         )

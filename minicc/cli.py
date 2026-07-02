@@ -18,6 +18,7 @@ from minicc import permissions
 from minicc import sessions
 from minicc import config
 from minicc import checkpoints
+from minicc import memory
 from minicc.prompts.system import load_project_context, build_session_context
 
 
@@ -80,6 +81,7 @@ def _cmd_help():
                 ),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
+                ("/memory [file|on|off]", "Browse or toggle cross-session memory"),
                 (
                     "/rewind [N]",
                     "List restore points, or revert files to restore point N",
@@ -153,6 +155,29 @@ def _cmd_recap(messages):
     summary = recap(messages)
     ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
     ux.markdown(summary)
+
+
+def _cmd_memory(arg: str | None):
+    """Browse or toggle auto-memory. `/memory` lists the store; `/memory <file>`
+    views one file; `/memory on|off` toggles it for this session."""
+    if arg in ("on", "off"):
+        memory.set_enabled(arg == "on")
+        llm.set_memory_index(memory.load_index())  # refresh what's injected
+        ux.say(f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO)
+        return
+    if arg:
+        path = arg if arg.startswith("/memories") else f"/memories/{arg}"
+        ux.say(memory.view(path))
+        return
+    ux.say(
+        ux.kv_block(
+            [
+                ("auto-memory", "on" if memory.enabled() else "off"),
+                ("store", str(memory.store_dir())),
+            ]
+        )
+    )
+    ux.say(memory.view("/memories"))
 
 
 # Short aliases for ergonomics; /model also accepts any raw model id.
@@ -311,6 +336,7 @@ def main():
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
     llm.set_project_context(load_project_context())
     llm.set_session_context(build_session_context())  # env + git snapshot (layer 3)
+    llm.set_memory_index(memory.load_index())          # auto-memory index (rides layer 2)
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
     if pre_approved:
@@ -363,6 +389,7 @@ def main():
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
                 llm.set_session_context(build_session_context())  # refresh env/git
+                llm.set_memory_index(memory.load_index())         # reload memory index
                 ux.say(
                     "conversation, permissions reset; CLAUDE.md reloaded",
                     style=ux.S_INFO,
@@ -377,6 +404,8 @@ def main():
                 _cmd_compact(history, focus=arg, session_id=session_id)
             elif cmd == "/recap":
                 _cmd_recap(history)
+            elif cmd == "/memory":
+                _cmd_memory(arg)
             elif cmd == "/rewind":
                 _cmd_rewind(history, arg, session_id=session_id)
             else:

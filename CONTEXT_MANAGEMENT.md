@@ -56,9 +56,9 @@ minicc places breakpoints to match how often each region changes:
   prompt is frozen at construction.
 - **Project context** — a second breakpoint after CLAUDE.md (first 200 lines /
   25 KB). It changes only on `/clear`, so keeping it separate lets a CLAUDE.md
-  reload re-cache while the system+tools layer survives. The planned **MEMORY.md
-  index** (cross-session memory — see "Not yet implemented") is designed to load
-  here too, beside CLAUDE.md, riding the same project-context cache.
+  reload re-cache while the system+tools layer survives. The **auto-memory
+  MEMORY.md index** (cross-session memory) is merged into this same block, beside
+  CLAUDE.md, so it rides the project-context cache and reloads together on `/clear`.
 - **Session context** — a third breakpoint after the env/git block
   (`build_session_context`: cwd, platform, date, and a git snapshot). It's
   **volatile-last** — placed after the static layers so its only change (a `/clear`
@@ -148,8 +148,8 @@ This touches the cache at **two moments that are easy to conflate**:
    — and every later turn reuses the new short prefix. This is the **intentional
    reset**: compaction discards the old history *by design* (that is the
    shrinking), then caches cleanly again. (Durable facts meant to outlive this
-   reset are the job of the planned **MEMORY.md** — re-read from disk after
-   compaction, CC's "project memory survives compaction".)
+   reset are the job of **auto-memory (MEMORY.md)** — its index re-loads from disk
+   on `/clear`, CC's "project memory survives compaction".)
 
 A structural rule keeps the replacement valid: the cut lands on an **assistant
 boundary**, so the kept tail starts with an assistant message and prepending the
@@ -222,12 +222,11 @@ forgets to ignore them).
 
 ## Not yet implemented
 
-The backlog — each feature with what it buys and why it waits. The substantial
-one is **MEMORY.md** (auto-written cross-session memory).
+The backlog — each feature with what it buys and why it waits.
 
 | Feature | What it buys | Why deferred |
 | ------- | ------------ | ------------ |
-| **MEMORY.md** (auto-written cross-session memory) | learnings persist across sessions (context-engineering principle #6) | a real feature (~1 week); "what to persist" wants dogfood data |
+| **Memory consolidation** (CC's "Auto Dream") | merge duplicates / prune stale / dedupe MEMORY.md so it stays a tight index | MVP auto-memory ships write+recall first; add an idle/`/memory consolidate` pass later |
 | **Tuning** (`KEEP_RECENT_MESSAGES` — no CC target, API example is 3; `CLEAR_AT_LEAST` value) | closer to CC's defaults | low-risk polish; wants dogfood data; **future work** |
 | **Dynamic cache breakpoint** (conversation anchor) | a 2nd history breakpoint for the 20-block lookback on block-heavy turns | all 4 breakpoints are now used (system/project/session/conversation), so this would need displacing a layer; marginal anyway (minicc re-marks every call) — wait for a dogfood signal |
 | **User-input source cap** | bound the one unbounded input (a huge pasted message) so it can't reach L5 | L5 already backstops it; turns a hard failure into a graceful one |
@@ -238,8 +237,10 @@ one is **MEMORY.md** (auto-written cross-session memory).
 context-editing defaults), then a prefix-sharing **L4 compaction** on a
 **`window − 13K` trigger + real token accounting**, the **9-section** summary —
 **reactive-413/429**, and the compaction-correctness fixes. Subagents,
-`/rewind` + file checkpoints, and session persistence are also done — see
-[SUBAGENTS.md](SUBAGENTS.md), [CHECKPOINT.md](CHECKPOINT.md), and `sessions.py`.)
+`/rewind` + file checkpoints, session persistence, the session-context cache layer,
+and **auto-memory** (the `memory` tool + MEMORY.md index, gated writes) are also done
+— see [SUBAGENTS.md](SUBAGENTS.md), [CHECKPOINT.md](CHECKPOINT.md), `sessions.py`,
+and `memory.py`.)
 
 ## Dogfood lessons
 
