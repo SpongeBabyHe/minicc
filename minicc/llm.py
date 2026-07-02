@@ -30,11 +30,13 @@ def set_model(model_id: str) -> None:
 
 
 # ─── L4: compaction trigger (window-relative, like Claude Code) ─────────────
-# CC compacts as it nears the model's context window. minicc does the same, but
-# clamps to a safe ceiling because its endpoint has a real ~450K single-request
-# wall (PAIN.md). effective budget = min(95% of the window, the ceiling).
-WINDOW_FRACTION = 0.95
-SAFE_REQUEST_CEILING = 350_000
+# CC auto-compacts near the model's context window; its leaked default is
+# `effectiveContextWindow - 13K`. minicc mirrors that exact shape. (The old
+# `min(95%, 350K)` clamp was dropped: the "~450K wall" in PAIN.md was a
+# misdiagnosed ITPM rate limit, not a request-size ceiling — a 450K request fits
+# the 1M window fine. Rate limits are handled by SDK backoff + the reactive-429
+# fallback below, not by shrinking the budget. See docs/CC_ALIGNMENT_PLAN.md.)
+COMPACT_BUFFER_TOKENS = 13_000
 
 # Context window (input tokens) by model-id prefix; ids may carry a date suffix.
 _MODEL_WINDOWS = {
@@ -56,9 +58,9 @@ _LAST_INPUT_TOKENS = 0
 # the prompt cache: in-place eviction rewrites mid-history and breaks the cache, so
 # only do it when it frees at least CLEAR_AT_LEAST tokens (worth the re-write).
 # Mirrors CC's trigger / keep / clear_at_least.
-CLEAR_TRIGGER = 100_000             # start clearing tool outputs above this (CC default)
+CLEAR_TRIGGER = 100_000             # start clearing above this (context-editing trigger default = 100K)
 CLEAR_AT_LEAST = 5_000             # ...but only if it frees ≥ this (don't nibble the cache)
-RECENT_TOOL_RESULTS_KEEP = 4       # keep this many recent tool_results intact (CC: 3)
+RECENT_TOOL_RESULTS_KEEP = 3       # recent tool_results kept intact (context-editing keep default = 3)
 EVICTED_MARKER = (
     "[content omitted; was earlier in conversation — re-call the tool if needed]"
 )
@@ -85,24 +87,36 @@ KEEP_RECENT_MESSAGES = 6
 MAX_COMPACT_ATTEMPTS = 3
 _compact_attempts = 0
 
-_COMPACT_PROMPT = """You compress an agent's conversation history into a structured summary so work can continue with less context. Output this exact structure:
+_COMPACT_PROMPT = """You compress an agent's conversation history into a structured summary so work can continue with less context. Match Claude Code's 9-section shape. Output exactly:
 
-## Goal
-<the user's overall objective, 1-2 sentences>
+## Primary Request and Intent
+<the user's explicit requests and overall intent; keep wording where it matters>
 
-## Done
-- <action taken + files touched + outcome>
+## Key Technical Concepts
+- <important technologies, patterns, conventions in play>
 
-## Key findings
-- <important facts, decisions, discoveries worth keeping>
+## Files and Code Sections
+- <files read/edited/created, why each matters, key snippets>
 
-## In progress
-<what's being worked on now and the immediate next step>
+## Errors and fixes
+- <errors hit and how each was resolved>
 
-## Open questions
-- <anything unresolved>
+## Problem Solving
+<problems solved and any ongoing troubleshooting>
 
-Be specific (file paths, decisions). Under 500 words. No pleasantries."""
+## All user messages
+- <every non-tool user message, so intent isn't lost>
+
+## Pending Tasks
+- <explicitly requested work not yet done>
+
+## Current Work
+<what was being done right before this summary, with file paths>
+
+## Optional Next Step
+<the next step, tightly tied to the most recent work>
+
+Be specific (file paths, decisions). No pleasantries."""
 
 
 def set_project_context(text: str):
@@ -161,9 +175,9 @@ def _model_window(model: str) -> int:
 
 
 def _effective_budget(model: str) -> int:
-    """Compaction threshold: the smaller of 95% of the model window and the safe
-    request ceiling (minicc's endpoint has a real ~450K single-request wall)."""
-    return min(int(WINDOW_FRACTION * _model_window(model)), SAFE_REQUEST_CEILING)
+    """Compaction threshold: the model window minus a safety buffer, matching CC's
+    `effectiveContextWindow - 13K`. No sub-window clamp (see COMPACT_BUFFER_TOKENS)."""
+    return _model_window(model) - COMPACT_BUFFER_TOKENS
 
 
 def _context_size(messages) -> int:
@@ -263,7 +277,7 @@ def _summarize(
     instruction = {"role": "user", "content": _COMPACT_PROMPT + focus_line}
     resp = client.messages.create(
         model=model if model is not None else MODEL,
-        max_tokens=1500,
+        max_tokens=2048,   # 9-section summary needs a bit more room than the old 5
         system=_build_system_block(system),                  # match the live prefix
         tools=tools if tools is not None else TOOLS,
         messages=_cacheable(list(messages) + [instruction]),
@@ -438,13 +452,20 @@ def llm_response(
     try:
         response = _send_request(params, stream)
     except APIStatusError as e:
-        # Reactive compaction (CC-style fallback): a 413 means the proactive
-        # trigger under-fired (token-estimate drift) or a single turn exceeded the
-        # ceiling. The SDK does NOT auto-retry 413, so force one compaction and
-        # retry once; a second 413 (e.g. one un-compactable huge message) surfaces.
-        if getattr(e, "status_code", None) != 413:
+        # Reactive compaction (CC-style fallback).
+        #  413: request too large for the window (proactive trigger under-fired, or
+        #       a single turn overflowed) → must shrink. SDK does NOT auto-retry 413.
+        #  429: rate limited. The SDK already retried with backoff; if it still
+        #       persists AND the context is large, a single request likely exceeds
+        #       the per-minute input budget (the PAIN.md case), which only shrinking
+        #       fixes. A small-context 429 is a transient/quota limit compaction
+        #       can't help, so it surfaces (don't destroy history over a temporary cap).
+        code = getattr(e, "status_code", None)
+        if code not in (413, 429):
             raise
-        ux.say("[request too large — compacting and retrying]", style=ux.S_ERROR)
+        if code == 429 and _estimate_tokens(messages) <= CLEAR_TRIGGER:
+            raise
+        ux.say("[request rejected — compacting and retrying]", style=ux.S_ERROR)
         if not _compact(messages, model=m, system=system, tools=tools):
             raise  # nothing compactable → let the error surface
         params["messages"] = _cacheable(messages)

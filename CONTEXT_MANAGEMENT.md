@@ -25,7 +25,7 @@ where it's silent minicc makes (and labels) its own choice.
 | **L2** | size | Cap each tool's output at the source so one call can't flood the history. |
 | **L3** | size | **Auto, incremental:** above `CLEAR_TRIGGER` blank out the oldest `tool_result` content — `clear_at_least`-guarded so it only breaks the cache when it frees enough (CC: clear tool outputs first). |
 | **L4** | size | **Primary lever:** when context nears the model window, summarize the history into a fresh, shorter prefix (on a warm cache). |
-| **L5** | safety | Stop after N compactions if one message keeps refilling the window; plus a reactive compaction on a 413. |
+| **L5** | safety | Stop after N compactions if one message keeps refilling the window; plus a reactive compaction on a 413/429. |
 | **L6** | control | `/context`, `/compact [focus]`, `/recap` — visibility and manual control. |
 
 L1 runs passively every turn; L2 on every tool call. The size path is **two-band,
@@ -97,7 +97,7 @@ rather than removing it later.
 
 **L3 — evict stale tool results (auto, incremental, `clear_at_least`-guarded).**
 `_evict_old_tool_result` blanks the oldest `tool_result` contents (keeping
-`RECENT_TOOL_RESULTS_KEEP = 4`), preserving the tool_use → tool_result structure
+`RECENT_TOOL_RESULTS_KEEP = 3`), preserving the tool_use → tool_result structure
 so the model can re-call. It runs **every turn the real context size sits between
 `CLEAR_TRIGGER = 100K` and the compaction budget** — CC's "clear older tool outputs
 first." It's cheap (no LLM call), and the `min_free = CLEAR_AT_LEAST` guard means it
@@ -107,13 +107,15 @@ the budget instead, L4 takes over and L3 stands down for that turn.
 
 **L4 — compaction (the primary lever).** When the **real** context size — the
 last response's `usage` (`input + cache_read + cache_creation`), not a
-char-estimate — nears the **effective budget** `min(95% × model_window,
-SAFE_REQUEST_CEILING ≈ 350K)`, compaction summarizes the older history into a
-fixed-shape note (Goal / Done / Key findings / In progress / Open questions) and
-replaces it, keeping `KEEP_RECENT_MESSAGES` recent messages verbatim. The budget
-is **window-relative** (like CC) but **clamped** by the ceiling, because minicc's
-endpoint has a real ~450K single-request wall (PAIN.md) — the clamp generalizes
-minicc's old absolute 150K (per-model: Haiku→190K, Sonnet/Opus 1M→350K).
+char-estimate — nears the **effective budget** `model_window − 13K` (matching CC's
+`effectiveContextWindow − 13K`), compaction summarizes the older history into CC's
+**9-section** note (Primary Request & Intent / Key Technical Concepts / Files & Code /
+Errors & fixes / Problem Solving / All user messages / Pending Tasks / Current Work /
+Optional Next Step) and replaces it, keeping `KEEP_RECENT_MESSAGES` recent messages
+verbatim. The budget is **window-relative like CC, with no sub-window clamp**: the
+old `min(95%, 350K)` ceiling was dropped once the "~450K wall" (PAIN.md) turned out
+to be a misdiagnosed ITPM *rate limit*, not a request-size cap — rate limits are
+handled by SDK backoff + reactive-429 (below), not by shrinking the budget.
 Concretely, the messages before the cut collapse into a single
 `[Earlier conversation summary]` user message, prepended to the kept tail:
 
@@ -174,7 +176,7 @@ So compaction can always pull accumulated history below the budget. The one path
 that stays open is a **single, irreducible, oversized message**, and the only
 unbounded source of one is **user input**: L2 caps tool *output* but not what the
 user types, and L4 can't cut the most-recent turn (`_find_cut_index` cuts *before*
-it). A pasted 200K-char message can't be shrunk, so reactive-413 forces a
+it). A pasted 200K-char message can't be shrunk, so reactive-413/429 forces a
 compaction that can't reduce, and after `MAX_COMPACT_ATTEMPTS` L5 raises.
 
 L5 is therefore a real failsafe, not dead code — it backstops exactly the input
@@ -195,18 +197,21 @@ never firing.
 
 **Following CC** (where it publishes specifics): bash output cap + disk save;
 glob 100 by mtime; read `offset`/`limit` pagination; **two-band sizing** — clear
-older tool outputs first (`clear_at_least`-guarded), then a **window-relative
-compaction trigger** (~95% of the model window) only if still needed; real token
-accounting from `usage`; cache layers system / project / conversation; CLAUDE.md
-first 200 lines or 25 KB; `/compact [focus]`; `/recap` is cache-safe.
+older tool outputs first (**official context-editing defaults**: `trigger` 100K,
+`keep` 3, `clear_at_least`-guarded), then a **`window − 13K` compaction trigger**
+(CC's `effectiveContextWindow − 13K`) only if still needed; real token accounting
+from `usage`; the **9-section** compact summary; cache layers system / project /
+conversation; CLAUDE.md first 200 lines or 25 KB; `/compact [focus]`; `/recap` is
+cache-safe.
 
-**minicc's own** (CC silent on the exact values): the **`SAFE_REQUEST_CEILING ≈
-350K`** clamping the window-relative budget (minicc's endpoint wall, PAIN.md); the
-L3 thresholds `CLEAR_TRIGGER = 100K` / `CLEAR_AT_LEAST = 5K` (the *ordering* is CC's,
-these numbers are minicc's); `RECENT_TOOL_RESULTS_KEEP = 4`; `KEEP_RECENT_MESSAGES`;
-the summary template; `MAX_COMPACT_ATTEMPTS = 3`; the `.minicc/` self-ignoring
-directory (`.minicc/.gitignore: "*"`, so artifacts never get tracked even if the
-project forgets to ignore them).
+**minicc's own** (CC silent, or the value is minicc's judgment): `CLEAR_AT_LEAST = 5K`
+(the context-editing `clear_at_least` is optional/off by default — minicc sets it, for
+exactly the reason the docs give: is clearing worth breaking the cache?);
+`KEEP_RECENT_MESSAGES = 6` (no published CC value; the compaction API's example keeps
+`messages[-3:]`); the exact summary wording; `MAX_COMPACT_ATTEMPTS = 3` (matches CC's
+"3 consecutive failures"); the `.minicc/` self-ignoring directory
+(`.minicc/.gitignore: "*"`, so artifacts never get tracked even if the project
+forgets to ignore them).
 
 ## Not yet implemented
 
@@ -216,15 +221,16 @@ one is **MEMORY.md** (auto-written cross-session memory).
 | Feature | What it buys | Why deferred |
 | ------- | ------------ | ------------ |
 | **MEMORY.md** (auto-written cross-session memory) | learnings persist across sessions (context-engineering principle #6) | a real feature (~1 week); "what to persist" wants dogfood data |
-| **Tuning** (`KEEP_RECENT_MESSAGES` 6→10, summary 5→9 sections, `CLEAR_TRIGGER`/`CLEAR_AT_LEAST`) | closer to CC's defaults | low-risk polish; wants dogfood data; **future work** |
+| **Tuning** (`KEEP_RECENT_MESSAGES` — no CC target, API example is 3; `CLEAR_AT_LEAST` value) | closer to CC's defaults | low-risk polish; wants dogfood data; **future work** |
 | **Dynamic cache breakpoint** (conversation anchor) | spend the freed 4th breakpoint to stay inside the 20-block lookback on block-heavy turns | marginal (minicc re-marks every call); the cache-hit gain can't be unit-verified — wait for a dogfood signal |
 | **User-input source cap** | bound the one unbounded input (a huge pasted message) so it can't reach L5 | L5 already backstops it; turns a hard failure into a graceful one |
 | Server-side compaction (`compact-2026-01-12`) | summarize server-side, no extra round-trip | build-vs-buy — the hand-rolled L4 is the portfolio substance; server-side is the production swap |
 
 (Now implemented and folded into the design above: conversation-history caching,
-**two-band sizing** — incremental L3 eviction with `clear_at_least`, then a
-prefix-sharing **L4 compaction** on a **window-relative trigger + real token
-accounting** — **reactive-413**, and the compaction-correctness fixes. Subagents,
+**two-band sizing** — incremental L3 eviction (`clear_at_least`, official
+context-editing defaults), then a prefix-sharing **L4 compaction** on a
+**`window − 13K` trigger + real token accounting**, the **9-section** summary —
+**reactive-413/429**, and the compaction-correctness fixes. Subagents,
 `/rewind` + file checkpoints, and session persistence are also done — see
 [SUBAGENTS.md](SUBAGENTS.md), [CHECKPOINT.md](CHECKPOINT.md), and `sessions.py`.)
 

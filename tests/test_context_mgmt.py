@@ -173,7 +173,7 @@ def test_summarize_shares_prefix_and_appends_instruction(monkeypatch):
     sent = captured["messages"]
     assert len(sent) == len(msgs) + 1
     assert sent[-1]["role"] == "user"
-    assert "## Goal" in sent[-1]["content"][-1]["text"]      # _COMPACT_PROMPT body
+    assert "## Current Work" in sent[-1]["content"][-1]["text"]  # _COMPACT_PROMPT body
 
 
 # ─── L4: never destroy history on an empty summary (regression) ──────────────
@@ -258,13 +258,13 @@ def test_evict_keeps_recent(monkeypatch):
 
 
 # ─── Window-relative compaction budget (CC-style trigger) ────────────────────
-def test_effective_budget_window_relative_then_ceiling():
-    # small-window model: 95% of the window (window-bound)
-    assert llm._effective_budget("claude-haiku-4-5") == int(0.95 * 200_000)
-    assert llm._effective_budget("claude-haiku-4-5-20251001") == 190_000   # date suffix ok
-    # big-window model: 95% of 1M would be 950K → clamped to the safe ceiling
-    assert llm._effective_budget("claude-sonnet-4-6") == llm.SAFE_REQUEST_CEILING
-    assert llm._effective_budget("who-knows") == int(0.95 * llm._DEFAULT_WINDOW)
+def test_effective_budget_is_window_minus_buffer():
+    # CC-aligned: window - 13K, no sub-window clamp (the old 350K ceiling was dropped).
+    b = llm.COMPACT_BUFFER_TOKENS
+    assert llm._effective_budget("claude-haiku-4-5") == 200_000 - b
+    assert llm._effective_budget("claude-haiku-4-5-20251001") == 200_000 - b   # date suffix ok
+    assert llm._effective_budget("claude-sonnet-4-6") == 1_000_000 - b         # 1M, no clamp
+    assert llm._effective_budget("who-knows") == llm._DEFAULT_WINDOW - b
 
 
 def test_over_budget_compacts_and_skips_eviction(monkeypatch):
@@ -414,6 +414,50 @@ def test_non_413_status_error_propagates(monkeypatch):
     monkeypatch.setattr(llm, "_compact", lambda m, **kw: compacted.update(n=compacted["n"] + 1) or True)
     with pytest.raises(llm.APIStatusError):
         llm.llm_response([user("hi")], stream=False)
+
+
+# ─── Reactive compaction on a 429 (rate-limit) fallback ──────────────────────
+class _Fake429(llm.APIStatusError):
+    """A 429 (rate limit); only .status_code is read."""
+    def __init__(self):
+        self.status_code = 429
+
+
+def test_reactive_compact_on_429_large_context(monkeypatch):
+    """A persistent 429 on a LARGE request → treat as over-ITPM (the PAIN.md case),
+    compact to shrink it and retry once."""
+    monkeypatch.setattr(llm, "_effective_budget", lambda model: 10_000_000)  # no pre-compact
+    monkeypatch.setattr(llm, "_estimate_tokens", lambda m: 200_000)          # > CLEAR_TRIGGER
+    monkeypatch.setattr(llm, "_compact_attempts", 0)
+    calls = {"send": 0, "compact": 0}
+
+    def flaky_send(params, stream):
+        calls["send"] += 1
+        if calls["send"] == 1:
+            raise _Fake429()
+        return FakeResponse()
+
+    monkeypatch.setattr(llm, "_send_request", flaky_send)
+    monkeypatch.setattr(llm, "_compact", lambda m, **kw: calls.update(compact=calls["compact"] + 1) or True)
+
+    resp = llm.llm_response([user("x" * 100)], stream=False)
+    assert resp is not None
+    assert calls["send"] == 2      # failed once, retried once
+    assert calls["compact"] == 1   # one forced compaction
+
+
+def test_reactive_429_small_context_reraises(monkeypatch):
+    """A 429 on a SMALL request is a transient/quota limit compaction can't fix —
+    it surfaces WITHOUT destroying history (no compaction)."""
+    monkeypatch.setattr(llm, "_effective_budget", lambda model: 10_000_000)
+    monkeypatch.setattr(llm, "_estimate_tokens", lambda m: 500)   # <= CLEAR_TRIGGER
+    monkeypatch.setattr(llm, "_compact_attempts", 0)
+    monkeypatch.setattr(llm, "_send_request", lambda params, stream: (_ for _ in ()).throw(_Fake429()))
+    compacted = {"n": 0}
+    monkeypatch.setattr(llm, "_compact", lambda m, **kw: compacted.update(n=compacted["n"] + 1) or True)
+    with pytest.raises(llm.APIStatusError):
+        llm.llm_response([user("hi")], stream=False)
+    assert compacted["n"] == 0   # never compacted a small transient 429
     assert compacted["n"] == 0     # never tried to compact for a 500
 
 
