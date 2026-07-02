@@ -5,3 +5,6 @@ evals/runs/
 .vscode/
 
 rich_p.py
+
+/docs
+/.obsidian
