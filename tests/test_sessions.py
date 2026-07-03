@@ -119,3 +119,62 @@ def test_latest_id(tmp_path, monkeypatch):
 def test_load_missing_returns_none(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert sessions.load("nope") is None
+
+
+# ─── conversation rewind: event_count / load_upto / rewind event ─────────────
+def test_event_count(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert sessions.event_count("s") == 0
+    sessions.append_message("s", {"role": "user", "content": "a"})
+    sessions.append_message("s", {"role": "assistant", "content": "b"})
+    assert sessions.event_count("s") == 2
+    sessions.log_compaction("s", [{"role": "user", "content": "S"}])
+    assert sessions.event_count("s") == 3          # compact is an event too
+
+
+def test_load_upto_replays_partial(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for i in range(4):
+        sessions.append_message("s", {"role": "user", "content": f"m{i}"})
+    assert sessions.load_upto("s", 2) == [
+        {"role": "user", "content": "m0"},
+        {"role": "user", "content": "m1"},
+    ]
+    assert sessions.load_upto("s", 0) == []
+    assert sessions.load_upto("nope", 2) is None
+
+
+def test_load_upto_works_across_a_compaction(tmp_path, monkeypatch):
+    """The rewind target may predate a compaction — replay reconstructs the
+    pre-compaction working set from the raw msg events (the transcript's point)."""
+    monkeypatch.chdir(tmp_path)
+    sessions.append_message("s", {"role": "user", "content": "m0"})       # event 1
+    sessions.append_message("s", {"role": "assistant", "content": "a0"})  # event 2
+    sessions.log_compaction("s", [{"role": "user", "content": "S"}])      # event 3
+    sessions.append_message("s", {"role": "assistant", "content": "a1"})  # event 4
+    # rewind target = before the compaction: raw pre-compaction state
+    assert sessions.load_upto("s", 2) == [
+        {"role": "user", "content": "m0"},
+        {"role": "assistant", "content": "a0"},
+    ]
+    # sanity: full replay applies the compact reset then the tail
+    assert sessions.load("s") == [
+        {"role": "user", "content": "S"},
+        {"role": "assistant", "content": "a1"},
+    ]
+
+
+def test_rewind_event_resets_on_load(tmp_path, monkeypatch):
+    """A rewind event has compact's reset semantics: load lands on the rewound
+    state, while the rewound-away msg events stay on disk (append-only)."""
+    monkeypatch.chdir(tmp_path)
+    sessions.append_message("s", {"role": "user", "content": "m0"})
+    sessions.append_message("s", {"role": "assistant", "content": "a0"})
+    sessions.append_message("s", {"role": "user", "content": "m1"})
+    rewound = [{"role": "user", "content": "m0"}]     # state as of event 1
+    sessions.log_rewind("s", rewound)
+    sessions.append_message("s", {"role": "assistant", "content": "a-new"})
+
+    assert sessions.load("s") == rewound + [{"role": "assistant", "content": "a-new"}]
+    path = tmp_path / ".minicc" / "sessions" / "s.jsonl"
+    assert '"m1"' in path.read_text()                  # rewound-away msg still on disk

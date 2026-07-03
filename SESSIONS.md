@@ -149,8 +149,10 @@ sub-agents pass `None`, so their isolated context is never recorded):
 - ✅ `/clear` rotates to a new session id — the pre-clear transcript stays on disk;
   new turns record to a fresh `<id>.jsonl`.
 - ⬜ session listing UI / picker — defer (just `--continue` for the common case)
-- ⬜ conversation-level `/rewind` to a boundary — the transcript now makes this
-  possible (raw events on disk); not yet wired.
+- ✅ conversation-level `/rewind` — `/rewind N conversation|both` replays the
+  transcript back to just before turn N's prompt (`load_upto` + a checkpoint-recorded
+  event anchor), works across compaction boundaries, and logs an append-only
+  `rewind` reset event. See [CHECKPOINT.md](CHECKPOINT.md) D3.
 
 ## Status
 ✅ Implemented. serialize + append-only transcript + `--continue`/`--resume`;

@@ -56,11 +56,35 @@ def test_backup_once_per_turn():
     assert f.read_text() == "orig"
 
 
-def test_restore_points_only_changing_turns():
+def test_restore_points_lists_every_turn_with_changed_files():
+    """Every turn is a restore point (CC: one checkpoint per prompt); the entry
+    shows which files that turn changed (empty for read-only turns)."""
     Path("e.txt").write_text("x")
     checkpoints.start(1, "read only")
     checkpoints.start(2, "edits e"); checkpoints.before_write("e.txt"); Path("e.txt").write_text("y")
-    assert checkpoints.restore_points() == [(2, "edits e")]
+    assert checkpoints.restore_points() == [
+        (1, "read only", []),
+        (2, "edits e", ["e.txt"]),
+    ]
+
+
+def test_events_at_returns_conversation_anchor():
+    checkpoints.start(1, "a", events=0)
+    checkpoints.start(2, "b", events=5)
+    assert checkpoints.events_at(1) == 0
+    assert checkpoints.events_at(2) == 5
+    assert checkpoints.events_at(99) is None
+
+
+def test_restore_files_from_read_only_turn_reverts_later_turns():
+    """Rewinding to a read-only turn undoes file changes made in LATER turns."""
+    f = Path("r.txt")
+    f.write_text("v0")
+    checkpoints.start(1, "read only")                 # no file changes this turn
+    checkpoints.start(2, "edit"); checkpoints.before_write("r.txt"); f.write_text("v1")
+    restored, failed = checkpoints.restore_files(1)   # read-only turn is valid
+    assert (restored, failed) == (1, [])
+    assert f.read_text() == "v0"
 
 
 def test_restore_files_unknown_turn_returns_none():
@@ -140,7 +164,7 @@ def test_stack_truncated_after_rewind():
     checkpoints.start(1, "t1"); checkpoints.before_write("a.txt"); Path("a.txt").write_text("a1")
     checkpoints.start(2, "t2"); checkpoints.before_write("a.txt"); Path("a.txt").write_text("a2")
     checkpoints.restore_files(2)
-    assert checkpoints.restore_points() == [(1, "t1")]   # turn 2 discarded, turn 1 remains
+    assert checkpoints.restore_points() == [(1, "t1", ["a.txt"])]   # turn 2 discarded, turn 1 remains
 
 
 def test_double_rewind_is_graceful():

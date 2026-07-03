@@ -21,8 +21,11 @@ SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["view", "create", "str_replace"],
-                "description": "view a file/dir, create (or overwrite) a file, or str_replace within a file.",
+                "enum": ["view", "create", "str_replace", "delete"],
+                "description": (
+                    "view a file/dir, create (or overwrite) a file, str_replace "
+                    "within a file, or delete a stale/merged file."
+                ),
             },
             "path": {
                 "type": "string",
@@ -59,4 +62,6 @@ def memory(command, path, file_text=None, old_str=None, new_str="", view_range=N
         if old_str is None:
             return "Error: str_replace requires old_str"
         return _store.str_replace(path, old_str, new_str or "")
-    return f"Error: unknown command {command!r} (use view, create, or str_replace)"
+    if command == "delete":
+        return _store.delete(path)
+    return f"Error: unknown command {command!r} (use view, create, str_replace, or delete)"

@@ -241,6 +241,25 @@ def test_request_stays_within_four_breakpoints(monkeypatch):
         llm.set_session_context("")
 
 
+def test_stable_prefix_ttl_conversation_stays_default(monkeypatch):
+    """cache_ttl=1h applies to the STABLE prefix blocks only; the rolling
+    conversation breakpoint keeps the default 5m (the API requires longer-TTL
+    breakpoints to precede shorter ones — stable layers render first)."""
+    monkeypatch.setattr(llm, "CACHE_TTL", "1h")
+    llm.set_project_context("# P\nx")
+    llm.set_session_context("# S\ny")
+    try:
+        blocks = llm._build_system_block()
+        assert all(
+            b["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for b in blocks
+        )
+        out = llm._cacheable([{"role": "user", "content": "hi"}])
+        assert out[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    finally:
+        llm.set_project_context("")
+        llm.set_session_context("")
+
+
 def test_session_context_is_volatile_last(monkeypatch):
     """Session context is the LAST system block (so a change never busts the static
     prefix above it) and carries its own cache breakpoint; static SYSTEM stays first."""

@@ -79,3 +79,16 @@ def test_preload_excludes_bash_and_non_gated():
     assert applied == {"write_file", "edit_file"}     # bash excluded; read_file/bogus not gated
     assert "bash" not in permissions._ALLOWED         # bash never pre-approved from config
     permissions.reset()
+
+
+def test_resolve_cache_ttl_default_override_and_validation(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    assert config.resolve_cache_ttl() == "5m"                    # default
+    (tmp_path / "home" / ".minicc").mkdir(parents=True)
+    (tmp_path / "home" / ".minicc" / "settings.json").write_text('{"cache_ttl": "1h"}')
+    assert config.resolve_cache_ttl() == "1h"                    # global setting
+    (tmp_path / "proj" / ".minicc").mkdir(parents=True)
+    (tmp_path / "proj" / ".minicc" / "settings.json").write_text('{"cache_ttl": "5m"}')
+    assert config.resolve_cache_ttl() == "5m"                    # project overrides
+    (tmp_path / "proj" / ".minicc" / "settings.json").write_text('{"cache_ttl": "2h"}')
+    assert config.resolve_cache_ttl() == "5m"                    # invalid → fallback

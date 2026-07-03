@@ -98,6 +98,24 @@ def log_compaction(session_id: str, working_set) -> None:
     )
 
 
+def log_rewind(session_id: str, working_set) -> None:
+    """Record a conversation rewind: the post-rewind working set. Same reset
+    semantics as `compact` on replay — the transcript stays append-only, so the
+    rewound-away messages remain on disk (lossless)."""
+    _append_event(
+        session_id, {"t": "rewind", "state": _serialize_messages(working_set)}
+    )
+
+
+def event_count(session_id: str) -> int:
+    """Number of events currently in the transcript (0 if none). Recorded by
+    checkpoints at turn start so a conversation rewind can replay back to it."""
+    path = _path(session_id)
+    if not path.exists():
+        return 0
+    return sum(1 for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
+
+
 def latest_id() -> str | None:
     """Most recently modified session id in this cwd, or None."""
     d = _dir()
@@ -107,23 +125,46 @@ def latest_id() -> str | None:
     return files[0].stem if files else None
 
 
+def _replay(lines, upto: int | None = None) -> list:
+    """Replay transcript events into a working set. `msg` appends; `compact` and
+    `rewind` RESET to their recorded state. `upto` limits to the first N events."""
+    working: list = []
+    seen = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if upto is not None and seen >= upto:
+            break
+        seen += 1
+        event = json.loads(line)
+        if event.get("t") == "msg":
+            working.append(event["m"])
+        elif event.get("t") in ("compact", "rewind"):
+            working = list(event["state"])
+    return working
+
+
 def load(session_id: str) -> list | None:
     """Replay the transcript into the working set (dict-form, API-ready). None if
-    the session doesn't exist. `msg` appends; `compact` resets to its state."""
+    the session doesn't exist."""
     path = _path(session_id)
     if not path.exists():
         return None
-    working: list = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            event = json.loads(line)
-            if event.get("t") == "msg":
-                working.append(event["m"])
-            elif event.get("t") == "compact":
-                working = list(event["state"])
+        return _replay(path.read_text(encoding="utf-8").splitlines())
     except (json.JSONDecodeError, OSError):
         return None
-    return working
+
+
+def load_upto(session_id: str, n_events: int) -> list | None:
+    """The working set as of the first `n_events` transcript events — the state a
+    conversation rewind restores to. Replaying (not slicing the live history)
+    means it works across compaction boundaries. None if the session doesn't exist."""
+    path = _path(session_id)
+    if not path.exists():
+        return None
+    try:
+        return _replay(path.read_text(encoding="utf-8").splitlines(), upto=n_events)
+    except (json.JSONDecodeError, OSError):
+        return None

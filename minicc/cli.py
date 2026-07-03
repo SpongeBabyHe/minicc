@@ -81,10 +81,10 @@ def _cmd_help():
                 ),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
-                ("/memory [file|on|off]", "Browse or toggle cross-session memory"),
+                ("/memory [file|on|off|consolidate]", "Browse, toggle, or tidy cross-session memory"),
                 (
-                    "/rewind [N]",
-                    "List restore points, or revert files to restore point N",
+                    "/rewind [N] [mode]",
+                    "List restore points; restore code (default) | conversation | both",
                 ),
                 ("q / exit / quit", "Leave minicc"),
             ]
@@ -158,12 +158,26 @@ def _cmd_recap(messages):
 
 
 def _cmd_memory(arg: str | None):
-    """Browse or toggle auto-memory. `/memory` lists the store; `/memory <file>`
-    views one file; `/memory on|off` toggles it for this session."""
+    """Browse, toggle, or consolidate auto-memory. `/memory` lists the store;
+    `/memory <file>` views one file; `/memory on|off` toggles it for this session;
+    `/memory consolidate` runs an Auto-Dream-style tidy pass (merge duplicates,
+    retire stale facts, fix dates, tighten the index)."""
     if arg in ("on", "off"):
         memory.set_enabled(arg == "on")
         llm.set_memory_index(memory.load_index())  # refresh what's injected
         ux.say(f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO)
+        return
+    if arg == "consolidate":
+        if not memory.enabled():
+            ux.say("auto-memory is off (/memory on first)", style=ux.S_ERROR)
+            return
+        ux.say(
+            "[consolidating memory — writes will ask for approval; answer 'all' to approve the batch]",
+            style=ux.S_INFO,
+        )
+        summary = memory.consolidate()
+        llm.set_memory_index(memory.load_index())  # reload the tidied index
+        ux.markdown(summary)
         return
     if arg:
         path = arg if arg.startswith("/memories") else f"/memories/{arg}"
@@ -232,48 +246,73 @@ def _cmd_model(arg: str | None):
 
 
 def _cmd_rewind(history, arg: str | None, session_id: str | None = None):
-    """List restore points, or `/rewind N` to revert files to restore point N.
-    N is the position in the /rewind list (contiguous 1..N over file-changing
-    turns only) — not an internal turn number, which has gaps from read-only turns.
-    Code-only: files revert, the conversation is kept (a notice tells the model)."""
-    points = checkpoints.restore_points()  # [(turn, query)], oldest→newest
+    """List restore points, or `/rewind N [code|conversation|both]` to restore.
+    N is the position in the /rewind list (every turn is a restore point, like
+    CC's one-checkpoint-per-prompt). Modes: `code` (default) reverts files and
+    keeps the conversation; `conversation` replays the transcript back to just
+    before turn N's prompt (files kept); `both` does both."""
+    points = checkpoints.restore_points()  # [(turn, query, changed_paths)]
     if arg is None:
         if not points:
-            ux.say("nothing to rewind — no file changes yet", style=ux.S_INFO)
+            ux.say("nothing to rewind yet", style=ux.S_INFO)
             return
+        rows = []
+        for i, (_, q, paths) in enumerate(points, 1):
+            mark = f"  [{len(paths)} file(s)]" if paths else ""
+            rows.append((f"[{i}]", ux.truncate(q, 60) + mark))
+        ux.say(ux.kv_block(rows))
         ux.say(
-            ux.kv_block(
-                [(f"[{i}]", ux.truncate(q, 60)) for i, (_, q) in enumerate(points, 1)]
-            )
-        )
-        ux.say(
-            "usage: /rewind <n> — revert files to restore point n (conversation kept); "
+            "usage: /rewind <n> [code|conversation|both] — code (default) reverts "
+            "files, conversation replays history back to before that prompt; "
             "bash-made changes aren't tracked.",
             style=ux.S_INFO,
         )
         return
+    parts = arg.split()
+    mode = parts[1] if len(parts) > 1 else "code"
     try:
-        n = int(arg)
+        n = int(parts[0])
     except ValueError:
-        ux.say("usage: /rewind <n>  (n from the /rewind list)", style=ux.S_ERROR)
+        ux.say("usage: /rewind <n> [code|conversation|both]", style=ux.S_ERROR)
+        return
+    if mode not in ("code", "conversation", "both"):
+        ux.say(f"unknown mode {mode!r} (code | conversation | both)", style=ux.S_ERROR)
         return
     if not (1 <= n <= len(points)):
         ux.say(f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
         return
-    restored, failed = checkpoints.restore_files(
-        points[n - 1][0]
-    )  # map index → internal turn
-    notice = {
-        "role": "user",
-        "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
-    }
-    history.append(notice)
-    if session_id:
-        sessions.append_message(session_id, notice)
-    msg = f"reverted {restored} file change(s) to restore point {n}; conversation kept"
-    if failed:
-        msg += f"  — {len(failed)} could not be restored: {', '.join(failed)}"
-    ux.say(msg, style=ux.S_INFO)
+    turn, query, _ = points[n - 1]
+    # read the conversation anchor BEFORE restore_files trims the stack
+    events = checkpoints.events_at(turn)
+
+    if mode in ("code", "both"):
+        restored, failed = checkpoints.restore_files(turn)
+        msg = f"reverted {restored} file change(s) to restore point {n}"
+        if failed:
+            msg += f"  — {len(failed)} could not be restored: {', '.join(failed)}"
+        ux.say(msg, style=ux.S_INFO)
+
+    if mode in ("conversation", "both"):
+        rewound = sessions.load_upto(session_id, events) if session_id else None
+        if rewound is None:
+            ux.say("no transcript to rewind from", style=ux.S_ERROR)
+            return
+        history[:] = rewound
+        sessions.log_rewind(session_id, history)  # append-only: a reset event
+        llm.reset_context_size()  # forget the pre-rewind size (avoid spurious compact)
+        ux.say(
+            f"conversation rewound to before turn {turn}; its prompt was: {ux.truncate(query, 80)}",
+            style=ux.S_INFO,
+        )
+    elif mode == "code":
+        # code-only: the conversation continues, so tell the model files changed
+        notice = {
+            "role": "user",
+            "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
+        }
+        history.append(notice)
+        if session_id:
+            sessions.append_message(session_id, notice)
 
 
 def _init_session():
@@ -381,6 +420,7 @@ def main():
             elif cmd == "/clear":
                 history.clear()
                 session_id = sessions.new_id()  # fresh transcript; old one kept on disk
+                llm.reset_context_size()  # stale size would trigger a spurious compact
                 permissions.reset()
                 permissions.preload(
                     config.allowed_tools()
@@ -416,10 +456,13 @@ def main():
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
         mark = len(history)  # roll-back point if this turn is interrupted/errors
+        # transcript position BEFORE this turn's user message — the replay target
+        # if a later `/rewind N conversation` returns to this turn
+        events = sessions.event_count(session_id)
         user_msg = {"role": "user", "content": query}
         history.append(user_msg)
         sessions.append_message(session_id, user_msg)  # append-only transcript
-        checkpoints.start(turn, query)  # snapshot files this turn touches, for /rewind
+        checkpoints.start(turn, query, events=events)  # files + conversation anchor
 
         try:
             agent_loop(history, session_id=session_id)  # streams; records incrementally

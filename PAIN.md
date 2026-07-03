@@ -28,9 +28,19 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 ## Context management
 - 2026-05-29: hit rate limit twice in < 1 hr on llm-kaki; "wait 1 min" didn't
   help (single request > 450K). → drove the whole v0.2 build.
+  - 2026-07-01 re-diagnosed: it was an **ITPM rate limit (429)**, not a
+    request-size wall — 450K fits Sonnet 4.6's 1M window (GA since 2026-03-13);
+    the SDK re-sent the same oversized body, so waiting couldn't help. The 350K
+    ceiling built on this was **dropped** for CC's `window − 13K` + reactive-429.
+    FIXED (details in `CONTEXT_MANAGEMENT.md`).
 - 2026-06-15: L4/L5 implemented & validated. Details (cut-point fix, survey-task
   churn, budget invariant, validation, v0.3 gaps) synthesized in
   `CONTEXT_MANAGEMENT.md` → "Dogfood lessons & validation".
+- 2026-07-02: Phase-1 CC alignment landed (two-band L3/L4 with official
+  context-editing defaults, `window − 13K` budget, 9-section summary, append-only
+  session transcript, session-context cache layer, auto-memory + /memory).
+  Processed into `CONTEXT_MANAGEMENT.md` / `SESSIONS.md` / `MEMORY.md`. **All
+  fresh — none of it dogfooded yet** (see retro questions below).
 
 ## Open questions for retro
 - [ ] Does the model follow codebase conventions reliably on real tasks, or is
@@ -39,3 +49,12 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
       the model recover sensibly?
 - [ ] Is the bash-fallback rate acceptable, or does it escalate to bash when
       grep/glob would do?
+- [ ] Memory: does the model write memory unprompted, and is what it saves
+      actually useful next session? (the what-to-persist policy wants data)
+- [ ] Memory: is the write-approval prompt too much friction mid-task?
+- [ ] L3 keep 4→3: does re-read churn go up noticeably?
+- [ ] Does the 9-section summary preserve enough to continue work cleanly after
+      an auto-compact? (never fired in real use yet)
+- [ ] Reactive-429 path: never exercised live — verify on the next rate-limit hit.
+- [ ] Resume across a compaction (transcript replay): try a real
+      `--continue` after an auto-compact.

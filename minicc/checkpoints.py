@@ -1,9 +1,12 @@
 """File checkpoint / rewind — back up files before the agent edits them, so
 `/rewind N` can restore them to an earlier turn. See CHECKPOINT.md.
 
-Design: per-file copy (D1), per-turn (D2), code-only (D3 — files revert, the
-conversation is kept), backups on disk (D4) so memory stays flat. Only
-write_file/edit_file are tracked; bash-made changes are not (PERMISSIONS.md).
+Design: per-file copy (D1), per-turn (D2), backups on disk (D4) so memory stays
+flat. Only write_file/edit_file are tracked; bash-made changes are not
+(PERMISSIONS.md). Every turn is a restore point (like CC: one checkpoint per
+prompt); each records the session transcript's event count at turn start, so
+`/rewind N conversation|both` can replay the transcript back to that state
+(works across compaction boundaries — see SESSIONS.md).
 """
 
 from pathlib import Path
@@ -11,7 +14,7 @@ from pathlib import Path
 ABSENT = None  # sentinel: file did not exist at checkpoint time → delete on rewind
 
 _DIR_NAME = ".minicc/checkpoints"
-_stack = []  # [{turn, query, dir: Path, files: {path: backup_id | ABSENT}}]
+_stack = []  # [{turn, query, events, dir: Path, files: {path: backup_id | ABSENT}}]
 
 
 def _root() -> Path:
@@ -37,10 +40,14 @@ def _rmtree(p: Path):
         p.unlink(missing_ok=True)
 
 
-def start(turn: int, query: str):
-    """Open a checkpoint for a new turn. The turn dir is created lazily on the
-    first backup, so read-only turns cost nothing."""
-    _stack.append({"turn": turn, "query": query, "dir": None, "files": {}})
+def start(turn: int, query: str, events: int = 0):
+    """Open a checkpoint for a new turn. `events` = the transcript event count at
+    turn start (BEFORE this turn's user message), the replay target for a
+    conversation rewind. The turn dir is created lazily on the first backup, so
+    read-only turns cost nothing."""
+    _stack.append(
+        {"turn": turn, "query": query, "events": events, "dir": None, "files": {}}
+    )
 
 
 def before_write(path):
@@ -67,18 +74,28 @@ def before_write(path):
 
 
 def restore_points():
-    """Turns that changed files, oldest→newest: [(turn, query), ...] for /rewind."""
-    return [(cp["turn"], cp["query"]) for cp in _stack if cp["files"]]
+    """Every turn, oldest→newest: [(turn, query, changed_paths), ...] for /rewind.
+    All turns are restore points (CC: one checkpoint per prompt); `changed_paths`
+    shows which files that turn touched (empty for read-only turns)."""
+    return [(cp["turn"], cp["query"], list(cp["files"])) for cp in _stack]
+
+
+def events_at(turn: int) -> int | None:
+    """The transcript event count recorded at `turn`'s start (the conversation-
+    rewind replay target), or None if the turn isn't on the stack."""
+    return next((cp["events"] for cp in _stack if cp["turn"] == turn), None)
 
 
 def restore_files(turn: int):
     """Revert files to their state before `turn`. Restores every checkpoint from
     the top down to and including `turn` (newest-first so the oldest backup wins),
     then discards them. Returns `(restored_count, failed_paths)`, or None if `turn`
-    isn't a restore point. A per-file error (e.g. its parent dir was removed by a
-    bash command, or a backup file is missing) is collected in `failed_paths`
-    rather than aborting the whole rewind and leaving a half-restored tree."""
-    idx = next((i for i, cp in enumerate(_stack) if cp["turn"] == turn and cp["files"]), None)
+    isn't a restore point. `turn` may be a read-only turn — then only LATER turns'
+    files revert (restored_count can be 0). A per-file error (e.g. its parent dir
+    was removed by a bash command, or a backup file is missing) is collected in
+    `failed_paths` rather than aborting the whole rewind and leaving a
+    half-restored tree."""
+    idx = next((i for i, cp in enumerate(_stack) if cp["turn"] == turn), None)
     if idx is None:
         return None
     restored, failed = 0, []

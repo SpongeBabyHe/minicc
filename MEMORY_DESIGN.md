@@ -30,14 +30,15 @@ it's never committed (it's under `$HOME`, not the project). Mirrors CC's
 ## The `memory` tool
 
 One tool over a `/memories` prefix this maps onto the real store, with
-path-traversal protection (reject anything resolving outside the root). Three
+path-traversal protection (reject anything resolving outside the root). Four
 commands (a subset of CC's GA `memory_20250818`, wire-compatible for a later upgrade):
 
 | command | what |
 |---|---|
 | `view` | a file (line-numbered) or the directory listing |
 | `create` | write (or overwrite) a file |
-| `str_replace` | replace one **unique** occurrence (omit `new_str` to delete) |
+| `str_replace` | replace one **unique** occurrence (omit `new_str` to delete text) |
+| `delete` | remove a stale/merged file (the `/memories` root is protected) |
 
 Topic files use CC's shape (the tool description steers this):
 
@@ -63,9 +64,9 @@ a tight index; add a one-line pointer there when you create a topic file.
 - **Lifecycle** — index loaded at startup; **reloaded on `/clear`** (memory *persists*
   across `/clear` — only the in-context snapshot reloads); survives compaction the
   same way (re-read from disk), matching CC's "project memory survives compaction."
-- **Gating** — writes (`create`/`str_replace`) go through the permission prompt like
-  `write_file`; **`view` is ungated** so the model can always read memory. Command-aware
-  gating lives in `permissions.py`.
+- **Gating** — writes (`create`/`str_replace`/`delete`) go through the permission
+  prompt like `write_file`; **`view` is ungated** so the model can always read memory.
+  Command-aware gating lives in `permissions.py`.
 - **Sub-agents** — memory is **not** in the read-only tool set, so a sub-agent's
   isolated context never reads or writes the main store.
 - **Steering** — a line in the system prompt tells the model to record durable
@@ -73,21 +74,32 @@ a tight index; add a one-line pointer there when you create a topic file.
 
 ## `/memory`
 
-Browse and toggle from a session: `/memory` lists the store (path + files), `/memory
-<file>` views one, `/memory on|off` toggles auto-memory for the session (off = the
-index isn't injected and writes are refused).
+Browse, toggle, and tidy from a session: `/memory` lists the store (path + files),
+`/memory <file>` views one, `/memory on|off` toggles auto-memory for the session
+(off = the index isn't injected and writes are refused), and `/memory consolidate`
+runs the consolidation pass below.
+
+## Consolidation (`/memory consolidate`)
+
+minicc's take on CC's background "Auto Dream" pass, run manually: **one `agent_loop`
+run with the memory tool only** (policy stays in the model — it judges what to merge;
+the harness only provides the loop). The prompt encodes the Auto-Dream operations:
+merge duplicates into the richer file, retire dated/contradicted facts, convert
+relative dates to absolute, prune dead index pointers/links, and rewrite `MEMORY.md`
+as a one-line-per-file index under 200 lines. Writes stay gated (answer `all` to
+approve the batch); the tidied index is re-injected afterwards. Manual-only for now —
+CC triggers it in the background (>24 h AND >5 sessions since last pass, community-
+observed); minicc can add an idle trigger once dogfood shows the cadence.
 
 ## Status & scope
 
-✅ Implemented (MVP): store + `memory` tool (view/create/str_replace) + path safety +
-index in the cache layer + gated writes + `/memory` browse/toggle. Unit tests in
-`tests/test_memory.py`.
+✅ Implemented (MVP): store + `memory` tool (view/create/str_replace/delete) + path
+safety + index in the cache layer + gated writes + `/memory` browse/toggle +
+`/memory consolidate`. Unit tests in `tests/test_memory.py`.
 
 Deferred:
-- **Consolidation** (CC's "Auto Dream") — periodic merge-duplicates / prune-stale /
-  keep-the-index-tight. MVP writes inline; add an idle or `/memory consolidate` pass.
-- The full 6-command GA tool (`insert`/`delete`/`rename`) — the 3-command subset covers
-  the MVP; upgrade if the model wants the rest.
+- Auto-triggering consolidation (idle/session-count heuristic) — manual command first.
+- The full 6-command GA tool (`insert`/`rename`) — the 4-command subset covers the MVP.
 - Persisting the on/off toggle across sessions (currently session-scoped).
 
 ## Alignment (vs Claude Code)

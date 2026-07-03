@@ -82,6 +82,15 @@ requests. A 50K-token history on Sonnet ($3/M in) is ~$0.15/turn uncached vs
 ~$0.015 cached — ~90% off the history, the write paid once. It compounds: every
 later turn (and all dogfood) gets cheaper.
 
+**TTL.** The default cache lives 5 minutes (each hit refreshes it free); a think
+break longer than that re-pays the write. Setting `cache_ttl: "1h"` in settings
+(GA, no beta header) puts the **stable prefix layers** on the 1-hour tier — written
+once at 2× instead of 1.25×, then refreshed free — while the **rolling conversation
+breakpoint stays at 5m**, because the API requires longer-TTL breakpoints to precede
+shorter ones and the stable layers render first. Default is 5m (cost-neutral);
+flip it for long interactive sessions with gaps. (CC requests 1h automatically on
+subscriptions.)
+
 **L1×L3 tension, managed by `clear_at_least`.** In-place eviction rewrites the
 cached prefix mid-history and breaks the cache from that point — so evicting on
 *every* turn would re-pay the write for a trickle of freed tokens. minicc handles
@@ -226,7 +235,7 @@ The backlog — each feature with what it buys and why it waits.
 
 | Feature | What it buys | Why deferred |
 | ------- | ------------ | ------------ |
-| **Memory consolidation** (CC's "Auto Dream") | merge duplicates / prune stale / dedupe MEMORY.md so it stays a tight index | MVP auto-memory ships write+recall first; add an idle/`/memory consolidate` pass later |
+| **Auto-triggered consolidation** (CC: background, >24h AND >5 sessions — community-observed) | memory tidies itself without a manual command | `/memory consolidate` (manual) shipped; wire an idle trigger once dogfood shows the cadence |
 | **Tuning** (`KEEP_RECENT_MESSAGES` — no CC target, API example is 3; `CLEAR_AT_LEAST` value) | closer to CC's defaults | low-risk polish; wants dogfood data; **future work** |
 | **Dynamic cache breakpoint** (conversation anchor) | a 2nd history breakpoint for the 20-block lookback on block-heavy turns | all 4 breakpoints are now used (system/project/session/conversation), so this would need displacing a layer; marginal anyway (minicc re-marks every call) — wait for a dogfood signal |
 | **User-input source cap** | bound the one unbounded input (a huge pasted message) so it can't reach L5 | L5 already backstops it; turns a hard failure into a graceful one |

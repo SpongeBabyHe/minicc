@@ -17,6 +17,19 @@ MODEL = config.resolve_model()
 # requests are handled by L3/L4, not retries.)
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
 SYSTEM = build_system_prompt()
+# TTL for the STABLE prefix layers (system+tools / project / session): "5m" or
+# "1h" (settings `cache_ttl`; GA, no beta header). 1h writes once at 2x, then
+# every hit refreshes free — insurance for >5-min gaps between turns. The rolling
+# conversation breakpoint stays at the default 5m: the API requires longer-TTL
+# breakpoints to precede shorter ones, and the stable layers render first.
+CACHE_TTL = config.resolve_cache_ttl()
+
+
+def _prefix_cache_control() -> dict:
+    """cache_control for the stable prefix blocks (a fresh dict each call)."""
+    if CACHE_TTL == "1h":
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
 
 
 def get_model() -> str:
@@ -162,17 +175,19 @@ def _build_system_block(system: str | None = None) -> list:
     """
     if system:
         return [
-            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            {"type": "text", "text": system, "cache_control": _prefix_cache_control()}
         ]
 
-    blocks = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    blocks = [
+        {"type": "text", "text": SYSTEM, "cache_control": _prefix_cache_control()}
+    ]
     project_layer = "\n\n".join(t for t in (_PROJECT_CONTEXT, _MEMORY_INDEX) if t)
     if project_layer:
         blocks.append(
             {
                 "type": "text",
                 "text": project_layer,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": _prefix_cache_control(),
             }
         )
     if _SESSION_CONTEXT:
@@ -180,7 +195,7 @@ def _build_system_block(system: str | None = None) -> list:
             {
                 "type": "text",
                 "text": _SESSION_CONTEXT,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": _prefix_cache_control(),
             }
         )
     return blocks
@@ -218,6 +233,15 @@ def _context_size(messages) -> int:
     """Best read of the next request's input size: the last response's REAL usage
     (one turn stale), or the char-estimate on the cold first turn before any."""
     return _LAST_INPUT_TOKENS or _estimate_tokens(messages)
+
+
+def reset_context_size():
+    """Forget the last request's real size; fall back to the char-estimate until
+    the next response. Called when the history shrinks OUTSIDE the normal flow
+    (/clear, conversation /rewind) — otherwise the stale large value would trigger
+    a spurious compaction attempt on the now-small history."""
+    global _LAST_INPUT_TOKENS
+    _LAST_INPUT_TOKENS = 0
 
 
 def _evict_old_tool_result(messages, min_free: int = 0) -> int:

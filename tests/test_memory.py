@@ -138,6 +138,45 @@ def test_memory_index_rides_project_layer():
         llm.set_memory_index("")
 
 
+def test_delete_file_and_guards(store):
+    memory.create("/memories/x.md", "fact")
+    assert memory.delete("/memories/x.md") == "Successfully deleted /memories/x.md"
+    assert not (store / "x.md").exists()
+    assert "does not exist" in memory.delete("/memories/x.md")     # already gone
+    assert "cannot delete" in memory.delete("/memories")           # root protected
+    assert "escapes" in memory.delete("/memories/../../etc")       # traversal blocked
+
+
+def test_memory_delete_is_gated(monkeypatch):
+    permissions.reset()
+    monkeypatch.setattr("builtins.input", lambda _: "no")
+    assert permissions.confirm("memory", {"command": "delete", "path": "/memories/x.md"}) is False
+
+
+def test_consolidate_runs_agent_loop_with_memory_tool_only(store, monkeypatch):
+    """consolidate() = one agent_loop pass, memory tool only, and returns the
+    final assistant text as the change summary."""
+    import minicc.agent as agent_mod
+
+    captured = {}
+
+    def fake_loop(msgs, system=None, stream=True, tools=None, max_turns=None, indent="", session_id=None):
+        captured["tools"] = [t["name"] for t in tools]
+        captured["system"] = system
+        captured["max_turns"] = max_turns
+        msgs.append({
+            "role": "assistant",
+            "content": [type("T", (), {"type": "text", "text": "merged 2, deleted 1"})()],
+        })
+
+    monkeypatch.setattr(agent_mod, "agent_loop", fake_loop)
+    out = memory.consolidate()
+    assert captured["tools"] == ["memory"]          # no bash/write/etc in reach
+    assert captured["max_turns"] == 15
+    assert "memory maintainer" in captured["system"]
+    assert out == "merged 2, deleted 1"
+
+
 def test_disabled_blocks_writes_and_index(store):
     """`/memory off` → index isn't injected and writes refuse; reads still work."""
     memory.create("/memories/MEMORY.md", "hi")     # enabled by default

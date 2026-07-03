@@ -23,7 +23,7 @@ GATED_TOOLS = ["bash", "write_file", "edit_file", "memory"]
 # Multi-command tools gate only *some* commands: a tool listed here gates only the
 # named commands, its others are free. (memory: writes gate; `view` stays free so the
 # model can always check memory.) Tools not listed gate every call.
-_GATED_COMMANDS = {"memory": {"create", "str_replace"}}
+_GATED_COMMANDS = {"memory": {"create", "str_replace", "delete"}}
 
 # Gated tools that may NOT be pre-approved from config (preload). bash's effect is
 # unbounded + irreversible and the gate is its ONLY boundary, so trusting it must

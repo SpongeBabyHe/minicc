@@ -10,6 +10,7 @@ this module maps onto the real store, with path-traversal protection.
 """
 
 import subprocess
+from datetime import date
 from pathlib import Path
 
 INDEX_NAME = "MEMORY.md"
@@ -154,3 +155,76 @@ def str_replace(path: str, old_str: str, new_str: str = "") -> str:
         )
     target.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
     return "The memory file has been edited."
+
+
+def delete(path: str) -> str:
+    """Delete a memory file (needed to merge duplicates / retire stale facts).
+    The memory root itself can't be deleted (official memory-tool contract)."""
+    if not _enabled:
+        return "Auto-memory is disabled (/memory on to enable)."
+    try:
+        target = _resolve(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    if target == store_dir().resolve() or path.rstrip("/") == _PREFIX:
+        return "Error: cannot delete the /memories root itself."
+    if not target.exists():
+        return f"Error: The path {path} does not exist"
+    if target.is_dir():
+        for child in sorted(target.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        target.rmdir()
+    else:
+        target.unlink()
+    return f"Successfully deleted {path}"
+
+
+# ─── consolidation (CC's "Auto Dream", run manually via /memory consolidate) ──
+_CONSOLIDATOR_SYSTEM = (
+    "You are a memory maintainer. Your ONLY job is to tidy an agent's memory store "
+    "under /memories using the memory tool. Do not invent facts; when unsure, keep. "
+    "Make targeted edits (str_replace) over wholesale rewrites."
+)
+
+_CONSOLIDATE_PROMPT = """Consolidate the memory store. Today is {today}.
+
+1. `view /memories`, then read MEMORY.md and every topic file.
+2. Apply, in this order:
+   - MERGE duplicates: if two files cover the same fact/preference, combine into
+     the richer file and delete the other.
+   - RETIRE dated facts: if a memory describes work that is clearly done or a
+     deadline that has passed, delete it — or fold its lasting takeaway into a
+     durable memory first.
+   - FIX time references: convert relative dates ("next week", "recently") to
+     absolute ones, using today's date.
+   - PRUNE dead pointers: index lines or [[links]] to files that no longer exist.
+   - REWRITE MEMORY.md as a concise index: exactly one line per surviving topic
+     file (`- [Title](file.md) — one-line hook`), under 200 lines.
+3. Finish with a short summary: files merged / deleted / edited and why.
+
+Writes ask the user for approval — that is expected; proceed."""
+
+
+def consolidate() -> str:
+    """One agent_loop pass over the store with the memory tool only (the model
+    does the judging — policy stays in the model, mechanism here). Returns the
+    model's summary of what changed."""
+    from minicc.agent import agent_loop          # lazy: avoid an import cycle
+    from minicc.tools import TOOLS
+
+    mem_tools = [t for t in TOOLS if t["name"] == "memory"]
+    msgs = [{"role": "user", "content": _CONSOLIDATE_PROMPT.format(today=date.today().isoformat())}]
+    agent_loop(
+        msgs,
+        system=_CONSOLIDATOR_SYSTEM,
+        stream=False,                # nested run; tool lines are shown indented
+        tools=mem_tools,
+        max_turns=15,                # a tidy pass, not an open-ended session
+        indent="  ",
+    )
+    for m in reversed(msgs):         # the final assistant text = the change summary
+        if m.get("role") == "assistant":
+            for b in m["content"]:
+                if getattr(b, "type", None) == "text":
+                    return b.text
+    return "(no summary produced)"

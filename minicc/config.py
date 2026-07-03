@@ -11,6 +11,11 @@ Keys:
   allowed_tools  — gated tools pre-approved without a prompt; union of global +
                    project. bash is NOT preloadable (unbounded + irreversible —
                    approve per session). Keep trust project-scoped. See PERMISSIONS.md.
+  cache_ttl      — "5m" (default) or "1h" for the STABLE prefix cache layers
+                   (system+tools / project / session). 1h writes cost 2x once but
+                   survive breaks between turns; hits refresh free. The rolling
+                   conversation breakpoint stays 5m (longer TTLs must precede
+                   shorter ones — API rule). See CONTEXT_MANAGEMENT.md.
 
 env is reserved for secrets + endpoint (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
 """
@@ -57,6 +62,15 @@ def set_default_model(model_id: str, scope: str = "global") -> Path:
     data["default_model"] = model_id
     path.write_text(json.dumps(data, indent=2))
     return path
+
+
+def resolve_cache_ttl() -> str:
+    """Cache TTL for the stable prefix layers: project > global > "5m".
+    Only "5m" and "1h" are valid (the API's two tiers); anything else falls back
+    to "5m" so a typo can't silently break caching."""
+    g, p = _read(_global()), _read(_project())
+    ttl = p.get("cache_ttl") or g.get("cache_ttl") or "5m"
+    return ttl if ttl in ("5m", "1h") else "5m"
 
 
 def _tool_list(d: dict) -> set:

@@ -11,13 +11,24 @@
   can't know what files a shell command touched (see [PERMISSIONS.md](PERMISSIONS.md):
   bash is unbounded). Same limitation as CC. Documented, not hidden.
 - **D2 granularity = per user turn.** A checkpoint per turn — "rewind to before
-  I asked X". Only turns that actually changed files are restore points.
-- **D3 scope = code-only.** `/rewind` reverts **files**, keeps the **conversation**.
-  Reasons: (a) **safer** — it never truncates `history`, so it can't orphan a
-  `tool_use` and 400 the next request; (b) the context-pruning that a
-  "rewind conversation too" mode would add is already covered by `/compact`,
-  `/clear`, and L3/L4; (c) it's CC's praised "keep what was tried, reset the
-  files" mode. A short notice is appended so the model knows the revert happened.
+  I asked X". **Every** turn is a restore point (CC: one checkpoint per prompt);
+  the `/rewind` list marks which files each turn changed. Each checkpoint also
+  records the session transcript's event count at turn start — the replay anchor
+  for a conversation rewind.
+- **D3 scope = three modes, code by default.** `/rewind N [code|conversation|both]`:
+  - **`code`** (default) reverts **files**, keeps the **conversation** — CC's
+    praised "keep what was tried, reset the files" mode. Never truncates `history`,
+    so it can't orphan a `tool_use`; a short notice tells the model.
+  - **`conversation`** replays the append-only transcript back to just before turn
+    N's prompt (files kept). Replaying — not slicing the live history — means it
+    works **across compaction boundaries**: the raw pre-compaction messages are
+    still on disk (SESSIONS.md). The rewind itself is an appended reset event, so
+    the transcript stays lossless; the rewound-away turns remain recoverable.
+    The stale context-size read is reset so the next turn doesn't spuriously compact.
+  - **`both`** does files + conversation.
+  (Conversation truncation can't 400: the replayed state is a turn-start boundary,
+  where every `tool_use` already has its `tool_result` — the same invariant the
+  interrupt-safe transcript recording maintains.)
 - **D4 storage = on disk** under `.minicc/checkpoints/` (self-ignored, like
   `bash_outputs`). Backup **content** lives on disk → no memory bloat; the small
   index (turn → {path: backup}) lives in memory for the session. (Loading the
@@ -48,17 +59,22 @@ rewind.
   only once the write is approved): if `path` isn't already backed up this turn,
   copy its current bytes to disk (or record `ABSENT`). No-op if no checkpoint is
   active (sub-agents).
-- **restore_files(n)** — cli `/rewind N`: for checkpoints from the top down to and
-  including turn n, restore each one's files **newest-first** (so turn n's
-  original — the oldest — wins for a file touched in several turns): write the
+- **restore_files(n)** — cli `/rewind N [code|both]`: for checkpoints from the top
+  down to and including turn n, restore each one's files **newest-first** (so turn
+  n's original — the oldest — wins for a file touched in several turns): write the
   bytes back, or delete if `ABSENT`. Then discard those checkpoints (rm their
-  dirs). The turn counter is **not** reset and `history` is **not** truncated
-  (code-only); instead a notice is appended:
+  dirs). `n` may be a read-only turn — then only later turns' files revert. In
+  `code` mode the turn counter is **not** reset and `history` is **not** truncated;
+  a notice is appended:
   `[Files were rewound to an earlier checkpoint; edits since then are undone.]`
   Returns `(restored_count, failed_paths)`: restore recreates a missing parent dir
   (it may have been `rm`'d by bash) and collects per-file errors into
   `failed_paths` instead of aborting half-way. The cli surfaces N is a contiguous
   restore-point index (the /rewind list), not the internal turn number.
+- **conversation mode** — cli reads the checkpoint's `events` anchor, rebuilds the
+  working set via `sessions.load_upto(session_id, events)`, replaces `history`
+  in place, logs a `rewind` reset event to the transcript, and resets the cached
+  context size (`llm.reset_context_size`).
 
 Newest-first is correct: a file edited in turns n and n+2 → applying n+2's backup
 then n's leaves n's (pre-turn-n) content.
@@ -67,12 +83,11 @@ then n's leaves n's (pre-turn-n) content.
 
 - **bash changes**: not tracked (D1). Surfaced in `/rewind` output.
 - **directory create/move/delete**: not undone (file content only — as in CC).
-- **deep rewind**: reverting to a much earlier turn leaves later (now-undone)
-  turns in the conversation — correct but noisy; the notice keeps the model right,
-  and `/compact` can tidy it.
+- **deep rewind (code mode)**: reverting to a much earlier turn leaves later
+  (now-undone) turns in the conversation — correct but noisy; the notice keeps the
+  model right, and `/rewind N both` (or `/compact`) tidies it.
 
 ## Deferred
 
 - Load the checkpoint index after a restart (data is already on disk).
-- A "rewind conversation too" mode (covered for now by `/compact` + `/clear`).
 - Per-tool-call granularity; a git-tree mode that would also cover bash.
