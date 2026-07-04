@@ -1,6 +1,6 @@
-from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory
+from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, web_fetch
 
-_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory]
+_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, web_fetch]
 
 # Tools carry NO cache breakpoint of their own. The request renders in the order
 # tools -> system -> messages, so the system-prompt breakpoint's prefix already

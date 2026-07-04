@@ -18,7 +18,10 @@ from minicc import ux
 
 # Gated tools: these require user approval before use. Single source of truth for
 # "which tools gate" — both confirm() and preload() key off it.
-GATED_TOOLS = ["bash", "write_file", "edit_file", "memory"]
+# web_fetch gates for the same reason bash does: a network request's effect is
+# unknown in advance, and under prompt injection a crafted URL is a data-
+# exfiltration channel (secrets in query params). The user sees each URL.
+GATED_TOOLS = ["bash", "write_file", "edit_file", "memory", "web_fetch"]
 
 # Multi-command tools gate only *some* commands: a tool listed here gates only the
 # named commands, its others are free. (memory: writes gate; `view` stays free so the
@@ -76,6 +79,13 @@ def _format_args(tool_name: str, tool_input: dict) -> str:
                 ("memory", tool_input.get("command", "")),
                 ("path", tool_input.get("path", "")),
                 ("preview", ux.truncate(body, 500)),
+            ]
+        )
+    if tool_name == "web_fetch":
+        return ux.kv_block(
+            [
+                ("url", tool_input.get("url", "")),
+                ("extract", ux.truncate(tool_input.get("prompt", ""), 200)),
             ]
         )
     return ux.kv_block(list(tool_input.items()))

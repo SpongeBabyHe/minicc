@@ -42,6 +42,19 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   Processed into `CONTEXT_MANAGEMENT.md` / `SESSIONS.md` / `MEMORY.md`. **All
   fresh — none of it dogfooded yet** (see retro questions below).
 
+## Tools
+- 2026-07-04: dogfood D1 first finding — 2 of 3 real llm-kaki tasks (survey data
+  sources, read a blog URL) blocked on missing web access. → web_fetch pulled
+  forward from Jul 10, shipped same day (gated; stdlib fetch + HTML→text, 50K cap).
+- 2026-07-04: web_fetch upgraded to CC's documented design same day (user asked
+  "对标CC?" — the simple version wasn't): url+prompt → small-model extraction
+  ("lossy by design"; 13.3K-char page → 2K answer in live test), 15-min cache,
+  cross-host-redirect notice, http→https. Divergence left: per-DOMAIN permission
+  granularity (CC prompts per new domain; minicc gates per call).
+- 2026-07-04: web_search decision SETTLED by official tools-reference: CC's
+  WebSearch runs on Anthropic's server-side web search backend ("not
+  configurable") → server-side web_search tool IS the CC-faithful choice for minicc.
+
 ## Open questions for retro
 - [ ] Does the model follow codebase conventions reliably on real tasks, or is
       the F1 variance pattern common?
@@ -54,7 +67,12 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 - [ ] Memory: is the write-approval prompt too much friction mid-task?
 - [ ] L3 keep 4→3: does re-read churn go up noticeably?
 - [ ] Does the 9-section summary preserve enough to continue work cleanly after
-      an auto-compact? (never fired in real use yet)
-- [ ] Reactive-429 path: never exercised live — verify on the next rate-limit hit.
-- [ ] Resume across a compaction (transcript replay): try a real
-      `--continue` after an auto-compact.
+      an auto-compact? (don't force it — if it never fires in real use, that's
+      data too)
+
+## QA items (directed tests, NOT dogfood — don't let these shape real-work tasks)
+- [ ] Reactive-429: can't be honestly provoked — if a real rate-limit hits, jot
+      the `/context` numbers.
+- [ ] Resume across a compaction (transcript replay): scripted end-to-end check
+      (drive a session past a compact, quit, `--continue`, continue working).
+      ~10 minutes, run separately from dogfood.
