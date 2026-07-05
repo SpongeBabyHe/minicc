@@ -41,6 +41,13 @@ def agent_loop(
         )
         assistant_msg = {"role": "assistant", "content": response.content}
         messages.append(assistant_msg)
+        if response.stop_reason == "pause_turn":
+            # A long-running SERVER tool turn (web_search) was paused mid-flight.
+            # Contract: send the paused assistant message back unchanged and the
+            # API resumes it — so record it and loop again without tool results.
+            if session_id:
+                sessions.append_message(session_id, assistant_msg)
+            continue
         if response.stop_reason != "tool_use":
             if session_id:                        # terminal assistant → record alone
                 sessions.append_message(session_id, assistant_msg)

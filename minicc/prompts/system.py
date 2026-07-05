@@ -12,6 +12,9 @@ Working style:
 - For a partial change use edit_file — never rewrite a whole file with write_file.
 - Read a tool's error before retrying; don't repeat a call hoping it works.
 - Plan long, multi-step tasks with todo_write; delegate read-many-files exploration to task.
+- web_search finds current/external information (titles + URLs + snippets); to read
+  a specific page in depth, follow up with web_fetch on its URL. Don't search for
+  stable knowledge you already have.
 
 Memory: the auto-memory index (MEMORY.md) is injected each session; read topic files
 on demand with the memory tool. Record durable, reusable learnings as you work

@@ -80,7 +80,7 @@ EVICTED_MARKER = (
 )
 
 
-_USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+_USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "web_searches": 0}
 _PROJECT_CONTEXT = ""
 _SESSION_CONTEXT = ""
 _MEMORY_INDEX = ""
@@ -542,6 +542,10 @@ def llm_response(
     _USAGE["output"] += response.usage.output_tokens
     _USAGE["cache_read"] += cache_r
     _USAGE["cache_creation"] += cache_c
+    # Server-tool usage (web_search): billed per search ($10/1k), shown in /cost.
+    stu = getattr(response.usage, "server_tool_use", None)
+    if stu:
+        _USAGE["web_searches"] += getattr(stu, "web_search_requests", 0) or 0
     # Real total input of THIS request → the next turn's compaction trigger.
     _LAST_INPUT_TOKENS = response.usage.input_tokens + cache_r + cache_c
     return response

@@ -100,6 +100,7 @@ def _cmd_cost():
         + u["cache_read"] * _PRICE_CACHE_READ_PER_M
         + u["cache_creation"] * _PRICE_CACHE_WRITE_PER_M
     ) / 1_000_000
+    cost += u.get("web_searches", 0) * 0.01   # server web_search: $10 per 1,000
     total_in = u["input"] + u["cache_read"] + u["cache_creation"]
     hit = (u["cache_read"] / total_in * 100) if total_in else 0
     ux.say(
@@ -109,6 +110,7 @@ def _cmd_cost():
                 ("cache read", f"{u['cache_read']:,}  ({hit:.0f}% hit rate)"),
                 ("cache write", f"{u['cache_creation']:,}"),
                 ("output", f"{u['output']:,}"),
+                ("web searches", f"{u.get('web_searches', 0):,}"),
                 ("est. cost", f"${cost:.4f}"),
             ]
         )

@@ -11,6 +11,9 @@ Keys:
   allowed_tools  — gated tools pre-approved without a prompt; union of global +
                    project. bash is NOT preloadable (unbounded + irreversible —
                    approve per session). Keep trust project-scoped. See PERMISSIONS.md.
+  web_search     — false to drop the server-side web_search tool from the tool
+                   set (default true). Needed when the org disabled web search
+                   in the Console (requests including it would 400).
   cache_ttl      — "5m" (default) or "1h" for the STABLE prefix cache layers
                    (system+tools / project / session). 1h writes cost 2x once but
                    survive breaks between turns; hits refresh free. The rolling
@@ -62,6 +65,16 @@ def set_default_model(model_id: str, scope: str = "global") -> Path:
     data["default_model"] = model_id
     path.write_text(json.dumps(data, indent=2))
     return path
+
+
+def web_search_enabled() -> bool:
+    """Whether to offer the server-side web_search tool (default True). Set
+    `"web_search": false` (project or global) to drop it — required if the org
+    disabled web search in the Console, since any request including the tool
+    would 400 there."""
+    g, p = _read(_global()), _read(_project())
+    v = p.get("web_search", g.get("web_search", True))
+    return v is not False
 
 
 def resolve_cache_ttl() -> str:
