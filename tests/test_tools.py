@@ -130,6 +130,35 @@ def test_bash_runs_simple_command():
     assert bash_mod.bash("echo pseudocode").strip() == "pseudocode"
 
 
+def test_bash_timeout_param_kills_and_teaches_retry():
+    """A short model-requested timeout kills the command; the error names the
+    actual timeout used and teaches the larger-`timeout` retry (CC's Bash shape)."""
+    out = bash_mod.bash("sleep 2", timeout=200)     # 200 ms
+    assert out.startswith("Error: command timed out after 0s")
+    assert "larger `timeout`" in out
+
+
+def test_bash_timeout_clamped_and_defaulted(monkeypatch):
+    """Requested timeouts clamp to MAX_TIMEOUT_MS; junk/omitted fall back to the
+    default. Captured via subprocess.run's timeout kwarg."""
+    seen = {}
+
+    class _R:
+        stdout, stderr = "ok", ""
+
+    def fake_run(cmd, shell, text, capture_output, timeout):
+        seen["timeout_s"] = timeout
+        return _R()
+
+    monkeypatch.setattr(bash_mod.subprocess, "run", fake_run)
+    bash_mod.bash("echo hi", timeout=9_999_999)
+    assert seen["timeout_s"] == bash_mod.MAX_TIMEOUT_MS / 1000      # clamped to 600s
+    bash_mod.bash("echo hi", timeout=-5)
+    assert seen["timeout_s"] == bash_mod.DEFAULT_TIMEOUT_MS / 1000  # junk → default
+    bash_mod.bash("echo hi")
+    assert seen["timeout_s"] == bash_mod.DEFAULT_TIMEOUT_MS / 1000  # omitted → default
+
+
 # ─── registration sanity ────────────────────────────────────────────────────
 
 def test_all_changed_tools_registered():

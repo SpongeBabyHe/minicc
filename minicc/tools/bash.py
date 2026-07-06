@@ -5,7 +5,10 @@ import uuid
 
 DEFAULT_MAX_OUTPUT = 30_000      # CC's default
 PREVIEW_CHARS = 2_000             # how much to show inline when truncated
-TIMEOUT_SECONDS = 120
+# CC's documented Bash limits (tools-reference): default 2 minutes, and the model
+# "can request up to 10 minutes per command with the `timeout` parameter" (ms).
+DEFAULT_TIMEOUT_MS = 120_000
+MAX_TIMEOUT_MS = 600_000
 
 SCHEMA = {
     "name": "bash",
@@ -13,15 +16,25 @@ SCHEMA = {
         "Run a shell command. Use this ONLY when no other tool fits — e.g. running "
         "scripts, git, package managers, or tests. For finding files prefer `glob`; for "
         "searching contents prefer `grep`; for reading prefer `read_file`; for editing "
-        "prefer `edit_file`/`write_file`. Commands are killed after 120s, so don't start "
-        "long-running servers or watchers in the foreground. Output is capped at 30,000 "
-        "chars; longer output is saved to a file and you get the path plus a 2,000-char "
-        "preview — read_file (with offset/limit) that path for the rest."
+        "prefer `edit_file`/`write_file`. Commands are killed after 120s by default; for "
+        "a known-slow command (build, install, model download, full test suite) request "
+        "more with `timeout` (milliseconds, up to 600000 = 10 min). Don't start "
+        "long-running servers or watchers in the foreground — run them detached. Output "
+        "is capped at 30,000 chars; longer output is saved to a file and you get the "
+        "path plus a 2,000-char preview — read_file (with offset/limit) that path for "
+        "the rest."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "The shell command to run."}
+            "command": {"type": "string", "description": "The shell command to run."},
+            "timeout": {
+                "type": "integer",
+                "description": (
+                    "Optional timeout in milliseconds (default 120000, max 600000). "
+                    "Use for known-slow commands like builds or downloads."
+                ),
+            },
         },
         "required": ["command"],
     },
@@ -54,23 +67,25 @@ def _ensure_output_dir() -> Path:
     return out_dir
 
 
-def bash(command: str) -> str:
+def bash(command: str, timeout: int | None = None) -> str:
     if any(p.search(command) for p in _DANGEROUS):
         return "Error: command blocked by safety filter (matched a destructive pattern)"
+    # Clamp the model-requested timeout to CC's bounds; ignore nonsense values.
+    ms = DEFAULT_TIMEOUT_MS if not timeout or timeout <= 0 else min(timeout, MAX_TIMEOUT_MS)
     try:
         r = subprocess.run(
             command,
             shell=True,
             text=True,
             capture_output=True,
-            timeout=TIMEOUT_SECONDS,
+            timeout=ms / 1000,
         )
         out = str(r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return (
-            f"Error: command timed out after {TIMEOUT_SECONDS}s and was killed. For a "
-            f"long-running process (server, watcher), run it in the background or bound "
-            f"its runtime."
+            f"Error: command timed out after {ms // 1000}s and was killed. For a "
+            f"known-slow command, retry with a larger `timeout` (up to {MAX_TIMEOUT_MS} ms). "
+            f"For a long-running process (server, watcher), run it detached instead."
         )
     except Exception as e:
         return f"Error: {e}"
