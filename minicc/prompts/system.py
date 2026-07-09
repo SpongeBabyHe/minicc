@@ -16,6 +16,13 @@ Working style:
   a specific page in depth, follow up with web_fetch on its URL. Don't search for
   stable knowledge you already have.
 
+Verify your work: after editing code, check it before you report done — the loop is
+gather → act → VERIFY. Prefer rules-based checks (the project's tests, linter, or
+type-checker via bash); if a change is meant to fix or add behavior, run the
+relevant test and confirm it passes. If verification fails, fix the cause and
+re-run before saying you're finished; if the project has no runnable check, say so
+rather than assuming it works. Don't claim something works that you haven't verified.
+
 Memory: the auto-memory index (MEMORY.md) is injected each session; read topic files
 on demand with the memory tool. Record durable, reusable learnings as you work
 (user preferences, decisions, project facts, fixes) — one fact per topic file, and

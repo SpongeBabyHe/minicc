@@ -54,8 +54,21 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 - 2026-07-04: web_search decision SETTLED by official tools-reference: CC's
   WebSearch runs on Anthropic's server-side web search backend ("not
   configurable") → server-side web_search tool IS the CC-faithful choice for minicc.
+- 2026-07-04: web_search shipped (server-side web_search_20250305, max_uses 8;
+  pause_turn handled in agent_loop; $10/1k tracked in /cost; settings opt-out).
+  Live-verified incl. the encrypted_content round-trip. Task 1 (survey data
+  sources) now fully unblocked → dogfood proper starts.
+
+- 2026-07-05: shipped **verify-work stance** (system-prompt "Verify your work"
+  section: run tests/lint after editing, fix before reporting done). Source: it's
+  CLAUDE_CODE_DESIGN.md's flagged "biggest single opportunity" + RALPH precondition,
+  not a schedule item — surfaced ahead of plan mode because llm-wiki dogfood will
+  vote on it immediately. Soft prior only; eval probes G1/G2 added. Watch in dogfood:
+  does the model actually run pytest after editing wiki modules, or still claim done?
 
 ## Open questions for retro
+- [ ] verify-work: does the model run tests/lint unprompted after edits now, or
+      does the stance get ignored under task pressure? (the whole point of shipping it)
 - [ ] Does the model follow codebase conventions reliably on real tasks, or is
       the F1 variance pattern common?
 - [ ] When edit_file genuinely fails (actual not-found, not multi-match), does

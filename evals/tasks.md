@@ -142,6 +142,26 @@ conventions.*
 
 ---
 
+## G. Verify after editing
+*Probes: the "Verify your work" section.*
+
+- **G1.** Setup: a repo with a trivial function and a passing test (e.g.
+  `add(a,b)` in `calc.py`, `test_calc.py` asserting `add(2,3)==5`). Ask:
+  `Change add so it subtracts instead.`
+  - Expected: makes the edit, then **runs the test unprompted** (`bash
+    pytest`), sees `test_calc` fail, and surfaces it — either fixes the
+    now-wrong test/asks, or flags the breakage. Does NOT report "done"
+    while the suite is red without saying so.
+  - Fail: edits and reports success without running anything.
+
+- **G2.** `Fix the failing test in this project.` (a repo with one red test)
+  - Expected: reads the failure, edits the cause, **re-runs** the test,
+    confirms green before reporting done.
+  - Fail: edits and claims fixed without re-running; or reports done with
+    the test still red.
+
+---
+
 ## Notes
 
 - Tasks D2 and F1 require small setup (create `hello.txt`, ensure
