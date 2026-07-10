@@ -290,3 +290,92 @@ def test_session_end_is_informational_only(monkeypatch):
     # exit 2 would block a blockable event; SessionEnd must ignore it (CC contract)
     _use({"SessionEnd": [_group("echo nope >&2; exit 2")]}, monkeypatch=monkeypatch)
     cli._fire_session_end("s1", "prompt_input_exit")  # must not raise / block anything
+
+
+# ─── wiring: Stop gate in the agent loop ─────────────────────────────────────
+
+class _Text:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _Resp:
+    def __init__(self, text, stop_reason="end_turn"):
+        self.content = [_Text(text)]
+        self.stop_reason = stop_reason
+
+
+def _drive(monkeypatch, replies, session_id="s1"):
+    """Run agent_loop against canned end_turn replies; returns (messages, calls)."""
+    from minicc import agent
+
+    queue = list(replies)
+    calls = []
+
+    def fake_llm(messages, *a, **k):
+        calls.append(len(messages))
+        return _Resp(queue.pop(0) if queue else "done")
+
+    monkeypatch.setattr(agent, "llm_response", fake_llm)
+    monkeypatch.setattr(agent.sessions, "append_message", lambda *a, **k: None)
+    messages = [{"role": "user", "content": "hi"}]
+    agent.agent_loop(messages, session_id=session_id)
+    return messages, calls
+
+
+def test_stop_block_feeds_reason_and_continues(tmp_path, monkeypatch):
+    # Stateful hook: blocks the FIRST stop (creates a marker), allows the second —
+    # also proves last_assistant_message reaches stdin (written to a file).
+    mark, seen = tmp_path / "mark", tmp_path / "seen.txt"
+    cmd = (
+        f"{sys.executable} -c \""
+        "import sys, json, pathlib\n"
+        "d = json.load(sys.stdin)\n"
+        f"pathlib.Path(r'{seen}').write_text(d['last_assistant_message'])\n"
+        f"m = pathlib.Path(r'{mark}')\n"
+        "if m.exists():\n"
+        "    sys.exit(0)\n"
+        "m.touch()\n"
+        "print('run the tests first', file=sys.stderr)\n"
+        "sys.exit(2)\""
+    )
+    _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
+    messages, calls = _drive(monkeypatch, ["first answer", "second answer"])
+    assert len(calls) == 2                       # blocked once → one extra model call
+    assert messages[2]["role"] == "user"
+    assert "run the tests first" in messages[2]["content"]   # reason fed back
+    assert seen.read_text() == "second answer"   # CC payload field, latest turn
+    assert messages[-1]["content"][0].text == "second answer"
+
+
+def test_stop_block_capped_after_8(monkeypatch):
+    _use({"Stop": [_group("echo never >&2; exit 2")]}, monkeypatch=monkeypatch)
+    messages, calls = _drive(monkeypatch, [])
+    assert len(calls) == 9  # 8 blocks honored, 9th attempt overridden (CC cap)
+
+
+def test_stop_skipped_for_subagents(monkeypatch):
+    _use({"Stop": [_group("exit 2")]}, monkeypatch=monkeypatch)
+    _messages, calls = _drive(monkeypatch, [], session_id=None)
+    assert len(calls) == 1  # no Stop surface in sub-agent loops → ends immediately
+
+
+def test_stop_additional_context_without_block_ends_turn(monkeypatch):
+    cmd = (
+        'echo \'{"hookSpecificOutput":'
+        '{"hookEventName":"Stop","additionalContext":"deploy succeeded"}}\''
+    )
+    _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
+    messages, calls = _drive(monkeypatch, ["answer"])
+    assert len(calls) == 1                        # turn ended (no block)
+    assert messages[-1]["role"] == "user"         # context trails for next turn
+    assert messages[-1]["content"] == "deploy succeeded"
+
+
+def test_stop_continue_false_overrides_block(monkeypatch):
+    cmd = 'echo \'{"decision":"block","reason":"more!","continue":false,"stopReason":"halted"}\''
+    _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
+    _messages, calls = _drive(monkeypatch, ["answer"])
+    assert len(calls) == 1  # continue:false wins over decision:block (CC precedence)

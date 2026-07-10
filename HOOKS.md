@@ -33,9 +33,9 @@ only the events with a real minicc surface are wired:
 | **PostCompact** | `llm._compact`, after history is replaced | `manual` \| `auto` | notification only (side effects, `systemMessage`); stdin has `compact_reason` |
 | **SessionStart** | `cli`, at startup and `/clear` | `startup` \| `resume` \| `clear` | inject `additionalContext` (appended to the session-context layer); stdin has `source`, `model` |
 | **SessionEnd** | `cli`, at exit and `/clear` | `clear` \| `prompt_input_exit` | informational only — exit codes and decisions ignored per CC; stdin has `reason` |
+| **Stop** | `agent_loop`, when a turn is about to end | — | block the stop (exit 2 / `decision:"block"`) — reason is fed back as a user message and the model keeps working; `continue:false` overrides a block; `additionalContext` without a block enters the conversation but the turn ends; stdin has `last_assistant_message`. Runaway guard: overridden after **8 consecutive blocks** (CC best-practices) |
 
-Deferred (real surface, later cut): **Stop** (turn-end gate — changes loop control
-flow; it's RALPH's "done" contract).
+All events with a real minicc surface are now wired.
 Not applicable (no surface): PermissionRequest, PostToolBatch, Notification, Task\*,
 Worktree\*, Elicitation\*, ConfigChange, FileChanged, SubagentStart/Stop, etc.
 
@@ -156,3 +156,10 @@ exit 0
   unbounded context growth is the exact failure minicc's context layers exist to
   prevent, and the user has seen a "[compaction blocked by PreCompact hook]" line per
   attempt by then.
+- **Stop** fires for the main session only; sub-agent turn-end is CC's separate
+  SubagentStop event (not wired — minicc's `task` sub-agents return a summary to the
+  parent, who verifies). The 8-block cap comes from CC's best-practices page ("Claude
+  Code overrides the hook and ends the turn after 8 consecutive blocks"); the hooks
+  reference itself documents no cap. No `stop_hook_active` stdin field: the current
+  reference doesn't document one (recorded so it isn't "restored" from older docs) —
+  loop protection is the harness-side cap instead.

@@ -75,6 +75,14 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   lifecycle BEFORE Stop — right by risk (none of these touch loop control flow;
   Stop becomes the single control-flow commit), vs my leverage-first ordering.
   +6 wiring tests (161 total green).
+- 2026-07-10: shipped **Stop hook** — the deterministic turn-end gate (verify-work's
+  enforced tier; RALPH's "done" primitive). block → reason fed back as a user
+  message, loop continues; continue:false overrides a block; additionalContext
+  sans block trails into the conversation; cap = 8 consecutive blocks (from
+  best-practices — the hooks reference documents NO cap and NO stop_hook_active
+  field; deliberately did not restore the latter from stale training-data memory).
+  Main session only (SubagentStop unwired). +5 loop tests (166 green). Hooks
+  feature COMPLETE → next: dogfood (llm-wiki worktree twin).
 
 - 2026-07-05: shipped **verify-work stance** (system-prompt "Verify your work"
   section: run tests/lint after editing, fix before reporting done). Source: it's
