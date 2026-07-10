@@ -91,11 +91,15 @@ def _format_args(tool_name: str, tool_input: dict) -> str:
     return ux.kv_block(list(tool_input.items()))
 
 
-def confirm(tool_name: str, tool_input: dict) -> bool:
-    if not _is_gated(tool_name, tool_input):
-        return True
-    if tool_name in _ALLOWED:
-        return True
+def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
+    """Whether this tool call may run. `force` (a PreToolUse hook's "ask") prompts
+    even for a normally-free tool and ignores the session allowlist — the hook is
+    explicitly asking the user to confirm this specific call."""
+    if not force:
+        if not _is_gated(tool_name, tool_input):
+            return True
+        if tool_name in _ALLOWED:
+            return True
     ux.say(_format_args(tool_name, tool_input))
     answer = input("Approve? [yes/no/all]: ").strip().lower()
     if answer == "all":

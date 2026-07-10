@@ -19,6 +19,7 @@ from minicc import sessions
 from minicc import config
 from minicc import checkpoints
 from minicc import memory
+from minicc import hooks
 from minicc.prompts.system import load_project_context, build_session_context
 
 
@@ -37,6 +38,42 @@ _INIT_PROMPT = (
     "If CLAUDE.md already exists, read it and improve it in place rather than "
     "duplicating. Keep it tight and high-signal — no filler. Write it with write_file."
 )
+
+
+def _fire_session_start(session_id: str, source: str) -> str:
+    """Run SessionStart hooks (source: "startup" | "resume" | "clear" — CC's fourth,
+    "compact", has no minicc surface since compaction is in-place, not a session
+    restart). Returns hook-injected context to append to the session-context layer
+    ("" if none) — CC injects additionalContext into context at session start the
+    same way. Cannot block."""
+    d = hooks.run(
+        "SessionStart",
+        session_id=session_id,
+        match_value=source,
+        source=source,
+        model=llm.get_model(),
+    )
+    for m in d.system_messages:
+        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    return "\n".join(d.additional_context)
+
+
+def _session_context_with_hooks(session_id: str, source: str) -> str:
+    """The session-context layer (env + git) plus any SessionStart hook context."""
+    ctx = build_session_context()
+    extra = _fire_session_start(session_id, source)
+    if extra:
+        ctx += f"\n\n# Context from SessionStart hook\n\n{extra}"
+    return ctx
+
+
+def _fire_session_end(session_id: str, reason: str) -> None:
+    """Run SessionEnd hooks (reason: "clear" | "prompt_input_exit" — CC's other
+    reasons target absent infra). Informational only: exit codes and decision
+    fields are ignored per CC's contract; only systemMessage surfaces."""
+    d = hooks.run("SessionEnd", session_id=session_id, match_value=reason, reason=reason)
+    for m in d.system_messages:
+        ux.say(f"[hook] {m}", style=ux.S_INFO)
 
 
 def _git_sha() -> str:
@@ -372,11 +409,16 @@ def main():
     history, session_id = _init_session()
     histfile = _setup_history()
     checkpoints.reset()  # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
+    hooks.reset()  # load hook config from settings.json for this session
     requested = config.allowed_tools()
     pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
     llm.set_project_context(load_project_context())
-    llm.set_session_context(build_session_context())  # env + git snapshot (layer 3)
+    # env + git snapshot (layer 3) + SessionStart hook context (fires here; CC
+    # sources: "resume" when picking up an existing transcript, else "startup")
+    llm.set_session_context(
+        _session_context_with_hooks(session_id, "resume" if history else "startup")
+    )
     llm.set_memory_index(memory.load_index())          # auto-memory index (rides layer 2)
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
@@ -420,6 +462,7 @@ def main():
             if cmd == "/help":
                 _cmd_help()
             elif cmd == "/clear":
+                _fire_session_end(session_id, "clear")  # old session ends (CC reason "clear")
                 history.clear()
                 session_id = sessions.new_id()  # fresh transcript; old one kept on disk
                 llm.reset_context_size()  # stale size would trigger a spurious compact
@@ -428,9 +471,11 @@ def main():
                     config.allowed_tools()
                 )  # keep settings-trusted tools
                 checkpoints.reset()
+                hooks.reset()  # re-read hook config (settings may have changed)
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
-                llm.set_session_context(build_session_context())  # refresh env/git
+                # refresh env/git + SessionStart(source="clear") hook context
+                llm.set_session_context(_session_context_with_hooks(session_id, "clear"))
                 llm.set_memory_index(memory.load_index())         # reload memory index
                 ux.say(
                     "conversation, permissions reset; CLAUDE.md reloaded",
@@ -454,6 +499,17 @@ def main():
                 ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             continue
 
+        # UserPromptSubmit hook: fires before Claude processes the prompt. It can
+        # reject the prompt (block / continue:false) or inject context for this turn.
+        # Runs only for real prompts, not slash commands (those are handled above).
+        prompt_hook = hooks.run("UserPromptSubmit", session_id=session_id, user_prompt=query)
+        for m in prompt_hook.system_messages:
+            ux.say(f"[hook] {m}", style=ux.S_INFO)
+        if prompt_hook.block or prompt_hook.stop:
+            reason = prompt_hook.reason or prompt_hook.stop_reason or "no reason given"
+            ux.say(f"prompt blocked by hook: {reason}", style=ux.S_ERROR)
+            continue
+
         turn += 1
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
@@ -464,6 +520,12 @@ def main():
         user_msg = {"role": "user", "content": query}
         history.append(user_msg)
         sessions.append_message(session_id, user_msg)  # append-only transcript
+        # Hook-injected context rides as an extra user message for this turn (CC adds
+        # additionalContext to the model's context alongside the prompt).
+        for ctx in prompt_hook.additional_context:
+            ctx_msg = {"role": "user", "content": ctx}
+            history.append(ctx_msg)
+            sessions.append_message(session_id, ctx_msg)
         checkpoints.start(turn, query, events=events)  # files + conversation anchor
 
         try:
@@ -484,7 +546,10 @@ def main():
         # The transcript is written incrementally (sessions.append_message +
         # llm.log_compaction) as the turn happens — no turn-end save() needed.
 
-    # loop exited (q/exit/EOF/Ctrl-C): persist input history for next run
+    # loop exited (q/exit/EOF/Ctrl-C): SessionEnd hook, then persist input history.
+    # All minicc exits leave from the prompt, so the reason is always
+    # "prompt_input_exit" (CC's logout/resume/other reasons have no surface here).
+    _fire_session_end(session_id, "prompt_input_exit")
     try:
         readline.write_history_file(histfile)
     except OSError:

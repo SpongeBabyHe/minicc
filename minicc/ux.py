@@ -87,8 +87,11 @@ def streaming(text: str = "thinking..."):
 
 
 def say(text: str, style: str = ""):
-    """Print text with optional style."""
-    console.print(text, style=style)
+    """Print text with optional style. markup=False: say() prints untrusted
+    content (tool results, hook messages, file paths) — rich would otherwise
+    swallow bracket runs like "[hook]" as tags or crash on a stray "[/]".
+    Styling is the `style` param's job; no caller uses inline markup."""
+    console.print(text, style=style, markup=False)
 
 
 def truncate(s, n: int) -> str:

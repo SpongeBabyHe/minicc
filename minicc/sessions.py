@@ -33,6 +33,12 @@ def _path(session_id: str) -> Path:
     return _dir() / f"{session_id}.jsonl"
 
 
+def path(session_id: str | None) -> Path | None:
+    """Public transcript path for a session (None if no session). Hooks put this
+    in their stdin payload as `transcript_path`, matching CC."""
+    return _path(session_id) if session_id else None
+
+
 def new_id() -> str:
     """A timestamp-based session id, e.g. 20260616_143022."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")

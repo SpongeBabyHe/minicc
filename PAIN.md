@@ -59,6 +59,23 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   Live-verified incl. the encrypted_content round-trip. Task 1 (survey data
   sources) now fully unblocked → dogfood proper starts.
 
+- 2026-07-09: shipped **hooks core** — CC-faithful command hooks for the 3 events with
+  a real minicc surface (PreToolUse: block/allow/ask/updatedInput; PostToolUse:
+  additionalContext/updatedToolOutput/block-feedback; UserPromptSubmit: block+context).
+  CC's exact settings.json schema + stdin/exit-code/JSON contract, so a CC command hook
+  drops in (matchers use minicc's lowercase tool names). YAGNI-cut the other ~27 events
+  (absent-infra). Stop hook deferred to next commit (changes loop control flow; RALPH's
+  gate). `minicc/hooks.py` + agent/cli wiring; 19 tests + HOOKS.md. Watch in dogfood:
+  is the deterministic PostToolUse-lint a better verify signal than the soft stance?
+- 2026-07-09 (same day, follow-up): **lifecycle hooks** — PreCompact (blockable,
+  matcher manual|auto, `compact_reason` payload — re-fetched the official reference
+  for the exact stdin fields), PostCompact (notify-only), SessionStart
+  (startup|resume|clear; additionalContext → session-context layer), SessionEnd
+  (clear|prompt_input_exit; informational per CC). Ordering call: user sequenced
+  lifecycle BEFORE Stop — right by risk (none of these touch loop control flow;
+  Stop becomes the single control-flow commit), vs my leverage-first ordering.
+  +6 wiring tests (161 total green).
+
 - 2026-07-05: shipped **verify-work stance** (system-prompt "Verify your work"
   section: run tests/lint after editing, fix before reporting done). Source: it's
   CLAUDE_CODE_DESIGN.md's flagged "biggest single opportunity" + RALPH precondition,

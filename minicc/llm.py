@@ -8,6 +8,7 @@ from minicc.prompts.system import build_system_prompt, load_project_context
 from minicc import ux
 from minicc import config
 from minicc import sessions
+from minicc import hooks
 
 load_dotenv()  # ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL only; model lives in config
 MODEL = config.resolve_model()
@@ -361,6 +362,7 @@ def _compact(
     system: str | None = None,
     tools=None,
     session_id: str | None = None,
+    trigger: str = "auto",
 ) -> bool:
     """Summarize older messages via one LLM call; replace them in place.
 
@@ -368,7 +370,22 @@ def _compact(
     OR the summary call produced no text (in which case the history is left
     untouched — never replaced with an empty summary). `system`/`tools` are
     threaded to _summarize so a sub-agent compacts under its own prefix.
+
+    `trigger` ("manual" for /compact, "auto" for the budget path) is the
+    PreCompact/PostCompact hook matcher + their `compact_reason` payload field
+    (CC's contract). A PreCompact hook can block compaction (exit 2 or
+    decision:"block"); PostCompact is notification-only, fired after success.
     """
+    pre = hooks.run(
+        "PreCompact", session_id=session_id, match_value=trigger, compact_reason=trigger
+    )
+    for m in pre.system_messages:
+        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    if pre.block or pre.stop:
+        reason = pre.reason or pre.stop_reason or "no reason given"
+        ux.say(f"[compaction blocked by PreCompact hook: {reason}]", style=ux.S_INFO)
+        return False
+
     cut = _find_cut_index(messages)
     if not cut:  # None or 0 → nothing safe to compact
         return False
@@ -397,12 +414,17 @@ def _compact(
     if session_id:
         sessions.log_compaction(session_id, messages)
     ux.say(f"[compacted {cut} messages into a summary]", style=ux.S_INFO)
+    post = hooks.run(
+        "PostCompact", session_id=session_id, match_value=trigger, compact_reason=trigger
+    )
+    for m in post.system_messages:
+        ux.say(f"[hook] {m}", style=ux.S_INFO)
     return True
 
 
 def compact(messages, focus: str | None = None, session_id: str | None = None) -> bool:
     """Manual compaction entry point (for /compact). Returns True if it ran."""
-    return _compact(messages, focus=focus, session_id=session_id)
+    return _compact(messages, focus=focus, session_id=session_id, trigger="manual")
 
 
 def recap(messages, focus: str | None = None) -> str:

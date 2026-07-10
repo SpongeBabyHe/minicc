@@ -19,6 +19,10 @@ Keys:
                    survive breaks between turns; hits refresh free. The rolling
                    conversation breakpoint stays 5m (longer TTLs must precede
                    shorter ones — API rule). See CONTEXT_MANAGEMENT.md.
+  hooks          — event-triggered shell commands (PreToolUse / PostToolUse /
+                   UserPromptSubmit / PreCompact / PostCompact / SessionStart /
+                   SessionEnd), CC's schema. disableAllHooks turns them off.
+                   Global + project groups both fire (concatenated). See HOOKS.md.
 
 env is reserved for secrets + endpoint (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
 """
@@ -84,6 +88,29 @@ def resolve_cache_ttl() -> str:
     g, p = _read(_global()), _read(_project())
     ttl = p.get("cache_ttl") or g.get("cache_ttl") or "5m"
     return ttl if ttl in ("5m", "1h") else "5m"
+
+
+def _hooks_of(d: dict) -> dict:
+    h = d.get("hooks")
+    return h if isinstance(h, dict) else {}
+
+
+def load_hooks() -> tuple[dict, bool]:
+    """Merged hook config for this cwd: (events, disabled).
+
+    `events` maps each hook-event name (PreToolUse, PostToolUse, …) to its list of
+    matcher-groups, with global and project groups CONCATENATED (both fire, unlike
+    allowed_tools which is a set-union) — global first, then project. `disabled` is
+    true if either file sets "disableAllHooks". Shape mirrors CC's settings.json so a
+    hook written for Claude Code drops in unchanged. See HOOKS.md."""
+    g, p = _read(_global()), _read(_project())
+    disabled = bool(g.get("disableAllHooks")) or bool(p.get("disableAllHooks"))
+    merged: dict = {}
+    for src in (g, p):
+        for event, groups in _hooks_of(src).items():
+            if isinstance(groups, list):
+                merged.setdefault(event, []).extend(groups)
+    return merged, disabled
 
 
 def _tool_list(d: dict) -> set:
