@@ -29,7 +29,7 @@ it's never committed (it's under `$HOME`, not the project). Mirrors CC's
 
 ## The `memory` tool
 
-One tool over a `/memories` prefix this maps onto the real store, with
+One tool over a `/memories` prefix that maps onto the real store, with
 path-traversal protection (reject anything resolving outside the root). Four
 commands (a subset of CC's GA `memory_20250818`, wire-compatible for a later upgrade):
 
@@ -107,7 +107,7 @@ Deferred:
 **Following CC**: two-layer index + lazy topic files; 200-line/25 KB index load;
 machine-local per-repo store; the topic-file frontmatter format + `[[links]]`; model
 decides what's worth saving; survives `/clear`/compaction by disk reload. **minicc's
-own**: the 3-command tool subset (vs GA's 6); gated writes (CC's tool auto-injects a
+own**: the 4-command tool subset (vs GA's 6); gated writes (CC's tool auto-injects a
 protocol prompt instead); `~/.minicc/` path. **Not baked in**: CC's exact save-decision
 heuristic and Auto-Dream cadence are model-/flag-internal — minicc leans on steering +
 the model's judgment, tuned from dogfood.

@@ -39,7 +39,7 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 - 2026-07-02: Phase-1 CC alignment landed (two-band L3/L4 with official
   context-editing defaults, `window − 13K` budget, 9-section summary, append-only
   session transcript, session-context cache layer, auto-memory + /memory).
-  Processed into `CONTEXT_MANAGEMENT.md` / `SESSIONS.md` / `MEMORY.md`. **All
+  Processed into `CONTEXT_MANAGEMENT.md` / `SESSIONS.md` / `MEMORY_DESIGN.md`. **All
   fresh — none of it dogfooded yet** (see retro questions below).
 
 ## Tools

@@ -130,12 +130,13 @@ minicc's `task` is a **separate `agent_loop`**, which makes this a clean fit:
 on the configured model.
 
 **Implementation note:** `MODEL` is a module global and `set_model()` mutates it —
-using that for the subagent would change the **parent's** model too. Thread a
-per-call `model` override through `agent_loop` → `llm_response` → the API params
-(don't mutate the global), alongside the `tools`/`max_turns` params the subagent
-already passes.
+using that for the subagent would change the **parent's** model too. So a per-call
+`model` override is threaded through `agent_loop` → `llm_response` → the API params
+(the global is never mutated), alongside the `tools`/`max_turns` params the
+subagent already passes.
 
-**Status: designed, not implemented.**
+**Status: implemented** — `task.py` sets `SUBAGENT_MODEL` (Haiku) and passes it
+per-call, so the parent's model and cached prefix are untouched.
 
 ## Interactions
 

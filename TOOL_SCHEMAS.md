@@ -49,8 +49,9 @@ Where each kind of fact belongs:
 - **Cross-cutting steering shared by all tools** (prefer edit over write; search before assuming) → the system prompt, said once.
 
 Minimalism applies to the **number of tools** and the **size of responses** — not
-to per-tool semantic detail. minicc keeps 8 focused, non-overlapping tools; each
-one earns a detailed description.
+to per-tool semantic detail. minicc keeps a small set of focused, non-overlapping
+tools (11 as of 2026-07: file/search six + task, todo_write, memory, web_fetch,
+web_search); each one earns a detailed description.
 
 ---
 

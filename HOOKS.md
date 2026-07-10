@@ -3,7 +3,8 @@
 User-configured shell commands that fire at points in the agent loop. Faithful to
 [Claude Code's hooks](https://code.claude.com/docs/en/hooks), adapted to minicc's
 surfaces and tool names. Implemented in `minicc/hooks.py`; wired in `minicc/agent.py`
-(tool events) and `minicc/cli.py` (prompt event).
+(tool events + the Stop gate), `minicc/cli.py` (prompt + session lifecycle), and
+`minicc/llm.py` (compaction events).
 
 ## Why hooks exist
 
@@ -11,8 +12,9 @@ CLAUDE.md and the system prompt are **advisory** — the model may or may not fo
 them. A hook is **deterministic**: it runs as code every time, so it can enforce an
 invariant the model can't be trusted to. This is CC's own framing ("Use hooks for
 actions that must happen every time with zero exceptions"), and it's the hard-gate
-complement to the [verify-work stance](CLAUDE_CODE_DESIGN.md): the stance *asks* the
-model to run tests after editing; a `PostToolUse` hook *makes* the linter run.
+complement to the verify-work stance in the system prompt: the stance *asks* the
+model to run tests after editing; a `PostToolUse` hook *makes* the linter run, and
+a `Stop` hook can hold the turn open until a check passes.
 
 Canonical uses: block writes to a protected path, run a formatter/linter after every
 edit, inject required context on each prompt.

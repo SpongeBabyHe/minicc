@@ -173,6 +173,11 @@ retries once (the SDK does **not** auto-retry 413). A second 413 (one
 un-compactable huge message) surfaces. This is the safety net for accounting
 drift on top of the proactive window-relative trigger.
 
+Compaction also fires **PreCompact / PostCompact hooks** (HOOKS.md): a PreCompact
+hook can veto a compaction (exit 2 / `decision:"block"`); a hook that vetoes
+*persistently* lands in L5's thrash guard below — deliberate, since unbounded
+growth is the failure these layers exist to prevent.
+
 **L5 — thrash guard.** If the history is still over budget after
 `MAX_COMPACT_ATTEMPTS = 3` compactions in a row, minicc raises (with a pointer to
 `/clear` or smaller chunks) instead of looping forever.

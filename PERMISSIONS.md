@@ -1,10 +1,13 @@
 # PERMISSIONS.md — the trust model, and why bash is the hard case
 
-minicc gates three tools before the model may run them. Reads (`read_file`,
-`glob`, `grep`) are never gated — they can't mutate. `write_file`/`edit_file` are
-gated but *bounded*: the prompt previews the exact path + diff, and the effect is
-in-tree and reversible. **bash is the hard case** — most of this doc is about it;
-the last section covers how granted trust persists. Code:
+minicc gates five tools before the model may run them: `bash`, `write_file`,
+`edit_file`, `memory` (writes only — `view` is free so the model can always read
+memory), and `web_fetch` (a crafted URL is a data-exfiltration channel under
+prompt injection; the user sees each URL). Reads (`read_file`, `glob`, `grep`)
+are never gated — they can't mutate. `write_file`/`edit_file` are gated but
+*bounded*: the prompt previews the exact path + diff, and the effect is in-tree
+and reversible. **bash is the hard case** — most of this doc is about it; the
+last section covers how granted trust persists. Code:
 [`permissions.py`](minicc/permissions.py), [`tools/bash.py`](minicc/tools/bash.py).
 
 ## Why bash is gated
@@ -22,12 +25,16 @@ unbounded *and* opaque.
 A permission decision and what the tool can actually *do* are different layers —
 and bash has a boundary at only one of them.
 
-**Permission layer** — where trust is decided (`confirm()`):
+**Permission layer** — where trust is decided. A `PreToolUse` hook (HOOKS.md)
+runs first and can `deny` the call outright, `allow` it past the gate, or `ask`
+to force the prompt; then `confirm()`:
 
 ```
-not gated?     → allow (reads never prompt)
-in _ALLOWED?   → allow (trusted this session)
-else           → prompt [yes / no / all]
+PreToolUse deny?  → blocked before anything runs
+PreToolUse allow? → run without prompting
+not gated?        → allow (reads never prompt)
+in _ALLOWED?      → allow (trusted this session)
+else              → prompt [yes / no / all]   (hook `ask` forces this prompt)
 ```
 
 This is the *only* boundary that constrains bash.
@@ -38,9 +45,9 @@ sets the starting pwd; `cd`, absolute paths, `~` all escape — *"scope escapes
 outside cwd are NOT detected"*), no `env=` restriction (it inherits the whole
 environment, **including `ANTHROPIC_API_KEY`**), no sandbox. Privileges = your
 user, over the **whole machine**: filesystem, network, processes. The only
-technical guards — a substring denylist (`rm -rf /`, `sudo`…), a 120s timeout, an
-output cap — are speed bumps, not boundaries (the denylist misses `rm -rf ~`,
-`rm -fr /`).
+technical guards — a regex denylist (`rm -rf /`, `sudo`, `mkfs`…), a 120s default
+timeout (model-extendable to 600s), an output cap — are speed bumps, not
+boundaries (the denylist still misses e.g. `rm -rf ~`).
 
 > **So bash's scope is the whole machine at your privilege, and the permission
 > gate is its *sole* boundary.** There is no second technical fence. (Contrast

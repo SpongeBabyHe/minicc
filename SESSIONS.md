@@ -109,9 +109,10 @@ mixed history works everywhere.
 ## Append-only transcript (compaction stays lossless)
 
 Storage is a **JSONL event log** (`<id>.jsonl`), one event per line, never
-rewritten. Two event kinds: `{"t":"msg","m":<message>}` and
-`{"t":"compact","state":[...]}`. `load` replays: a `msg` appends; a `compact`
-RESETS the working set to its recorded state (summary + kept tail).
+rewritten. Three event kinds: `{"t":"msg","m":<message>}`,
+`{"t":"compact","state":[...]}`, and `{"t":"rewind","state":[...]}` (a
+conversation `/rewind` — see CHECKPOINT.md D3). `load` replays: a `msg` appends;
+a `compact` or `rewind` RESETS the working set to its recorded state.
 
 **Why not overwrite a single JSON each turn (the old design)?** In-session L4
 compaction rewrites `history` in place (summary + recent), so overwriting on save
@@ -119,7 +120,7 @@ persisted the *compacted* history — the raw pre-compaction messages were silen
 lost. An append-only log fixes this: the raw `msg` events stay on disk (line count
 only grows), while the `compact` event lets a resume reconstruct the small working
 set instead of re-inflating the whole raw log. Mirrors Claude Code's JSONL
-transcript + `compact_boundary`. See docs/CC_ALIGNMENT_PLAN.md (item A).
+transcript + `compact_boundary` design.
 
 **Recording points** (`session_id` threaded `agent_loop → llm_response → _compact`;
 sub-agents pass `None`, so their isolated context is never recorded):

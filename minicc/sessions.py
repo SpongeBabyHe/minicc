@@ -2,13 +2,14 @@
 
 Each session is a JSONL file (`<id>.jsonl`), written one event per line and NEVER
 rewritten — so the raw conversation survives even when the in-memory working set is
-compacted (an overwrite-on-save scheme would drop the summarized history). Two event kinds:
+compacted (an overwrite-on-save scheme would drop the summarized history). Three event kinds:
 
     {"t": "msg",     "m": <one API-shaped message>}   # appended as the turn happens
     {"t": "compact", "state": [<messages>]}           # post-compaction working set
+    {"t": "rewind",  "state": [<messages>]}           # conversation /rewind reset
 
-`load` replays the log: a `msg` event appends; a `compact` event RESETS the working
-set to its recorded state (summary + kept tail). So reconstruction yields exactly
+`load` replays the log: a `msg` event appends; a `compact` or `rewind` event RESETS
+the working set to its recorded state (summary + kept tail). So reconstruction yields exactly
 what the live session held — small and API-ready — no matter how long the raw log
 grew, while the pre-compaction `msg` events stay on disk (lossless).
 
