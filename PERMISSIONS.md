@@ -20,6 +20,39 @@ effect, so gating substitutes **a human looking at each command** for the
 bounding that code can't provide. bash is the one tool whose blast radius is
 unbounded *and* opaque.
 
+## The read-only carve-out + permission rules (CC parity, rebuilt 2026-07-14)
+
+CC runs a built-in set of read-only bash commands "without a permission prompt in
+every mode", and persists `Bash(prefix *)` allow rules per project ("Yes, don't
+ask again"). The three-arm /init experiment measured the gap: 18 approval prompts
+on baseline minicc vs 0 on CC for the same exploration — and prompting on every
+`ls` suppresses exploration depth, making this a QUALITY problem, not just
+friction. minicc now mirrors both mechanisms (`is_readonly_command`,
+`_bash_allowed` in permissions.py):
+
+- **The read-only list** (CC's, verbatim): `ls cat echo pwd head tail grep find
+  wc which diff stat du` + `cd` *within the working directory* + read-only `git`
+  subcommands (status/log/diff/show/blame/…; branch/tag/remote/stash excluded
+  outright — each has mutating forms).
+- **Allow rules**: `permissions.allow` in settings holds CC-schema rules; an
+  exported `Bash(uv run *)` drops in unchanged (case-insensitive). Wildcards are
+  CC's verbatim: `*` spans spaces; trailing `" *"` (alias `:*`) is a word
+  boundary — `ls *` matches `ls -la` and bare `ls`, never `lsof`. The `always`
+  prompt answer persists first-two-tokens + `" *"` per gated subcommand (max 5,
+  CC's cap) to project settings.
+- **Compound commands split on CC's operators** (`&& || ; | |& &`, newlines);
+  every subcommand must independently qualify — `ls && rm x` prompts.
+- **Wrapper stripping** (CC's fixed set): `timeout/time/nice/nohup/stdbuf` +
+  bare `xargs`.
+- **Fail-safe by construction**: redirections (except the harmless `2>&1` and
+  `/dev/null` sink forms), command/process substitution, backticks, subshells,
+  env-var prefixes, `find -exec/-delete`, `git log --output`, or anything shlex
+  can't tokenize simply *prompt as before*. A parsing gap can only produce a
+  false PROMPT, never a false ALLOW.
+- Recorded divergences: allow rules only (CC adds ask/deny with deny→ask→allow
+  precedence); one project settings file (CC splits three); prefix derivation is
+  our heuristic (CC doesn't publish its dialog's).
+
 ## What layer is bash's scope at?
 
 A permission decision and what the tool can actually *do* are different layers —
@@ -50,35 +83,40 @@ timeout (model-extendable to 600s), an output cap — are speed bumps, not
 boundaries (the denylist still misses e.g. `rm -rf ~`).
 
 > **So bash's scope is the whole machine at your privilege, and the permission
-> gate is its *sole* boundary.** There is no second technical fence. (Contrast
-> Claude Code's fine-grained rules — `Bash(git diff:*)` vs `Bash(rm:*)`, path
-> patterns; minicc's grants are coarse / whole-tool, so *which scope* you trust
-> bash in is the only lever you have.)
+> gate is its *sole* boundary.** There is no second technical fence. (minicc now has CC-style
+> `bash(prefix *)` rules and the read-only carve-out at the permission layer —
+> but the EXECUTION layer remains unconfined either way.)
 
-## Persisting trust — the allowlist, and why it's load-only
+## Persisting trust — three lifetimes, and the principle that separates them
 
-`_ALLOWED` is filled from two sources with deliberately different lifetimes:
+- **`'all'` at a prompt** — whole-tool, session only (in-memory; gone on
+  restart / `/clear`).
+- **`allowed_tools` in `settings.json`** — whole-tool, hand-edited, persistent.
+  bash is excluded (`NO_PRELOAD`).
+- **`'always'` at a bash prompt** — a **narrow prefix rule** (`bash(uv run *)`),
+  persisted to project settings.
 
-- **`'all'` at a prompt** — typed in the moment, lives for the session only
-  (in-memory; gone on restart / `/clear`).
-- **`allowed_tools` in `settings.json`** — hand-edited, loaded at startup,
-  persistent.
-
-The principle that keeps them apart:
+The principle that governs all three:
 
 > A mistake's cost = its permanence × its silence.
 
-So a hasty `'all'` (the reflex under approval fatigue) must **never auto-persist**
-to settings — otherwise the prompt meant to protect you trains you to disable it
-forever. `permissions.py` can't even write settings (it doesn't import `config`);
-the only path to permanence is editing the file, and that friction *is* the
-safety. Startup prints what settings pre-approved, so persistent trust stays
-visible. (The one tool never eligible for persistence is **bash** — see above:
-the gate is its only boundary.)
+A hasty whole-tool `'all'` must **never auto-persist** — otherwise the prompt
+meant to protect you trains you to disable it forever, which is why whole-tool
+bash trust remains strictly session-scoped.
+
+**Revised 2026-07-12** (was: "the one tool never eligible for persistence is
+bash"): **rule granularity changes the arithmetic**. A persisted `bash(uv run *)`
+is not "trust bash forever"; it's "trust this reviewed command family".
+Permanence is bounded by the prefix; silence is removed by the startup print
+("bash allow rules from settings: …") and by the rule being written only on an
+explicit `always` answer at a visible prompt. Both factors shrink — that's what
+makes persistence defensible. This is CC's own resolution (its "don't ask again"
+persists per project + command prefix).
 
 ## Debt surfaced by this analysis
 
 - bash denylist is trivially bypassable — decorative, not a boundary.
 - bash inherits the full env incl `ANTHROPIC_API_KEY` — an approved `printenv`
   leaks it; consider scrubbing secrets from the subprocess env.
-- no path confinement / sandbox; coarse (whole-tool) grants.
+- no path confinement / sandbox; whole-tool grants except bash's rule layer.
+- no ask/deny rules — allow-only (deny would add real safety: `bash(git push *)`).

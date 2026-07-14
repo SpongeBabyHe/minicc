@@ -28,6 +28,7 @@ env is reserved for secrets + endpoint (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
 """
 
 import json
+import re
 from pathlib import Path
 
 # Fallback when no settings file sets a default.
@@ -111,6 +112,53 @@ def load_hooks() -> tuple[dict, bool]:
             if isinstance(groups, list):
                 merged.setdefault(event, []).extend(groups)
     return merged, disabled
+
+
+_BASH_RULE = re.compile(r"^[Bb]ash\((.+)\)$")
+
+
+def permission_allow_rules() -> list:
+    """Bash allow-rule patterns from `permissions.allow` (global + project, in that
+    order, deduped). CC's exact schema shape — an exported `Bash(uv run *)` rule
+    drops in unchanged (tool name case-insensitive; non-bash rules ignored for
+    now). See PERMISSIONS.md."""
+    seen, rules = set(), []
+    for d in (_read(_global()), _read(_project())):
+        perms = d.get("permissions")
+        allow = perms.get("allow", []) if isinstance(perms, dict) else []
+        for entry in allow if isinstance(allow, list) else []:
+            m = _BASH_RULE.match(str(entry).strip())
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1))
+                rules.append(m.group(1))
+    return rules
+
+
+def add_allow_rule(pattern: str) -> Path:
+    """Persist one bash allow rule to PROJECT settings (the `always` answer at a
+    permission prompt). Written as lowercase `bash(<pattern>)` — minicc's tool-name
+    convention; read back case-insensitively."""
+    path = _project()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gi = path.parent / ".gitignore"  # keep project .minicc/ self-ignoring
+    if not gi.exists():
+        gi.write_text("*\n")
+    data = _read(path)
+    # tolerate hand-edited malformation (permissions: [] etc.) — a crash here
+    # would land in the middle of an approval prompt
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        perms = {}
+        data["permissions"] = perms
+    allow = perms.get("allow")
+    if not isinstance(allow, list):
+        allow = []
+        perms["allow"] = allow
+    rule = f"bash({pattern})"
+    if rule not in allow:
+        allow.append(rule)
+        path.write_text(json.dumps(data, indent=2))
+    return path
 
 
 def _tool_list(d: dict) -> set:
