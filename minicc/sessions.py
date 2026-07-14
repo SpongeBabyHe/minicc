@@ -4,9 +4,14 @@ Each session is a JSONL file (`<id>.jsonl`), written one event per line and NEVE
 rewritten — so the raw conversation survives even when the in-memory working set is
 compacted (an overwrite-on-save scheme would drop the summarized history). Three event kinds:
 
-    {"t": "msg",     "m": <one API-shaped message>}   # appended as the turn happens
+    {"t": "msg",     "ts": <iso>, "m": <one API-shaped message>[, "usage": {...}]}
     {"t": "compact", "state": [<messages>]}           # post-compaction working set
     {"t": "rewind",  "state": [<messages>]}           # conversation /rewind reset
+
+`ts` (every msg) and `usage` (assistant msgs, token counts from the API response)
+mirror CC's transcript fields — they're what make post-hoc process analysis
+(timing, cost, turn economy) possible. Replay ignores unknown keys, so old
+transcripts without them stay loadable.
 
 `load` replays the log: a `msg` event appends; a `compact` or `rewind` event RESETS
 the working set to its recorded state (summary + kept tail). So reconstruction yields exactly
@@ -89,9 +94,26 @@ def _append_event(session_id: str, event: dict) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def append_message(session_id: str, message) -> None:
-    """Append one message to the transcript (append-only, in conversation order)."""
-    _append_event(session_id, {"t": "msg", "m": _serialize_message(message)})
+def append_message(session_id: str, message, usage=None) -> None:
+    """Append one message to the transcript (append-only, in conversation order).
+    `usage` (assistant messages): the API response's usage object; recorded so
+    process analysis gets per-turn token counts for free."""
+    event = {
+        "t": "msg",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "m": _serialize_message(message),
+    }
+    if usage is not None:
+        event["usage"] = {
+            k: getattr(usage, k, 0) or 0
+            for k in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        }
+    _append_event(session_id, event)
 
 
 def log_compaction(session_id: str, working_set) -> None:

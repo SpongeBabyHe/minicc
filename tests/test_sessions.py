@@ -178,3 +178,33 @@ def test_rewind_event_resets_on_load(tmp_path, monkeypatch):
     assert sessions.load("s") == rewound + [{"role": "assistant", "content": "a-new"}]
     path = tmp_path / ".minicc" / "sessions" / "s.jsonl"
     assert '"m1"' in path.read_text()                  # rewound-away msg still on disk
+
+
+# ─── ts + usage fields (CC-transcript parity; enables process analysis) ──────
+
+def test_append_message_records_ts_and_usage(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from minicc import sessions
+
+    monkeypatch.chdir(tmp_path)
+    sid = "20990101_000000"
+    sessions.append_message(sid, {"role": "user", "content": "hi"})
+    usage = SimpleNamespace(
+        input_tokens=10, output_tokens=20,
+        cache_read_input_tokens=30, cache_creation_input_tokens=40,
+    )
+    sessions.append_message(sid, {"role": "assistant", "content": "yo"}, usage=usage)
+
+    lines = [json.loads(l) for l in sessions.path(sid).read_text().splitlines()]
+    assert all("ts" in e for e in lines)          # every msg carries a timestamp
+    assert "usage" not in lines[0]                # user msg: no usage
+    assert lines[1]["usage"] == {
+        "input_tokens": 10, "output_tokens": 20,
+        "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40,
+    }
+    # replay ignores the new keys (old readers / mixed transcripts stay loadable)
+    assert sessions.load(sid) == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+    ]

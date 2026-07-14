@@ -91,6 +91,38 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   vote on it immediately. Soft prior only; eval probes G1/G2 added. Watch in dogfood:
   does the model actually run pytest after editing wiki modules, or still claim done?
 
+## Dogfood — the /init comparison experiment (llm-kaki, R1–R3, 2026-07-11 → 14)
+
+Full records live in Obsidian (`Start/my-mini-cc/`: 三臂对比记录 + 改进建议);
+this is the repo-side condensate. Setup: A = minicc+API, B = CC CLI, C = CC CLI
+Fable 5, same base commit, /init in three worktrees.
+
+- **R1/R2** (2-arm): B won structure; A won gotcha depth; verdicts flipped once
+  commands were LIVE-RUN — every point B lost traced to commands it never ran.
+  Fixes shipped, then hard-discarded for a clean 3-arm rerun (stash was skipped;
+  lesson: archive before reverting).
+- **R3** (3-arm, clean baseline): A=20 calls (18 bash-cat, ≈18 prompts, 0
+  verification, 5 output errors); B=40 calls (32 Read, 0 verification, 3 errors,
+  344s, 2.09M cache-read); C=15 batched calls, 192s, 695K cache-read, **2
+  verification actions** (pytest before documenting — its own words: "Let me
+  verify the test command works before documenting it" — and git check-ignore),
+  59-line output, fewest errors. C's verified claims were all correct; its
+  unverified ones (ruff, a dev.sh-reload attribution) were its only errors.
+- **Recovered CC's official /init prompt verbatim** from B's transcript —
+  now the skeleton of minicc's /init.
+- **Grading-method lessons** (recorded after two self-corrections): execution
+  counts as verification, grep does not (a dev.sh short-name misjudgment); read
+  the process transcript before judging the result (two C claims initially
+  misfiled as fabrications were verified in-process).
+- **Rebuild (2026-07-14, this working tree)**: /init = CC official skeleton +
+  verify-before-write + quantifier-check + parallel-batch hint; read-only bash
+  carve-out + safe redirects; `bash(prefix *)` allow rules + `always`;
+  phantom-decline fix (stdin flush + empty-reprompt); adaptive thinking (both CC
+  arms ran with thinking on — minicc bare was an uncontrolled variable);
+  transcript ts+usage (CC-parity observability; A's timing/cost columns were
+  blank in the analysis); two-layer bash steering; ancestor CLAUDE.md walk;
+  recent-commits env block. 194 tests green.
+
 ## Open questions for retro
 - [ ] verify-work: does the model run tests/lint unprompted after edits now, or
       does the stance get ignored under task pressure? (the whole point of shipping it)

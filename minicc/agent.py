@@ -57,11 +57,11 @@ def agent_loop(
             # Contract: send the paused assistant message back unchanged and the
             # API resumes it — so record it and loop again without tool results.
             if session_id:
-                sessions.append_message(session_id, assistant_msg)
+                sessions.append_message(session_id, assistant_msg, usage=response.usage)
             continue
         if response.stop_reason != "tool_use":
             if session_id:  # terminal assistant → record alone
-                sessions.append_message(session_id, assistant_msg)
+                sessions.append_message(session_id, assistant_msg, usage=response.usage)
             # Stop hook: the deterministic turn-end gate (the enforced complement to
             # the verify-work stance). A block feeds its reason back and keeps the
             # turn going; MAX_STOP_BLOCKS caps a hook that never lets go.
@@ -88,7 +88,7 @@ def agent_loop(
         # Record assistant + its tool_results together, only now that both exist —
         # so a Ctrl-C mid-tool never persists a dangling tool_use to the transcript.
         if session_id:
-            sessions.append_message(session_id, assistant_msg)
+            sessions.append_message(session_id, assistant_msg, usage=response.usage)
             sessions.append_message(session_id, tool_msg)
 
 

@@ -302,6 +302,8 @@ class _Text:
 
 
 class _Resp:
+    usage = None  # append_message(usage=None) skips the usage field
+
     def __init__(self, text, stop_reason="end_turn"):
         self.content = [_Text(text)]
         self.stop_reason = stop_reason
