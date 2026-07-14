@@ -422,6 +422,23 @@ def _compact(
     return True
 
 
+def _thinking_param(model: str) -> dict | None:
+    """Adaptive thinking for models that support it (4.6+ / Opus 4.7+ / Fable).
+
+    CC runs with thinking ON — the three-arm /init transcripts show thinking
+    blocks in both CC arms while minicc's Sonnet ran bare, an uncontrolled
+    variable in the harness comparison and a fidelity gap in its own right.
+    Adaptive is the only on-mode on 4.7+ (budget_tokens is a 400 there); models
+    predating adaptive (Haiku 4.5 sub-agents) get no thinking param at all.
+    Thinking blocks come back in `response.content` and minicc already appends
+    content verbatim to history + transcript, which is exactly the replay
+    contract (pass thinking blocks back unchanged on the same model)."""
+    known_adaptive = ("sonnet-4-6", "opus-4-6", "opus-4-7", "opus-4-8", "fable")
+    if any(k in model for k in known_adaptive):
+        return {"type": "adaptive"}
+    return None
+
+
 def compact(messages, focus: str | None = None, session_id: str | None = None) -> bool:
     """Manual compaction entry point (for /compact). Returns True if it ran."""
     return _compact(messages, focus=focus, session_id=session_id, trigger="manual")
@@ -532,10 +549,16 @@ def llm_response(
     params = dict(
         model=m,
         messages=_cacheable(messages),  # L1: cache the conversation history too
-        max_tokens=8000,
+        # Thinking tokens share this budget — 8000 starved long turns once
+        # adaptive thinking landed, so the ceiling doubles (well under Sonnet's
+        # 64K output cap; max_tokens is a safety ceiling, not a target).
+        max_tokens=16_000,
         system=_build_system_block(system),
         tools=tools if tools is not None else TOOLS,
     )
+    thinking = _thinking_param(m)
+    if thinking:
+        params["thinking"] = thinking
     try:
         response = _send_request(params, stream)
     except APIStatusError as e:

@@ -14,9 +14,11 @@ SCHEMA = {
     "name": "bash",
     "description": (
         "Run a shell command. Use this ONLY when no other tool fits — e.g. running "
-        "scripts, git, package managers, or tests. For finding files prefer `glob`; for "
-        "searching contents prefer `grep`; for reading prefer `read_file`; for editing "
-        "prefer `edit_file`/`write_file`. Commands are killed after 120s by default; for "
+        "scripts, git, package managers, or tests. IMPORTANT: avoid running `ls`, "
+        "`find`, `cat`, `head`, `tail`, or `grep` through bash unless you have verified "
+        "a dedicated tool cannot do the job — use `glob` to find files, `grep` to "
+        "search contents, `read_file` to read, and `edit_file`/`write_file` to edit. "
+        "Commands are killed after 120s by default; for "
         "a known-slow command (build, install, model download, full test suite) request "
         "more with `timeout` (milliseconds, up to 600000 = 10 min). Don't start "
         "long-running servers or watchers in the foreground — run them detached. Output "

@@ -31,12 +31,59 @@ _PRICE_CACHE_READ_PER_M = 0.30  # 0.1x input
 
 # /init: a canned instruction run as a normal agent turn — the model explores with
 # its own tools and writes CLAUDE.md. No special machinery; just a good prompt.
+#
+# The skeleton is CC's official /init prompt, recovered VERBATIM from a CC session
+# transcript during the three-arm /init experiment (2026-07-14) — its proven parts
+# are kept word-for-word (single-test requirement, the "requires reading multiple
+# files" inclusion bar, the banned-genericism examples, rules-file checks, the
+# anti-fabrication clause, the standard header for cross-tool interop). Three
+# additions the experiment showed the original lacks:
+#   1. verify-before-write — no arm's unverified command survived checking; the
+#      wording is Fable 5's own spontaneous phrasing from that run.
+#   2. universal-quantifier check — "all"/"only" claims were the other error class.
+#   3. batch parallel reads — turn count drove a 3x context-traffic spread.
+# Deliberately absent (the experiment showed CC needs neither): todo/task
+# scaffolding hints.
 _INIT_PROMPT = (
-    "Analyze this project and write a concise CLAUDE.md at the repo root to help an "
-    "AI assistant work here effectively. First explore the structure with "
-    "glob/grep/read_file (build/test/run commands, layout, key files, conventions). "
-    "If CLAUDE.md already exists, read it and improve it in place rather than "
-    "duplicating. Keep it tight and high-signal — no filler. Write it with write_file."
+    "Please analyze this codebase and create a CLAUDE.md file, which will be given "
+    "to future AI coding agents (Claude Code, minicc) operating in this repository.\n\n"
+    "What to add:\n"
+    "1. Commands that will be commonly used, such as how to build, lint, and run "
+    "tests. Include the necessary commands to develop in this codebase, such as "
+    "how to run a single test.\n"
+    "2. High-level code architecture and structure so that future instances can be "
+    "productive more quickly. Focus on the \"big picture\" architecture that "
+    "requires reading multiple files to understand.\n\n"
+    "Usage notes:\n"
+    "- VERIFY each command works by actually running it (bash) before documenting "
+    "it; if it needs env vars or a .env file, say so next to the command. If you "
+    "cannot verify a command, do not present it as working.\n"
+    "- Before writing a claim containing \"all\", \"only\", \"both\" or "
+    "\"never\", check each member it quantifies over.\n"
+    "- Explore with glob/grep/read_file; batch independent file reads as parallel "
+    "tool calls in a single turn — each extra turn re-reads the whole context.\n"
+    "- If there's already a CLAUDE.md, improve it in place rather than duplicating.\n"
+    "- Do not repeat yourself and do not include obvious instructions like "
+    "\"Provide helpful error messages to users\", \"Write unit tests for all new "
+    "utilities\", \"Never include sensitive information (API keys, tokens) in "
+    "code or commits\".\n"
+    "- Avoid listing every component or file structure that can be easily "
+    "discovered.\n"
+    "- Don't include generic development practices.\n"
+    "- If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot "
+    "rules (in .github/copilot-instructions.md), make sure to include the "
+    "important parts.\n"
+    "- If there is a README.md, make sure to include the important parts.\n"
+    "- Do not make up information such as \"Common Development Tasks\", \"Tips "
+    "for Development\", \"Support and Documentation\" unless this is expressly "
+    "included in other files that you read.\n"
+    "- Be sure to prefix the file with the following text:\n\n"
+    "```\n"
+    "# CLAUDE.md\n\n"
+    "This file provides guidance to Claude Code (claude.ai/code) when working with "
+    "code in this repository.\n"
+    "```\n\n"
+    "Write the result with write_file."
 )
 
 
@@ -425,6 +472,12 @@ def main():
     if pre_approved:
         ux.say(
             f"pre-approved (no prompt) from settings: {', '.join(sorted(pre_approved))}",
+            style=ux.S_INFO,
+        )
+    bash_rules = config.permission_allow_rules()
+    if bash_rules:
+        ux.say(  # persistent trust stays visible (PERMISSIONS.md principle)
+            f"bash allow rules from settings: {', '.join(bash_rules)}",
             style=ux.S_INFO,
         )
     if refused:

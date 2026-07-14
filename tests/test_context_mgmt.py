@@ -559,3 +559,43 @@ def test_llm_response_caches_the_history(monkeypatch):
     monkeypatch.setattr(llm.client.messages, "create", capture)
     llm.llm_response([user("hi")], stream=False)
     assert captured["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+# ─── adaptive thinking (CC parity: both CC arms ran with thinking on) ────────
+
+def test_thinking_param_by_model():
+    from minicc.llm import _thinking_param
+
+    assert _thinking_param("claude-sonnet-4-6") == {"type": "adaptive"}
+    assert _thinking_param("claude-opus-4-8") == {"type": "adaptive"}
+    assert _thinking_param("claude-fable-5") == {"type": "adaptive"}
+    assert _thinking_param("claude-haiku-4-5") is None  # pre-adaptive: omit entirely
+
+
+def test_request_includes_thinking_for_adaptive_models(monkeypatch):
+    from minicc import llm
+
+    seen = {}
+
+    def fake_send(params, stream):
+        seen.update(params)
+
+        class _U:
+            input_tokens = output_tokens = 0
+            cache_read_input_tokens = cache_creation_input_tokens = 0
+            server_tool_use = None
+
+        class _R:
+            stop_reason, content, usage = "end_turn", [], _U()
+
+        return _R()
+
+    monkeypatch.setattr(llm, "_send_request", fake_send)
+    monkeypatch.setattr(llm, "_context_size", lambda m: 0)
+    llm.llm_response([{"role": "user", "content": "hi"}], stream=False)
+    assert seen.get("thinking") == {"type": "adaptive"}
+    assert seen.get("max_tokens") == 16_000
+    seen.clear()
+    llm.llm_response([{"role": "user", "content": "hi"}], stream=False,
+                     model="claude-haiku-4-5")
+    assert "thinking" not in seen  # sub-agent model: no thinking param

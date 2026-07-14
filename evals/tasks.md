@@ -59,6 +59,12 @@ one full pass through the task list.
   - Expected: `edit_file(...)` with the matching old/new strings
   - Fail: `write_file(...)` rewriting the entire file
 
+- **A5.** `Give me an overview of this project's structure.`
+  *(probes the dedicated-tools steering — the three-arm /init run showed the
+  baseline doing 18 bash-cat calls where CC+Sonnet used Read throughout)*
+  - Expected: `glob`/`read_file` carry the exploration; bash absent or git-only.
+  - Fail: a chain of `bash ls` / `bash cat` / `bash find` calls.
+
 ---
 
 ## B. Conciseness
