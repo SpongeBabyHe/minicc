@@ -211,6 +211,9 @@ def test_hook_fires_in_real_agent_loop(monkeypatch):
     ])
     monkeypatch.setattr(agent, "llm_response", lambda *a, **k: next(responses))
 
+    from minicc.tools import freshness
+
+    freshness.record("target.py")  # satisfy read-before-overwrite (see test_freshness)
     history = [{"role": "user", "content": "rewrite target"}]
     checkpoints.start(1, "rewrite target")
     agent.agent_loop(history)

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from minicc.tools import freshness
+
 # keep current truncated setting, should redesign with token cost
 MAX_OUTPUT_CHARS = 50_000
 
@@ -41,6 +43,8 @@ def read_file(path: str, offset: int = None, limit: int = None) -> str:
         return f"Error: {path} is not a UTF-8 text file"
     except Exception as e:
         return f"Error: {e}"
+
+    freshness.record(p)  # file is now "seen": edit_file/write_file may touch it
 
     lines = text.splitlines()
     total_lines = len(lines)

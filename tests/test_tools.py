@@ -16,6 +16,7 @@ import pytest
 
 from minicc.tools import bash as bash_mod
 from minicc.tools import edit_file as edit_mod
+from minicc.tools import freshness
 from minicc.tools import grep as grep_mod
 from minicc.tools import read_file as read_mod
 from minicc.tools import write_file as write_mod
@@ -27,14 +28,17 @@ from minicc.tools import TOOLS, TOOL_HANDLERS
 def test_edit_replaces_unique_occurrence(tmp_path):
     f = tmp_path / "a.py"
     f.write_text("x = 1\ny = 2\n")
+    freshness.record(f)  # read-before-edit contract (contract itself: test_freshness)
     out = edit_mod.edit_file(str(f), "y = 2", "y = 3")
-    assert out == f"Edited {f}"
+    assert out.startswith(f"Edited {f} (lines 2-2):")
+    assert "y = 3" in out                    # post-edit snippet, no read-back needed
     assert f.read_text() == "x = 1\ny = 3\n"
 
 
 def test_edit_rejects_multiple_occurrences(tmp_path):
     f = tmp_path / "a.py"
     f.write_text("v = 0\nv = 0\n")
+    freshness.record(f)
     out = edit_mod.edit_file(str(f), "v = 0", "v = 1")
     assert out.startswith("Error:")
     assert "appears 2 times" in out
@@ -44,6 +48,7 @@ def test_edit_rejects_multiple_occurrences(tmp_path):
 def test_edit_rejects_missing_text(tmp_path):
     f = tmp_path / "a.py"
     f.write_text("hello\n")
+    freshness.record(f)
     out = edit_mod.edit_file(str(f), "nope", "x")
     assert out.startswith("Error:")
     assert "not found" in out

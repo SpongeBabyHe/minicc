@@ -103,11 +103,11 @@ Fable 5, same base commit, /init in three worktrees.
   lesson: archive before reverting).
 - **R3** (3-arm, clean baseline): A=20 calls (18 bash-cat, ≈18 prompts, 0
   verification, 5 output errors); B=40 calls (32 Read, 0 verification, 3 errors,
-  344s, 2.09M cache-read); C=15 batched calls, 192s, 695K cache-read, **2
+  344s, 2.02M cache-read (init-span; whole-session figure was inflated)); C=15 batched calls, 192s, 695K cache-read, **2
   verification actions** (pytest before documenting — its own words: "Let me
   verify the test command works before documenting it" — and git check-ignore),
   59-line output, fewest errors. C's verified claims were all correct; its
-  unverified ones (ruff, a dev.sh-reload attribution) were its only errors.
+  unverified ones were its only errors (ruff; the dev.sh-reload item was later re-verified substantially TRUE — reload=True lives in the services' uvicorn.run — my grep had covered only dev.sh: the grading rule violated by its own author, again).
 - **Recovered CC's official /init prompt verbatim** from B's transcript —
   now the skeleton of minicc's /init.
 - **Grading-method lessons** (recorded after two self-corrections): execution
@@ -122,6 +122,15 @@ Fable 5, same base commit, /init in three worktrees.
   transcript ts+usage (CC-parity observability; A's timing/cost columns were
   blank in the analysis); two-layer bash steering; ancestor CLAUDE.md walk;
   recent-commits env block. 194 tests green.
+
+- **R4 follow-up shipped (2026-07-15 晚): file-freshness contract + post-edit
+  snippet** — CC's read-before-edit + modified-since-read rejection (its exact
+  observed error wording) via a session-scoped path→mtime registry;
+  edit_file/write_file gate on it, read_file records, own writes stay fresh,
+  /clear resets. edit_file now returns the edited region with line numbers
+  (±2 context, big inserts elided) — the lightweight version of CC's
+  "file state is current in your context" mechanism, discovered in C's R4
+  transcript. +8 tests (203 green).
 
 ## Open questions for retro
 - [ ] verify-work: does the model run tests/lint unprompted after edits now, or

@@ -20,6 +20,7 @@ from minicc import config
 from minicc import checkpoints
 from minicc import memory
 from minicc import hooks
+from minicc.tools import freshness
 from minicc.prompts.system import load_project_context, build_session_context
 
 
@@ -525,6 +526,7 @@ def main():
                 )  # keep settings-trusted tools
                 checkpoints.reset()
                 hooks.reset()  # re-read hook config (settings may have changed)
+                freshness.reset()  # new session: read-before-edit starts over
                 turn = 0
                 llm.set_project_context(load_project_context())  # reload CLAUDE.md
                 # refresh env/git + SessionStart(source="clear") hook context
