@@ -162,6 +162,14 @@ def is_readonly_command(command: str) -> bool:
 
 _RULES: list | None = None  # [(pattern, compiled)] — lazy; reset() reloads
 
+# Grants from an invoked skill's allowed-tools frontmatter. Active until the
+# next user prompt (CC scopes grants to "while the skill is active"; its
+# disallowed-tools doc pins that window: "clears when you send your next
+# message"). bash(...) entries become temporary allow rules; bare names ungate
+# that tool outright. Never persisted. See SKILL_DESIGN.md.
+_SKILL_RULES: list = []  # [(pattern, compiled)]
+_SKILL_TOOLS: set = set()  # lowercase tool names
+
 
 def _glob_to_re(s: str) -> str:
     return ".*".join(re.escape(part) for part in s.split("*"))
@@ -188,7 +196,7 @@ def _subcommand_matches_rule(toks: list) -> bool:
     if not toks or "=" in toks[0]:
         return False
     cmd = " ".join(toks)
-    return any(rx.match(cmd) for _p, rx in _rules())
+    return any(rx.match(cmd) for _p, rx in [*_rules(), *_SKILL_RULES])
 
 
 def _bash_allowed(command: str) -> bool:
@@ -229,6 +237,8 @@ def _is_gated(tool_name: str, tool_input: dict) -> bool:
     for read-only commands and persisted allow rules (CC's carve-outs)."""
     if tool_name not in GATED_TOOLS:
         return False
+    if tool_name in _SKILL_TOOLS:
+        return False  # granted by an active skill's allowed-tools (until next prompt)
     if tool_name == "bash" and _bash_allowed(tool_input.get("command", "")):
         return False
     gated_cmds = _GATED_COMMANDS.get(tool_name)
@@ -333,12 +343,43 @@ def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
     return answer == "yes"
 
 
+_SKILL_BASH_RULE = re.compile(r"(?is)^bash\((.+)\)$")
+
+
+def grant_skill_tools(entries: list):
+    """Apply an invoked skill's allowed-tools for the rest of the turn.
+    `bash(git add *)` shapes use the same rule compiler as persisted rules
+    (case-insensitive on the tool name, CC-export friendly); bare names ungate
+    that tool. The grant is printed so temporary trust stays visible — the same
+    principle as the startup allow-rules line."""
+    for e in entries:
+        e = str(e).strip()
+        m = _SKILL_BASH_RULE.match(e)
+        if m:
+            pat = m.group(1).strip()
+            _SKILL_RULES.append((pat, _compile_rule(pat)))
+        elif e:
+            _SKILL_TOOLS.add(e.lower())
+    if entries:
+        ux.say(
+            "skill grants (until your next message): " + ", ".join(entries),
+            style=ux.S_INFO,
+        )
+
+
+def clear_skill_grants():
+    """Called on every new user prompt: skill grants don't outlive the turn."""
+    _SKILL_RULES.clear()
+    _SKILL_TOOLS.clear()
+
+
 def reset():
     """Clear the session-scoped allowed-tools set and drop the cached allow rules
     (re-read from settings on next use). Called by /clear."""
     global _RULES
     _ALLOWED.clear()
     _RULES = None
+    clear_skill_grants()
 
 
 def preload(tools) -> set:

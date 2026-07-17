@@ -82,6 +82,16 @@ def web_search_enabled() -> bool:
     return v is not False
 
 
+def skill_shell_disabled() -> bool:
+    """CC's `disableSkillShellExecution` setting (same key, either file): when
+    true, !`cmd` / ```! blocks in skills are replaced with a policy notice
+    instead of running. Default false."""
+    g, p = _read(_global()), _read(_project())
+    return bool(
+        g.get("disableSkillShellExecution") or p.get("disableSkillShellExecution")
+    )
+
+
 def resolve_cache_ttl() -> str:
     """Cache TTL for the stable prefix layers: project > global > "5m".
     Only "5m" and "1h" are valid (the API's two tiers); anything else falls back

@@ -87,8 +87,12 @@ boundaries (the denylist still misses e.g. `rm -rf ~`).
 > `bash(prefix *)` rules and the read-only carve-out at the permission layer —
 > but the EXECUTION layer remains unconfined either way.)
 
-## Persisting trust — three lifetimes, and the principle that separates them
+## Persisting trust — four lifetimes, and the principle that separates them
 
+- **A skill's `allowed-tools`** (2026-07-16) — the shortest lifetime: rules or
+  tool names granted when a skill is invoked, cleared at the **next user
+  message** (CC's window). Printed when applied ("skill grants (until your
+  next message): …"). Never persisted; `reset()` clears it too.
 - **`'all'` at a prompt** — whole-tool, session only (in-memory; gone on
   restart / `/clear`).
 - **`allowed_tools` in `settings.json`** — whole-tool, hand-edited, persistent.

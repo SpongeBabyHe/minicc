@@ -1,7 +1,7 @@
 from minicc import config
-from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, web_fetch, web_search
+from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, skill, web_fetch, web_search
 
-_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, web_fetch]
+_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, skill, web_fetch]
 # web_search is SERVER-executed (no client handler; see tools/web_search.py). It's
 # offered unless settings disable it ("web_search": false) — necessary because an
 # org that disabled web search in the Console 400s any request that includes it.

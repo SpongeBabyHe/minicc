@@ -50,8 +50,10 @@ Where each kind of fact belongs:
 
 Minimalism applies to the **number of tools** and the **size of responses** — not
 to per-tool semantic detail. minicc keeps a small set of focused, non-overlapping
-tools (11 as of 2026-07: file/search six + task, todo_write, memory, web_fetch,
-web_search); each one earns a detailed description.
+tools (12 as of 2026-07: file/search six + task, todo_write, memory, skill,
+web_fetch, web_search); each one earns a detailed description. (`skill` keeps
+its description static and small — the volatile listing rides a
+`<system-reminder>` instead; see SKILL_DESIGN.md.)
 
 ---
 
