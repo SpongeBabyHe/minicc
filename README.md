@@ -14,6 +14,7 @@ code in your project. It runs an agent loop with these tools:
 - `task` — delegate exploration to a read-only subagent (own context, cheaper model)
 - `todo_write` — a model-maintained task list for long work
 - `memory` — cross-session auto-memory (index + topic files)
+- `skill` — invoke packaged instructions from `.minicc/skills/` (user side: `/<name>`)
 - `web_fetch` / `web_search` — read a URL (url+prompt extraction) / search the web
 
 Gated operations (`bash`, `write_file`, `edit_file`, `web_fetch`, memory
@@ -23,8 +24,9 @@ session. Reads are never gated. See `PERMISSIONS.md`.
 Beyond the loop: prompt caching + two-band context management (eviction →
 compaction; `CONTEXT_MANAGEMENT.md`), session persistence with
 `--continue`/`--resume` (`SESSIONS.md`), file checkpoints + `/rewind`
-(`CHECKPOINT.md`), streaming markdown output (`STREAMING.md`), and
-Claude Code-compatible hooks (`HOOKS.md`).
+(`CHECKPOINT.md`), streaming markdown output (`STREAMING.md`),
+Claude Code-compatible hooks (`HOOKS.md`), SKILL.md skills with
+CC's `<system-reminder>` context injection (`SKILL_DESIGN.md`).
 
 ## Run
 

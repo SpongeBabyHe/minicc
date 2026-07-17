@@ -84,6 +84,69 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   Main session only (SubagentStop unwired). +5 loop tests (166 green). Hooks
   feature COMPLETE → next: dogfood (llm-wiki worktree twin).
 
+- 2026-07-16: shipped **skills** — CC's SKILL.md contract from the official
+  docs (fetched same day, full page): personal/project discovery with ancestor
+  walk, frontmatter (shallow hand-rolled YAML; malformed → body with empty
+  metadata, CC's documented failure mode), /name + `skill` tool (listing rides
+  the tool description), $ARGUMENTS/$N/named/${CLAUDE_*} substitutions with
+  CC's escape semantics, !`cmd`/```! shell preprocessing (single pass, subst
+  first, disableSkillShellExecution honored), allowed-tools grants scoped to
+  next-user-prompt, re-invoke dedup note. Cuts ledger in SKILLS.md (fork,
+  plugins, watchers — listing is session-static for cache economics). +21
+  tests (224 green). Watch in dogfood: does the model invoke a matching skill
+  unprompted, and does the static listing staleness ever bite?
+
+- 2026-07-16 (same day, follow-up): **system-reminder injection** — user asked
+  why CC's hot updates don't bust prompt caching; digging in exposed that my
+  skills-listing placement (tool description, session-static) matched CC's
+  LEGACY layout (SLASH_COMMAND_TOOL_CHAR_BUDGET is the fossil). Current CC
+  injects claudeMd/memory/date/skill-listing as <system-reminder> blocks in
+  the MESSAGE STREAM (append-side = cache-free updates; verified: live CC
+  session observation + CC's own tool descriptions + B/C transcripts carrying
+  zero reminders — they're re-derived, never persisted). Rebuilt to match:
+  reminders.py (inject on first prompt / on change / on loss-from-history —
+  self-healing via history scan) + watch.py (generic polling primitive, built
+  for agent-teams reuse); CLAUDE.md + MEMORY.md left the prefix-cache layers
+  entirely (3 of 4 breakpoints used now, one spare); date moved to
+  # currentDate (a date in a cached prefix goes stale at midnight). Side
+  benefit: memory writes reach context mid-session, not just at /clear.
+  +10 tests (233 green). Lesson for the honesty ledger: I presented "listing
+  rides the tool description" as CC fact when it was an unverified assumption
+  — the user's "为什么CC热更新不会打乱caching" question caught it.
+
+- 2026-07-16 (late, corrections): re-fetching CC's memory doc for the docs/
+  update caught TWO fidelity errors in the same-day reminder work: (1) I had
+  claude_md/MEMORY.md hot-reloading on mtime change — CC loads them "at the
+  start of every conversation" and re-injects only after loss (compact/clear);
+  only SKILLS have documented live change detection. Reverted to loss-only
+  re-injection (constant snapshot = fire-once latch). (2) minicc truncated
+  CLAUDE.md at 200 lines/25KB "per CC's limits" — the official page says
+  "CLAUDE.md files are loaded in full regardless of length; this limit applies
+  only to MEMORY.md". Truncation removed. Bonus: the doc states the delivery
+  placement outright ("delivered as a user message after the system prompt")
+  — the three-way inference from earlier today is now doc-confirmed. Ledger
+  lesson repeated: extrapolating one documented behavior (skills live-reload)
+  to a neighboring feature (CLAUDE.md) is the same class of error as the
+  half-grep. Worse (user caught the contradiction between the shipped commit
+  and this correction): the refuting fact was ALREADY in the repo's own
+  lighthouse — docs/CC_CONTEXT_MANAGEMENT.md (mtime Jul 10, six days before
+  the reminder work) says CLAUDE.md edits "don't apply until restart//clear —
+  CC chooses ignore" — and I wrote the hot-reload without grepping it. New
+  gate: a CC-parity behavior claim needs a cited source (official doc /
+  observation / probe) BEFORE implementation — grep docs/ lighthouses first;
+  no source = don't build it, record it as an assumption. 232 green.
+  - Full pre-commit audit (user-ordered, no-memory rules): 16 skills-doc +
+    5 memory-doc quotes re-verified verbatim; both commit trees rebuilt via
+    git archive and rerun (224/233 exact); 8 doc examples executed black-box
+    — all pass. Two live CC CLI probes: (a) confirmed the claudeMd
+    "(project instructions, checked into the codebase)" label — the last
+    training-memory item, now observed; (b) a $0-only skill got NO
+    "ARGUMENTS:" append → minicc's any-placeholder-consumes reading matches
+    CC's implementation over its doc's letter. Probe bonus shipped same
+    audit: user-side skill expansion envelope (<command-message>/<command-
+    name>/<command-args> + "Base directory for this skill:") and the
+    single-newline reminder byte format.
+
 - 2026-07-05: shipped **verify-work stance** (system-prompt "Verify your work"
   section: run tests/lint after editing, fix before reporting done). Source: it's
   CLAUDE_CODE_DESIGN.md's flagged "biggest single opportunity" + RALPH precondition,
@@ -131,6 +194,18 @@ Fable 5, same base commit, /init in three worktrees.
   (±2 context, big inserts elided) — the lightweight version of CC's
   "file state is current in your context" mechanism, discovered in C's R4
   transcript. +8 tests (203 green).
+
+- **2026-07-17: survey-driven A-group landed** — user reset the two skill
+  commits and ordered a fresh full survey before recommitting. Three probes
+  closed the open questions: /init persists as tags-record + isMeta-record
+  (B transcript line 4/5 — the expansion IS persisted, unlike reminders);
+  Skill tool_result carries the base-dir header on the model path too; the
+  listing lives in a post-system block, not the tool description (first probe
+  answered NONE — single negative probes lie; triangulate). Shipped: two-
+  record expansion with sessions `meta` flag (/init included), base-dir on
+  both paths; SKILLS.md superseded by SKILL_DESIGN.md (survey + evidence
+  classes + next-steps ledger). E2E re-verified live (record shapes + zero
+  reminder persistence + model received injection). 233 green.
 
 ## Open questions for retro
 - [ ] verify-work: does the model run tests/lint unprompted after edits now, or

@@ -226,18 +226,17 @@ def test_tools_carry_no_cache_breakpoint():
 
 
 def test_request_stays_within_four_breakpoints(monkeypatch):
-    """system + project + session + the rolling conversation marker = exactly the
-    API's 4 cache breakpoints, and never more."""
-    llm.set_project_context("# Project context\nstuff")
+    """system + session + the rolling conversation marker = 3 of the API's 4
+    cache breakpoints (one spare). CLAUDE.md / memory / skills are NOT prefix
+    layers — they ride <system-reminder> messages (reminders.py, CC parity)."""
     llm.set_session_context("# Session context\n- cwd: /x")
     try:
         system_blocks = llm._build_system_block()
         sys_bps = sum(1 for b in system_blocks if "cache_control" in b)
         convo_bps = 1  # _cacheable marks the last message
-        assert sys_bps == 3                 # system + project + session
-        assert sys_bps + convo_bps == 4     # the full budget, not over it
+        assert sys_bps == 2                 # system + session
+        assert sys_bps + convo_bps <= 4     # within the budget, one spare
     finally:
-        llm.set_project_context("")
         llm.set_session_context("")
 
 
@@ -246,7 +245,6 @@ def test_stable_prefix_ttl_conversation_stays_default(monkeypatch):
     conversation breakpoint keeps the default 5m (the API requires longer-TTL
     breakpoints to precede shorter ones — stable layers render first)."""
     monkeypatch.setattr(llm, "CACHE_TTL", "1h")
-    llm.set_project_context("# P\nx")
     llm.set_session_context("# S\ny")
     try:
         blocks = llm._build_system_block()
@@ -256,28 +254,24 @@ def test_stable_prefix_ttl_conversation_stays_default(monkeypatch):
         out = llm._cacheable([{"role": "user", "content": "hi"}])
         assert out[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     finally:
-        llm.set_project_context("")
         llm.set_session_context("")
 
 
 def test_session_context_is_volatile_last(monkeypatch):
     """Session context is the LAST system block (so a change never busts the static
     prefix above it) and carries its own cache breakpoint; static SYSTEM stays first."""
-    llm.set_project_context("# Project\nx")
-    llm.set_session_context("# Session context\n- Date: 2026-07-01")
+    llm.set_session_context("# Session context\n- cwd: /x")
     try:
         blocks = llm._build_system_block()
         assert blocks[0]["text"] == llm.SYSTEM                     # static first
         assert blocks[-1]["text"].startswith("# Session context")  # volatile last
         assert "cache_control" in blocks[-1]
     finally:
-        llm.set_project_context("")
         llm.set_session_context("")
 
 
 def test_no_session_block_when_unset():
     """Unset (e.g. sub-agents / tests) → no session block appears."""
-    llm.set_project_context("")
     llm.set_session_context("")
     blocks = llm._build_system_block()
     assert len(blocks) == 1 and blocks[0]["text"] == llm.SYSTEM
@@ -291,7 +285,10 @@ def test_build_session_context_has_env(monkeypatch, tmp_path):
     ctx = build_session_context()
     assert ctx.startswith("# Session context")
     assert str(tmp_path) in ctx
-    assert "Date:" in ctx and "Platform:" in ctx
+    assert "Platform:" in ctx
+    # the date is NOT here: it rides the claudeMd reminder as # currentDate
+    # (CC parity) — a date in a cached prefix would go stale mid-session
+    assert "Date:" not in ctx
 
 
 # ─── L3: eviction keeps recent N ─────────────────────────────────────────────

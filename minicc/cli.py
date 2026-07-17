@@ -20,8 +20,10 @@ from minicc import config
 from minicc import checkpoints
 from minicc import memory
 from minicc import hooks
+from minicc import reminders
+from minicc import skills
 from minicc.tools import freshness
-from minicc.prompts.system import load_project_context, build_session_context
+from minicc.prompts.system import build_session_context
 
 
 # Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
@@ -147,7 +149,7 @@ def _session_info() -> dict:
         "os": platform.system(),
     }
     if (Path.cwd() / "CLAUDE.md").exists():
-        info["CLAUDE.md"] = "loaded"
+        info["CLAUDE.md"] = "found (injected as a system-reminder at first prompt)"
     return info
 
 
@@ -172,6 +174,14 @@ def _cmd_help():
                     "List restore points; restore code (default) | conversation | both",
                 ),
                 ("q / exit / quit", "Leave minicc"),
+            ]
+            + [  # user-invocable skills (SKILL_DESIGN.md); rescan = live view
+                (
+                    f"/{n}" + (f" {sk.hint}" if sk.hint else ""),
+                    f"skill: {sk.description[:100]}",
+                )
+                for n, sk in sorted(skills.discover().items())
+                if sk.meta.get("user-invocable") is not False
             ]
         )
     )
@@ -251,7 +261,8 @@ def _cmd_memory(arg: str | None):
     retire stale facts, fix dates, tighten the index)."""
     if arg in ("on", "off"):
         memory.set_enabled(arg == "on")
-        llm.set_memory_index(memory.load_index())  # refresh what's injected
+        # no file changed, so the reminder poller wouldn't notice — force it
+        reminders.invalidate()
         ux.say(f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO)
         return
     if arg == "consolidate":
@@ -263,7 +274,7 @@ def _cmd_memory(arg: str | None):
             style=ux.S_INFO,
         )
         summary = memory.consolidate()
-        llm.set_memory_index(memory.load_index())  # reload the tidied index
+        # the tidied MEMORY.md re-injects via the reminder poller at next prompt
         ux.markdown(summary)
         return
     if arg:
@@ -458,16 +469,18 @@ def main():
     histfile = _setup_history()
     checkpoints.reset()  # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
     hooks.reset()  # load hook config from settings.json for this session
+    skills.reset(session_id)  # ${CLAUDE_SESSION_ID} + fresh already-loaded tracking
+    reminders.reset()  # claudeMd/skills reminders inject on the first prompt
     requested = config.allowed_tools()
     pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
-    llm.set_project_context(load_project_context())
-    # env + git snapshot (layer 3) + SessionStart hook context (fires here; CC
-    # sources: "resume" when picking up an existing transcript, else "startup")
+    # env + git snapshot (layer 2) + SessionStart hook context (fires here; CC
+    # sources: "resume" when picking up an existing transcript, else "startup").
+    # CLAUDE.md / memory index / skill listing are NOT loaded here: they ride
+    # <system-reminder> messages injected at prompt time (reminders.py, CC parity).
     llm.set_session_context(
         _session_context_with_hooks(session_id, "resume" if history else "startup")
     )
-    llm.set_memory_index(memory.load_index())          # auto-memory index (rides layer 2)
     ux.console.rule()
     ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
     if pre_approved:
@@ -481,6 +494,9 @@ def main():
             f"bash allow rules from settings: {', '.join(bash_rules)}",
             style=ux.S_INFO,
         )
+    skill_names = sorted(skills.discover())
+    if skill_names:
+        ux.say(f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
     if refused:
         ux.say(
             f"settings list {', '.join(refused)} but it can't be pre-approved "
@@ -503,10 +519,20 @@ def main():
             continue
         if query.lower() in ("q", "exit", "quit"):
             break
+        # Skill allowed-tools grants last until the NEXT message (CC's window) —
+        # this input is that message; a skill invoked below re-grants for itself.
+        permissions.clear_skill_grants()
 
+        # A slash-command turn expands into CC's two-message shape (probed live;
+        # same in B's /init transcript): a command-tags user message + the
+        # expansion user message (transcript marks the second `meta`, CC's isMeta).
+        expansion = None  # (tags, expanded content) when this turn is an expansion
         if query.strip() == "/init":
             ux.say("scanning the project to write CLAUDE.md ...", style=ux.S_INFO)
-            query = _INIT_PROMPT
+            expansion = (
+                "<command-message>init</command-message>\n<command-name>/init</command-name>",
+                _INIT_PROMPT,
+            )
             # fall through: run as a normal agent turn (tools + streaming + persist)
         elif query.startswith("/"):
             # split into command word + optional argument (e.g. /compact <focus>)
@@ -527,13 +553,13 @@ def main():
                 checkpoints.reset()
                 hooks.reset()  # re-read hook config (settings may have changed)
                 freshness.reset()  # new session: read-before-edit starts over
+                skills.reset(session_id)  # new session id; forget loaded skills
+                reminders.reset()  # fresh claudeMd/skills reminders on next prompt
                 turn = 0
-                llm.set_project_context(load_project_context())  # reload CLAUDE.md
                 # refresh env/git + SessionStart(source="clear") hook context
                 llm.set_session_context(_session_context_with_hooks(session_id, "clear"))
-                llm.set_memory_index(memory.load_index())         # reload memory index
                 ux.say(
-                    "conversation, permissions reset; CLAUDE.md reloaded",
+                    "conversation, permissions reset",
                     style=ux.S_INFO,
                 )
             elif cmd == "/cost":
@@ -551,13 +577,26 @@ def main():
             elif cmd == "/rewind":
                 _cmd_rewind(history, arg, session_id=session_id)
             else:
-                ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
-            continue
+                # not a built-in — try a skill (built-ins win a name clash, like
+                # CC's built-in commands; skills can't shadow /clear or /help)
+                expansion = skills.user_invoke(cmd[1:], arg or "")
+                if expansion is None:
+                    ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
+            if expansion is None:
+                continue
+            ux.say(f"skill: {cmd[1:]}", style=ux.S_INFO)
+            # fall through: the expansion runs as a normal agent turn (the
+            # /init pattern) — tools, streaming, transcript persist
 
         # UserPromptSubmit hook: fires before Claude processes the prompt. It can
         # reject the prompt (block / continue:false) or inject context for this turn.
-        # Runs only for real prompts, not slash commands (those are handled above).
-        prompt_hook = hooks.run("UserPromptSubmit", session_id=session_id, user_prompt=query)
+        # Runs only for real prompts, not slash commands (those are handled above);
+        # for an expansion turn it sees the expanded content, as before.
+        prompt_hook = hooks.run(
+            "UserPromptSubmit",
+            session_id=session_id,
+            user_prompt=expansion[1] if expansion else query,
+        )
         for m in prompt_hook.system_messages:
             ux.say(f"[hook] {m}", style=ux.S_INFO)
         if prompt_hook.block or prompt_hook.stop:
@@ -572,9 +611,24 @@ def main():
         # transcript position BEFORE this turn's user message — the replay target
         # if a later `/rewind N conversation` returns to this turn
         events = sessions.event_count(session_id)
-        user_msg = {"role": "user", "content": query}
-        history.append(user_msg)
-        sessions.append_message(session_id, user_msg)  # append-only transcript
+        # <system-reminder> injection (CC's mechanism): claudeMd / skill listing
+        # ride INSIDE the user turn, reminder text first (observed shape of CC's
+        # own turns). The transcript stores only the typed/expanded text —
+        # reminders are ephemeral (CC parity: its session JSONLs carry none),
+        # so resume/rewind/compact self-heal via re-injection at the next prompt.
+        # Being past `mark`, an interrupted turn rolls them back too.
+        prefix = "".join(f"{n}\n" for n in reminders.for_prompt(history))
+        if expansion:
+            tags, expanded = expansion
+            history.append({"role": "user", "content": prefix + tags})
+            sessions.append_message(session_id, {"role": "user", "content": tags})
+            history.append({"role": "user", "content": expanded})
+            sessions.append_message(
+                session_id, {"role": "user", "content": expanded}, meta=True
+            )
+        else:
+            history.append({"role": "user", "content": prefix + query})
+            sessions.append_message(session_id, {"role": "user", "content": query})
         # Hook-injected context rides as an extra user message for this turn (CC adds
         # additionalContext to the model's context alongside the prompt).
         for ctx in prompt_hook.additional_context:

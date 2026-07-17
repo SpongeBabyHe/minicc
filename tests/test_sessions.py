@@ -71,6 +71,25 @@ def test_append_load_round_trip(tmp_path, monkeypatch):
     assert (tmp_path / ".minicc" / ".gitignore").read_text() == "*\n"
 
 
+def test_meta_flag_marks_expansion_record_only(tmp_path, monkeypatch):
+    """A slash expansion persists as CC's two-record pair: tags message, then
+    the expanded content with `meta: true` on the RECORD (CC's isMeta). The
+    flag never reaches the replayed API message."""
+    monkeypatch.chdir(tmp_path)
+    sid = "20260717_090000"
+    sessions.append_message(sid, {"role": "user", "content": "<command-name>/x</command-name>"})
+    sessions.append_message(sid, {"role": "user", "content": "expanded body"}, meta=True)
+
+    raw = [json.loads(l) for l in
+           (tmp_path / ".minicc" / "sessions" / f"{sid}.jsonl").read_text().splitlines()]
+    assert "meta" not in raw[0] and raw[1]["meta"] is True
+    # replayed history carries plain API messages — no meta key leaks
+    assert sessions.load(sid) == [
+        {"role": "user", "content": "<command-name>/x</command-name>"},
+        {"role": "user", "content": "expanded body"},
+    ]
+
+
 def test_compaction_boundary_reconstructs(tmp_path, monkeypatch):
     """load replays: msg events append, a compact event RESETS to its state — so
     resume yields [summary] + kept tail + anything appended after the boundary."""

@@ -58,12 +58,16 @@ a tight index; add a one-line pointer there when you create a topic file.
 
 ## How it wires into the rest
 
-- **Cache layer** — the `MEMORY.md` index is **merged into the project-context block**
-  next to CLAUDE.md (one breakpoint), so it rides the project cache and reloads with
-  it. See [CONTEXT_MANAGEMENT.md](CONTEXT_MANAGEMENT.md) § L1.
-- **Lifecycle** — index loaded at startup; **reloaded on `/clear`** (memory *persists*
-  across `/clear` — only the in-context snapshot reloads); survives compaction the
-  same way (re-read from disk), matching CC's "project memory survives compaction."
+- **Delivery** — the `MEMORY.md` index rides the **claudeMd `<system-reminder>`**
+  next to CLAUDE.md, with CC's exact label ("user's auto-memory, persists across
+  conversations") — a message-stream injection, not a prefix cache layer (that was
+  the pre-2026-07-16 design). See `reminders.py` and
+  [CONTEXT_MANAGEMENT.md](CONTEXT_MANAGEMENT.md) § caching.
+- **Lifecycle** — injected on the first prompt; **re-injected when the copy is
+  lost from history** (compaction — CC: "re-injected from disk" — /clear, resume)
+  or on `/memory on|off` (invalidate). Mid-session writes are NOT re-injected
+  (CC loads the index "at the start of every conversation"; the model reads
+  fresh memory on demand via the memory tool instead).
 - **Gating** — writes (`create`/`str_replace`/`delete`) go through the permission
   prompt like `write_file`; **`view` is ungated** so the model can always read memory.
   Command-aware gating lives in `permissions.py`.

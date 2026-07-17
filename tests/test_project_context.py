@@ -3,22 +3,23 @@
 The pinned behavior: a CLAUDE.md in ANY ancestor directory is loaded
 automatically (CC's monorepo feature — observed live when a stray
 ~/Documents/CLAUDE.md was silently injected into every project under it),
-outermost first, nearest last.
+outermost first, nearest last. Delivery — the claudeMd system-reminder with
+per-file "Contents of <path> …" labels — is covered in test_reminders.py;
+this file pins the walk itself.
 """
 
 import os
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
-from minicc.prompts.system import load_project_context
+from minicc.prompts.system import claude_md_files
 
 
 def test_cwd_claude_md_loads(tmp_path, monkeypatch):
     (tmp_path / "CLAUDE.md").write_text("# Local rules")
     monkeypatch.chdir(tmp_path)
-    out = load_project_context()
-    assert "# Local rules" in out
-    assert "— from" not in out  # cwd's own file carries no path label
+    files = claude_md_files()
+    assert files == [(tmp_path / "CLAUDE.md", "# Local rules")]
 
 
 def test_ancestor_claude_md_loads_outermost_first(tmp_path, monkeypatch):
@@ -27,22 +28,24 @@ def test_ancestor_claude_md_loads_outermost_first(tmp_path, monkeypatch):
     sub.mkdir(parents=True)
     (sub / "CLAUDE.md").write_text("SUBPROJECT RULES")
     monkeypatch.chdir(sub)
-    out = load_project_context()
+    files = claude_md_files()
     # both present; outermost first so the nearest file reads last (wins)
-    assert out.index("ROOT CONVENTIONS") < out.index("SUBPROJECT RULES")
-    assert f"— from {tmp_path}" in out  # ancestor files are labeled with their path
+    assert [t for _p, t in files] == ["ROOT CONVENTIONS", "SUBPROJECT RULES"]
+    assert files[0][0] == tmp_path / "CLAUDE.md"  # each carries its real path
 
 
 def test_no_claude_md_anywhere(tmp_path, monkeypatch):
     sub = tmp_path / "deep"
     sub.mkdir()
     monkeypatch.chdir(sub)
-    assert load_project_context() == ""
+    assert claude_md_files() == []
 
 
-def test_per_file_truncation_still_applies(tmp_path, monkeypatch):
+def test_claude_md_loads_in_full(tmp_path, monkeypatch):
+    """No truncation — CC's memory doc: "CLAUDE.md files are loaded in full
+    regardless of length"; the 200-line/25KB cap is MEMORY.md-only."""
     (tmp_path / "CLAUDE.md").write_text("\n".join(f"line{i}" for i in range(300)))
     monkeypatch.chdir(tmp_path)
-    out = load_project_context()
-    assert "line199" in out and "line250" not in out
-    assert "truncated at 200 lines" in out
+    (_path, text), = claude_md_files()
+    assert "line299" in text
+    assert "truncated" not in text

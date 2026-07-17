@@ -66,8 +66,10 @@ def _resolve(mem_path: str) -> Path:
 
 
 def load_index() -> str:
-    """The MEMORY.md index for injection into the project-context layer — first 200
-    lines / 25 KB, whichever comes first. "" if disabled or there's no memory yet."""
+    """The MEMORY.md index text — first 200 lines / 25 KB, whichever comes
+    first. "" if disabled or there's no memory yet. Injected by reminders.py as
+    a "Contents of <path> (user's auto-memory, …)" section of the claudeMd
+    system-reminder (CC's label and placement), so no header of its own here."""
     if not _enabled:
         return ""
     idx = store_dir() / INDEX_NAME
@@ -82,7 +84,7 @@ def load_index() -> str:
     lines = text.splitlines()
     if len(lines) > _INDEX_MAX_LINES:
         text = "\n".join(lines[:_INDEX_MAX_LINES])
-    return f"# Auto-memory index (from MEMORY.md — read topic files on demand)\n\n{text}"
+    return text
 
 
 # ─── tool operations (return CC-style strings; the model reads whatever we return) ──

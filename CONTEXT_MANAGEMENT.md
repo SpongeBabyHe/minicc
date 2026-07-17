@@ -21,7 +21,7 @@ where it's silent minicc makes (and labels) its own choice.
 
 | Layer | Concern | What it does |
 | ----- | ------- | ------------ |
-| **L1** | cost | Prompt cache: stable prefix (system+tools, project, session env/git) **and** conversation history. CLAUDE.md as project memory. |
+| **L1** | cost | Prompt cache: stable prefix (system+tools, session env/git) **and** conversation history. CLAUDE.md/memory/skills ride `<system-reminder>` messages, not prefix layers (reminders.py). |
 | **L2** | size | Cap each tool's output at the source so one call can't flood the history. |
 | **L3** | size | **Auto, incremental:** above `CLEAR_TRIGGER` blank out the oldest `tool_result` content — `clear_at_least`-guarded so it only breaks the cache when it frees enough (CC: clear tool outputs first). |
 | **L4** | size | **Primary lever:** when context nears the model window, summarize the history into a fresh, shorter prefix (on a warm cache). |
@@ -54,28 +54,38 @@ minicc places breakpoints to match how often each region changes:
   groups them). A separate tools breakpoint would only help if system changed
   while tools didn't — which never happens within a session, since the system
   prompt is frozen at construction.
-- **Project context** — a second breakpoint after CLAUDE.md (first 200 lines /
-  25 KB). It changes only on `/clear`, so keeping it separate lets a CLAUDE.md
-  reload re-cache while the system+tools layer survives. The **auto-memory
-  MEMORY.md index** (cross-session memory) is merged into this same block, beside
-  CLAUDE.md, so it rides the project-context cache and reloads together on `/clear`.
-- **Session context** — a third breakpoint after the env/git block
-  (`build_session_context`: cwd, platform, date, and a git snapshot). It's
-  **volatile-last** — placed after the static layers so its only change (a `/clear`
-  refresh) can't bust system+tools or project above it. This is where the fourth
-  breakpoint goes; the env used to be baked into the static system prompt, which
-  mixed per-session content into the most-stable layer.
+- **Session context** — a second breakpoint after the env/git block
+  (`build_session_context`: cwd, platform, and a git snapshot — CC keeps env +
+  gitStatus in its system prompt too). It's **volatile-last** — placed after the
+  static layer so its only change (a `/clear` refresh) can't bust system+tools
+  above it. The env used to be baked into the static system prompt, which mixed
+  per-session content into the most-stable layer.
 - **Conversation history** — `_cacheable` marks the last block of the most-recent
   message every turn (the standard rolling-breakpoint pattern). The next turn
   reads the whole prior history from cache; only the new exchange is fresh.
 
-That uses all **four** of the API's breakpoints per request (system+tools /
-project / session / conversation) — the static→dynamic layer stack CC uses. A
+**CLAUDE.md, the auto-memory MEMORY.md index, the current date, and the skill
+listing are NOT prefix layers** (they were, until 2026-07-16). CC delivers them
+as `<system-reminder>` blocks in the *message stream* — its memory doc says it
+outright: *"CLAUDE.md content is delivered as a user message after the system
+prompt, not as part of the system prompt itself"* — and minicc now does the
+same (`reminders.py`). Re-injection is per-kind, matching each documented CC
+behavior: the **skills listing** re-injects when the skill set changes
+(`watch.py` mtime poll — skills have documented live change detection); the
+**claudeMd block** re-injects only when its copy is LOST from the live history
+(post-compact — *"Claude re-reads it from disk and re-injects it"* — /clear,
+resume, rewind), never on a mid-session edit. Either way the update is one
+appended block instead of a busted prefix layer.
+
+That uses **three** of the API's four breakpoints per request (system+tools /
+session / conversation) — the static→dynamic layer stack CC uses, one spare. A
 would-be *conversation anchor* (a second history breakpoint to stay inside the
-20-block cache lookback on ≈10+ parallel-tool turns) would need a 5th slot minicc
-doesn't have, so it stays deferred — and it's marginal anyway: minicc re-marks the
-last message every call, so consecutive requests differ by only a couple of blocks
-and the common case is already inside the lookback window.
+20-block cache lookback on ≈10+ parallel-tool turns) now HAS a free slot — the
+reminder refactor released the old project-context breakpoint — but stays
+deferred on the merits: minicc re-marks the last message every call, so
+consecutive requests differ by only a couple of blocks and the common case is
+already inside the lookback window. It's a dogfood-signal-first change now,
+not a budget problem.
 
 **Economics.** Cache write costs 1.25× input, read 0.1×, break-even at two
 requests. A 50K-token history on Sonnet ($3/M in) is ~$0.15/turn uncached vs
@@ -221,8 +231,9 @@ glob 100 by mtime; read `offset`/`limit` pagination; **two-band sizing** — cle
 older tool outputs first (**official context-editing defaults**: `trigger` 100K,
 `keep` 3, `clear_at_least`-guarded), then a **`window − 13K` compaction trigger**
 (CC's `effectiveContextWindow − 13K`) only if still needed; real token accounting
-from `usage`; the **9-section** compact summary; cache layers system / project /
-session / conversation (env/git volatile-last); CLAUDE.md first 200 lines or 25 KB;
+from `usage`; the **9-section** compact summary; cache layers system / session /
+conversation (env/git volatile-last; CLAUDE.md rides `<system-reminder>`
+messages, loaded in full — the 200-line/25 KB cap is MEMORY.md-only);
 `/compact [focus]`; `/recap` is cache-safe.
 
 **minicc's own** (CC silent, or the value is minicc's judgment): `CLEAR_AT_LEAST = 5K`
@@ -242,7 +253,7 @@ The backlog — each feature with what it buys and why it waits.
 | ------- | ------------ | ------------ |
 | **Auto-triggered consolidation** (CC: background, >24h AND >5 sessions — community-observed) | memory tidies itself without a manual command | `/memory consolidate` (manual) shipped; wire an idle trigger once dogfood shows the cadence |
 | **Tuning** (`KEEP_RECENT_MESSAGES` — no CC target, API example is 3; `CLEAR_AT_LEAST` value) | closer to CC's defaults | low-risk polish; wants dogfood data; **future work** |
-| **Dynamic cache breakpoint** (conversation anchor) | a 2nd history breakpoint for the 20-block lookback on block-heavy turns | all 4 breakpoints are now used (system/project/session/conversation), so this would need displacing a layer; marginal anyway (minicc re-marks every call) — wait for a dogfood signal |
+| **Dynamic cache breakpoint** (conversation anchor) | a 2nd history breakpoint for the 20-block lookback on block-heavy turns | a slot is FREE since the reminder refactor released the project-context breakpoint (2026-07-16); still marginal (minicc re-marks every call) — wait for a dogfood signal |
 | **User-input source cap** | bound the one unbounded input (a huge pasted message) so it can't reach L5 | L5 already backstops it; turns a hard failure into a graceful one |
 | Server-side compaction (`compact-2026-01-12`) | summarize server-side, no extra round-trip | build-vs-buy — the hand-rolled L4 is the portfolio substance; server-side is the production swap |
 

@@ -122,20 +122,17 @@ def test_memory_is_preloadable_from_config():
     permissions.reset()
 
 
-# ─── the index rides the project-context cache layer (one breakpoint) ─────────
-def test_memory_index_rides_project_layer():
-    from minicc import llm
-    llm.set_project_context("# Project\nP")
-    llm.set_memory_index("# Auto-memory\nM")
-    try:
-        blocks = llm._build_system_block()
-        project_block = blocks[1]["text"]
-        assert "# Project" in project_block and "# Auto-memory" in project_block  # merged
-        # merged into ONE block → system + project(+memory) = 2 breakpoints, no 5th
-        assert sum(1 for b in blocks if "cache_control" in b) == 2
-    finally:
-        llm.set_project_context("")
-        llm.set_memory_index("")
+# ─── the index rides the claudeMd system-reminder (CC parity) ─────────────────
+def test_memory_index_rides_claude_md_reminder(store):
+    """The MEMORY.md index is delivered inside the claudeMd reminder with CC's
+    exact label — not as a system-prompt cache layer (see reminders.py)."""
+    from minicc import reminders
+
+    memory.create("/memories/MEMORY.md", "- [Fact](f.md) — a hook")
+    text = reminders._claude_md_text()
+    assert "(user's auto-memory, persists across conversations):" in text
+    assert "- [Fact](f.md) — a hook" in text
+    assert str(store / "MEMORY.md") in text  # labeled with its real path
 
 
 def test_delete_file_and_guards(store):

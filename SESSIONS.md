@@ -143,7 +143,16 @@ sub-agents pass `None`, so their isolated context is never recorded):
   - `--continue` → resume the most recent session in this cwd.
   - `--resume <id>` → resume a specific session.
   - no flag → fresh session.
-- **On resume**: load history, reload CLAUDE.md fresh (same as startup), continue.
+- **On resume**: load history, continue. CLAUDE.md/memory/skills context arrives
+  fresh via `<system-reminder>` injection on the first prompt (reminders.py) —
+  the transcript carries **no reminders** (CC parity: they're re-derived at
+  request time, never persisted), so a resumed session can't replay stale ones.
+- **Slash expansions** (`/init`, `/skill-name`): persisted as CC's two-record
+  pair — the command-tags user message, then the expanded content with
+  `meta: true` on the record (CC's `isMeta`; probed live 2026-07-17). The flag
+  is transcript-only; replay returns plain API messages. So the transcript has
+  three persistence levels: normal messages (full) / expansions (two records,
+  second marked meta) / reminders (never).
 
 ## Scope
 - ✅ serialize + append-only transcript + `--continue` + `--resume <id>`

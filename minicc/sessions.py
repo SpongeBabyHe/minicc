@@ -94,15 +94,21 @@ def _append_event(session_id: str, event: dict) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def append_message(session_id: str, message, usage=None) -> None:
+def append_message(session_id: str, message, usage=None, meta=False) -> None:
     """Append one message to the transcript (append-only, in conversation order).
     `usage` (assistant messages): the API response's usage object; recorded so
-    process analysis gets per-turn token counts for free."""
+    process analysis gets per-turn token counts for free. `meta` marks a
+    harness-generated expansion (a slash command's rendered content) — CC's
+    transcripts mark these `isMeta: true` as the second record of a two-record
+    pair (tags message + expansion message; probed live 2026-07-17). The flag
+    rides the transcript RECORD only, never the API message."""
     event = {
         "t": "msg",
         "ts": datetime.now().isoformat(timespec="seconds"),
         "m": _serialize_message(message),
     }
+    if meta:
+        event["meta"] = True
     if usage is not None:
         event["usage"] = {
             k: getattr(usage, k, 0) or 0

@@ -1,6 +1,5 @@
 import platform
 import subprocess
-from datetime import date
 from pathlib import Path
 
 _TEMPLATE = """You are a coding agent working in the user's project, from the terminal.
@@ -48,7 +47,7 @@ works — try it on a small case; about breaking compatibility — ask.
 
 def build_system_prompt() -> str:
     """The static instruction prefix (cache layer 1). No env here — that lives in
-    build_session_context (layer 3, volatile-last) so this block stays byte-stable
+    build_session_context (layer 2, volatile-last) so this block stays byte-stable
     across sessions and can be cached globally, the way Claude Code groups it."""
     return _TEMPLATE
 
@@ -88,16 +87,18 @@ def _git_snapshot() -> str:
 
 
 def build_session_context() -> str:
-    """Session context (cache prefix layer 3): environment fixed at session start,
+    """Session context (cache prefix layer 2): environment fixed at session start,
     with the volatile bit (git status) LAST so the stable prefix above stays
-    byte-identical. Captured once at startup / on /clear — mirrors CC's env block.
+    byte-identical. Captured once at startup / on /clear — mirrors CC's env +
+    gitStatus blocks, which live in ITS system prompt too. The date is NOT here:
+    CC delivers it as the # currentDate section of the claudeMd system-reminder
+    (see reminders.py) — a date in a cached prefix would go stale mid-session.
     """
     lines = [
         "# Session context",
         "",
         f"- Working directory: {Path.cwd()}",
         f"- Platform: {platform.system()} ({platform.machine()})",
-        f"- Date: {date.today().isoformat()}",
     ]
     git = _git_snapshot()
     if git:
@@ -106,47 +107,43 @@ def build_session_context() -> str:
 
 
 def _read_claude_md(path: Path) -> str:
-    """One CLAUDE.md, truncated to CC's limits: first 200 lines or 25KB,
-    whichever comes first. "" if missing/empty."""
+    """One CLAUDE.md, in full. "" if missing/empty.
+
+    No truncation: CC's memory doc is explicit — "CLAUDE.md files are loaded
+    in full regardless of length"; the 200-line/25KB limit "applies only to
+    MEMORY.md" (which minicc enforces in memory.load_index). This function
+    truncated until 2026-07-16, citing "CC's limits" — a misattribution of the
+    MEMORY.md-only limit, caught by re-reading the official page."""
     if not path.exists():
         return ""
     try:
-        text = path.read_text().strip()
+        return path.read_text().strip()
     except OSError:
         return ""
-    if not text:
-        return ""
-
-    MAX_BYTES = 25 * 1024
-    encoded = text.encode("utf-8")
-    if len(encoded) > MAX_BYTES:
-        text = encoded[:MAX_BYTES].decode("utf-8", errors="ignore").rstrip()
-        text += f"\n\n[CLAUDE.md truncated at 25KB; was {len(encoded):,} bytes]"
-
-    MAX_LINES = 200
-    lines = text.splitlines()
-    if len(lines) > MAX_LINES:
-        text = "\n".join(lines[:MAX_LINES])
-        text += f"\n\n[CLAUDE.md truncated at 200 lines.]"
-    return text
 
 
-def load_project_context() -> str:
-    """Load CLAUDE.md from cwd AND every ancestor directory (cache prefix layer 2).
+def claude_md_files() -> list[tuple[Path, str]]:
+    """(path, text) for CLAUDE.md in cwd AND every ancestor directory.
 
     CC's monorepo behavior: parent directories' CLAUDE.md files are pulled in
     automatically alongside the project's own (root conventions + subproject
     specifics), outermost first so the nearest file reads last and wins where
-    they disagree. Truncation (200 lines / 25KB) applies per file. Returns ""
-    if none found. Recorded divergences: no ~/.claude global CLAUDE.md
-    (auto-memory covers that role), no CLAUDE.local.md, no on-demand
-    child-directory loading.
+    they disagree. Each file loads IN FULL (see _read_claude_md).
+
+    Consumed by reminders.py, which injects each file as a labeled
+    "Contents of <path> …" section of the claudeMd system-reminder — CC's
+    message-stream mechanism, NOT a system-prompt cache layer (the old
+    load_project_context design; see reminders.py for why it moved).
+    Recorded divergences (memory doc, re-read 2026-07-16): no ~/.claude global
+    CLAUDE.md (auto-memory covers that role), no CLAUDE.local.md, no on-demand
+    child-directory loading, no ./.claude/CLAUDE.md alternate location, no
+    @path imports (CC expands them at launch, depth 4), no stripping of
+    block-level HTML comments before injection.
     """
     cwd = Path.cwd()
-    sections = []
+    out = []
     for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd
         text = _read_claude_md(d / "CLAUDE.md")
         if text:
-            label = "" if d == cwd else f" — from {d}"
-            sections.append(f"# Project context (CLAUDE.md{label})\n\n{text}")
-    return "\n\n".join(sections)
+            out.append((d / "CLAUDE.md", text))
+    return out
