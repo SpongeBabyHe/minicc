@@ -166,7 +166,7 @@ Fable 5, same base commit, /init in three worktrees.
   lesson: archive before reverting).
 - **R3** (3-arm, clean baseline): A=20 calls (18 bash-cat, ≈18 prompts, 0
   verification, 5 output errors); B=40 calls (32 Read, 0 verification, 3 errors,
-  344s, 2.02M cache-read (init-span; whole-session figure was inflated)); C=15 batched calls, 192s, 695K cache-read, **2
+  344s, 0.95M cache-read (init-span, id-deduped — two audits deep: session-trim, then streaming-record dedup)); C=15 batched calls, 192s, 245K cache-read, **2
   verification actions** (pytest before documenting — its own words: "Let me
   verify the test command works before documenting it" — and git check-ignore),
   59-line output, fewest errors. C's verified claims were all correct; its
@@ -195,6 +195,14 @@ Fable 5, same base commit, /init in three worktrees.
   "file state is current in your context" mechanism, discovered in C's R4
   transcript. +8 tests (203 green).
 
+- **2026-07-17 (R5 audit ripple): CC-transcript usage is written on MULTIPLE
+  streaming records per message** — every prior by-event sum double-counted
+  (Task-1 table: B 2.1× high, C 2.8× high; corrected by message-id dedup:
+  B/C cache_read ratio is 3.9×, not 2.9×). The 07-15 "span-slice" audit
+  re-ran the SAME flawed extractor and blessed its output — re-verification
+  must change the instrument or the method, not repeat it. transcript2md /
+  future extractors: dedupe by message id ALWAYS.
+
 - **2026-07-17: survey-driven A-group landed** — user reset the two skill
   commits and ordered a fresh full survey before recommitting. Three probes
   closed the open questions: /init persists as tags-record + isMeta-record
@@ -207,9 +215,90 @@ Fable 5, same base commit, /init in three worktrees.
   classes + next-steps ledger). E2E re-verified live (record shapes + zero
   reminder persistence + model received injection). 233 green.
 
+- **2026-07-17 (dogfood R5 / llm-wiki phase2 setup): multi-line paste
+  shatters** — pasting the task brief into arm A delivered only the first
+  sentence as the query; the terminal replayed the REMAINING lines into later
+  prompts as separate queries (input() returns at the first newline). B/C
+  unaffected (CC's TUI does bracketed paste). FIXED same hour: _read_query
+  drains lines already buffered on a TTY stdin after the first line (paste
+  arrives as a burst; typing doesn't); non-TTY stdin keeps one-line-per-query
+  so scripted smokes are untouched. +3 tests. Arm A's partial run discarded
+  and rerun with the full brief.
+  - Second failure on the rerun: the paste reached the query WITH surrogate
+    escapes (tty/readline byte mangling) and the transcript writer crashed
+    the whole process with "surrogates not allowed" — an input-boundary
+    problem surfacing three layers later. Fixed the boundary: _sanitize
+    (surrogateescape round-trip: split sequences recover their real chars,
+    garbage becomes visible U+FFFD) + the drain now reads RAW BYTES and
+    decodes once (no text-layer read boundaries to split characters on).
+    +2 tests (238 green). Writer stays strict on purpose — any OTHER source
+    of bad text should still fail loud.
+  - Third layer (found by diffing A's persisted brief against B's): the
+    sanitize stopped the crash but bytes were REALLY lost — requirement #2
+    arrived as stuttered fragments + 2 U+FFFD and the final out-of-scope
+    line was missing entirely. Damage started at byte ~1100: after input()
+    returns, readline restores CANONICAL tty mode and macOS's 1024-byte
+    input queue drops the overflow before the drain can start. Real fix:
+    enable bracketed paste (GNU readline 8.2 present) so the entire paste
+    lands atomically inside readline's raw-mode window; drain kept as
+    fallback; multi-line input now prints a paste RECEIPT (lines/chars +
+    a loud U+FFFD warning) so truncation is visible BEFORE the turn runs.
+    Run A2 of this round aborted as invalid (task spec differed from B/C).
+  - Fourth failure, different organ: A's clean-paste run "stopped mid-way";
+    user typed 继续 → API 400 "tool_use ids without tool_result". Transcript
+    forensics: the dangling assistant carried a todo_write with EMPTY input
+    and usage.output_tokens=16000 — exactly the max_tokens cap. A stream cut
+    by the output cap ends with stop_reason="max_tokens" while still holding
+    a partial tool_use; the terminal branch recorded it as-is (no exception →
+    no rollback → silent turn end). Fixed both sides: agent_loop discards the
+    partial call (keeps streamed text/thinking, placeholder if nothing left,
+    LOUD notice + "say continue"); sessions._replay repairs pre-fix
+    transcripts by inserting/merging synthetic tool_results so --continue of
+    a poisoned session stays API-valid. +4 tests (242 green). Open question:
+    what CC does on max_tokens mid tool-call (auto-continue? notice?) —
+    unverified, minicc's discard-and-tell is the safe reading. CC's
+    max_tokens default also unverified (env-vars doc fetch truncated twice).
+  - Attribution correction (user pushed "CC harness is stronger"): the 16K
+    blowout happened on the MANGLED-brief run — garbage spec in, monster
+    response out. The clean rerun's peaks: A 5,267 vs B 5,747 (near-parity;
+    B never approached 16K either), A finished the task, zero Korean, closed
+    in Chinese. So per dimension: input robustness CC wins (all four R5 bugs
+    are minicc's); clean-input behavior shaping ~par; language discipline
+    minicc wins (its anchor held where CC's Sonnet drifted Korean).
+  - Meta: the user's Korean-in-B hypothesis (byte pollution) was DISPROVEN
+    by the transcripts — B/C briefs arrived clean; B's Korean is Sonnet CJK
+    drift starting in its FIRST assistant message, 0 hits in deliverables;
+    C (Fable) had zero drift and closed in the user's language. A-vs-B now
+    doubles as a language-anchor harness test (minicc has one, CC doesn't).
+    (An earlier edit of this file clipped this bullet's header — repaired.)
+  - Scene re-audit (user-ordered, 2026-07-17): all five A sessions mapped —
+    161928/162233 (shatter ×2: each holds exactly ONE query = the first
+    sentence; the remaining lines were NOT executed as queries as first
+    claimed — zero fragment queries in either transcript; most plausibly the
+    approval prompts' stale-stdin tcflush ate them), 163158 (0-byte file =
+    the surrogate crash's fossil: open() succeeded, encode died pre-write),
+    163742 (mangled brief + max_tokens), 165112 (graded run — brief now
+    BYTE-VERIFIED identical to B's 1,387 chars, zero U+FFFD, 范围外 intact).
+    L3 refinement: corruption onset at 920 bytes into the drained stream
+    (consistent with a ~1KB canonical-queue cap, not an exact 1024
+    signature); the ×6 fragment REPETITION is not explained by queue drops
+    (drops lose bytes, they don't duplicate) — residual unknown (terminal
+    retransmit or double paste). The fix's validity is independent of that
+    residual: bracketed paste removes the whole post-readline window, and
+    the clean 165112 run is the empirical proof.
+  - Fallback-path verification (pty experiment, same day): drove minicc
+    through a real pty with a 2,656-byte burst and NO bracketed markers
+    (forcing the burst-drain fallback). Result: all 29 lines arrived, ~3
+    chars damaged at the canonical-queue boundary, and the paste receipt
+    fired its U+FFFD warning exactly as designed — the fallback is
+    degraded-but-LOUD, never silent. (Test-harness note: writing >1KB to a
+    pty master without draining echo deadlocks — writer thread required.)
+
 ## Open questions for retro
-- [ ] verify-work: does the model run tests/lint unprompted after edits now, or
-      does the stance get ignored under task pressure? (the whole point of shipping it)
+- [x] verify-work: ANSWERED by R5 (2026-07-17) — under real task pressure A ran
+      11 verification actions unprompted (pytest×7 + ruff×4), the most of the
+      three arms; same-model B under CC ran 3 (zero lint) and shipped 7 ruff
+      errors. The stance works. (r5-三臂对比记录)
 - [ ] Does the model follow codebase conventions reliably on real tasks, or is
       the F1 variance pattern common?
 - [ ] When edit_file genuinely fails (actual not-found, not multi-match), does

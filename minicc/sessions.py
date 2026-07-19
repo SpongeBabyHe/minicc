@@ -177,7 +177,62 @@ def _replay(lines, upto: int | None = None) -> list:
             working.append(event["m"])
         elif event.get("t") in ("compact", "rewind"):
             working = list(event["state"])
-    return working
+    return _repair_dangling_tool_uses(working)
+
+
+def _repair_dangling_tool_uses(msgs: list) -> list:
+    """Make a replayed working set API-valid: every tool_use must be answered
+    by a tool_result in the NEXT message, or the request 400s. Transcripts
+    written before the max_tokens truncation fix can carry an unanswered
+    partial tool_use (dogfood R5: output cap hit mid tool-call); repair by
+    inserting/merging a synthetic result rather than refusing to resume."""
+    out: list = []
+    for i, m in enumerate(msgs):
+        out.append(m)
+        if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
+            continue
+        ids = [
+            b.get("id")
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        if not ids:
+            continue
+        nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+        answered = set()
+        next_has_results = (
+            nxt is not None
+            and nxt.get("role") == "user"
+            and isinstance(nxt.get("content"), list)
+            and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in nxt["content"]
+            )
+        )
+        if next_has_results:
+            answered = {
+                b.get("tool_use_id")
+                for b in nxt["content"]
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            }
+        missing = [t for t in ids if t not in answered]
+        if not missing:
+            continue
+        synthetic = [
+            {
+                "type": "tool_result",
+                "tool_use_id": t,
+                "content": "[interrupted: no result was recorded]",
+            }
+            for t in missing
+        ]
+        if next_has_results:
+            # partial answers exist: ALL results must live in that one next
+            # message, so merge the synthetic ones into it
+            nxt["content"] = list(nxt["content"]) + synthetic
+        else:
+            out.append({"role": "user", "content": synthetic})
+    return out
 
 
 def load(session_id: str) -> list | None:

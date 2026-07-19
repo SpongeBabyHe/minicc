@@ -60,6 +60,23 @@ def agent_loop(
                 sessions.append_message(session_id, assistant_msg, usage=response.usage)
             continue
         if response.stop_reason != "tool_use":
+            # A non-tool_use stop can still CARRY tool_use blocks: max_tokens
+            # cutting the stream mid tool-call leaves a partial call with
+            # truncated (often empty) input and no result can ever answer it —
+            # sending it back 400s the next request ("tool_use ids were found
+            # without tool_result blocks"; dogfood R5, output=16000 exactly at
+            # the cap). Drop the partial call, keep what streamed before it,
+            # and say so out loud instead of ending the turn silently.
+            if any(getattr(b, "type", None) == "tool_use" for b in response.content):
+                kept = [b for b in response.content if getattr(b, "type", None) != "tool_use"]
+                assistant_msg["content"] = kept or [
+                    {"type": "text", "text": "[response truncated at the output-token limit]"}
+                ]
+                ux.say(
+                    f"{indent}response stopped ({response.stop_reason}) mid tool-call; "
+                    "the partial call was discarded — say 'continue' to resume",
+                    style=ux.S_ERROR,
+                )
             if session_id:  # terminal assistant → record alone
                 sessions.append_message(session_id, assistant_msg, usage=response.usage)
             # Stop hook: the deterministic turn-end gate (the enforced complement to
