@@ -1,7 +1,10 @@
 import argparse
+import os
 import platform
 import readline  # noqa: F401 — importing enables history + line editing for input()
+import select
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from anthropic import (
@@ -44,7 +47,7 @@ _PRICE_CACHE_READ_PER_M = 0.30  # 0.1x input
 #   1. verify-before-write — no arm's unverified command survived checking; the
 #      wording is Fable 5's own spontaneous phrasing from that run.
 #   2. universal-quantifier check — "all"/"only" claims were the other error class.
-#   3. batch parallel reads — turn count drove a 3x context-traffic spread.
+#   3. batch parallel reads — turn count drove a ~4x context-traffic spread.
 # Deliberately absent (the experiment showed CC needs neither): todo/task
 # scaffolding hints.
 _INIT_PROMPT = (
@@ -435,7 +438,17 @@ def _init_session():
 
 
 def _setup_history():
-    """Load input history so ↑/↓ and Ctrl-R recall queries across runs."""
+    """Load input history so ↑/↓ and Ctrl-R recall queries across runs.
+    Also enables bracketed paste (GNU readline 8.1+): the whole paste —
+    newlines included — lands atomically in readline's buffer while the tty
+    is in readline's raw mode. Without it, everything after the first line
+    floods the kernel's CANONICAL input queue (1024 bytes on macOS) and the
+    overflow is silently dropped/mangled — dogfood R5 lost a requirement
+    line and the out-of-scope constraints of a 2.4KB pasted brief that way."""
+    try:
+        readline.parse_and_bind("set enable-bracketed-paste on")
+    except Exception:
+        pass  # editline or old readline: _read_query's drain is the fallback
     histfile = Path.cwd() / ".minicc" / "repl_history"
     histfile.parent.mkdir(parents=True, exist_ok=True)
     gi = histfile.parent / ".gitignore"
@@ -446,6 +459,72 @@ def _setup_history():
     except (FileNotFoundError, OSError):
         pass
     return histfile
+
+
+def _sanitize(text: str) -> str:
+    """Make input safe to persist and send: the tty/readline layer can hand
+    back surrogate escapes when bytes didn't decode cleanly (observed live in
+    dogfood R5 — a large paste crashed the transcript writer with 'surrogates
+    not allowed', killing the session). Re-encode the escapes back to their
+    original bytes and re-decode: sequences that were merely split recover
+    their real characters; anything irrecoverable becomes U+FFFD (visible in
+    the echoed query) instead of a crash three layers later."""
+    try:
+        text.encode("utf-8")  # fast path: already clean
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def _read_query() -> str:
+    """Read one query; a multi-line PASTE arrives as ONE query.
+
+    input() returns at the first newline, so a pasted block would shatter —
+    line 1 becomes the query and the REST of the paste is silently lost (the
+    next permission prompt's stale-stdin flush eats it; R5 scene audit: two
+    sessions each show exactly ONE query = the brief's first sentence, zero
+    fragment queries — arm A worked off one sentence, twice). CC's TUI handles this via
+    bracketed paste; minicc's stdlib REPL gets the burst-drain equivalent:
+    after the first line, consume whatever is ALREADY buffered on stdin
+    (select, 50ms per chunk). Paste arrives as a burst; typing never does, so
+    an interactively typed line is returned unchanged.
+
+    The drain reads RAW BYTES (os.read) and decodes once at the end — a
+    multi-byte character split across tty buffer chunks reassembles instead
+    of shattering into surrogates at a text-layer read boundary.
+
+    TTY-only on purpose: with piped stdin everything is "already buffered",
+    and draining would swallow the whole script — scripted use (tests, e2e
+    smokes) keeps the one-line-per-query semantics."""
+    first = input("\nQuery: ")
+    if not sys.stdin.isatty():
+        return _sanitize(first).strip()
+    fd = sys.stdin.fileno()
+    chunks: list[bytes] = []
+    while select.select([sys.stdin], [], [], 0.05)[0]:
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:  # EOF mid-drain
+            break
+        chunks.append(data)
+    text = _sanitize(first)
+    if chunks:
+        text += "\n" + b"".join(chunks).decode("utf-8", "replace")
+    text = text.strip()
+    # Paste receipt: multi-line input echoes its size so truncation is visible
+    # BEFORE the turn runs (R5: a mangled paste was only noticed post-run).
+    if "\n" in text:
+        note = f"[paste received: {text.count(chr(10)) + 1} lines, {len(text)} chars]"
+        if "�" in text:
+            ux.say(
+                note + "  ⚠ contains U+FFFD — bytes were LOST in transit; re-paste",
+                style=ux.S_ERROR,
+            )
+        else:
+            ux.say(note, style=ux.S_INFO)
+    return text
 
 
 def _friendly_error(e: Exception) -> str:
@@ -511,7 +590,7 @@ def main():
     turn = 0
     while True:
         try:
-            query = input("\nQuery: ").strip()
+            query = _read_query()
         except (EOFError, KeyboardInterrupt):
             break
 
