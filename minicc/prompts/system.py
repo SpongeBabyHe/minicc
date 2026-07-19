@@ -12,7 +12,8 @@ Working style:
   batch independent reads as parallel tool calls in one turn.
 - For a partial change use edit_file — never rewrite a whole file with write_file.
 - Read a tool's error before retrying; don't repeat a call hoping it works.
-- Plan long, multi-step tasks with todo_write; delegate read-many-files exploration to task.
+- Plan long, multi-step tasks with the task list (task_create/task_list/task_update);
+  mark one item in_progress at a time. Delegate read-many-files exploration to task.
 - web_search finds current/external information (titles + URLs + snippets); to read
   a specific page in depth, follow up with web_fetch on its URL. Don't search for
   stable knowledge you already have.

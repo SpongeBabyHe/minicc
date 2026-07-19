@@ -1,7 +1,15 @@
 from minicc import config
-from . import bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, skill, web_fetch, web_search
+from . import bash, read_file, write_file, edit_file, glob, grep, task, memory, skill, web_fetch, web_search
+from . import task_create, task_list, task_get, task_update
 
-_MODULES = [bash, read_file, write_file, edit_file, glob, grep, task, todo_write, memory, skill, web_fetch]
+# The Task* coordination tools replace the old stateless todo_write (D1): a
+# stateful, id-keyed store with a dependency graph — the substrate the
+# coordinator/teams tiers stand on. See minicc/tasks.py.
+_MODULES = [
+    bash, read_file, write_file, edit_file, glob, grep, task,
+    task_create, task_list, task_get, task_update,
+    memory, skill, web_fetch,
+]
 # web_search is SERVER-executed (no client handler; see tools/web_search.py). It's
 # offered unless settings disable it ("web_search": false) — necessary because an
 # org that disabled web search in the Console 400s any request that includes it.
