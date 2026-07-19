@@ -11,7 +11,8 @@ code in your project. It runs an agent loop with these tools:
 - `bash` — run shell commands (120s default timeout, model-extendable to 600s)
 - `read_file` / `write_file` / `edit_file` — file I/O
 - `glob` / `grep` — search by name or content
-- `task` — delegate exploration to a read-only subagent (own context, cheaper model)
+- `agent` — delegate a subtask to a sub-agent (own context; built-in types + `.minicc/agents/*.md` roles)
+- `task_create`/`task_list`/`task_get`/`task_update` — the coordination task list (dependency graph)
 - `todo_write` — a model-maintained task list for long work
 - `memory` — cross-session auto-memory (index + topic files)
 - `skill` — invoke packaged instructions from `.minicc/skills/` (user side: `/<name>`)

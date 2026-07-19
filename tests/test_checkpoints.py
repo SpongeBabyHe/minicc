@@ -194,7 +194,7 @@ def test_memory_stays_flat():
 def test_hook_fires_in_real_agent_loop(monkeypatch):
     """Drive the actual agent_loop (model response mocked) through a real
     write_file call, and confirm the checkpoint hook captured it for /rewind."""
-    from minicc import agent, permissions
+    from minicc import query_engine as engine, permissions
 
     permissions.reset(); permissions.preload(["write_file"])   # skip the approve prompt
     Path("target.py").write_text("ORIGINAL")
@@ -209,14 +209,14 @@ def test_hook_fires_in_real_agent_loop(monkeypatch):
               input={"path": "target.py", "content": "REWRITTEN"})]),
         B(stop_reason="end_turn", content=[B(type="text", text="done")]),
     ])
-    monkeypatch.setattr(agent, "llm_response", lambda *a, **k: next(responses))
+    monkeypatch.setattr(engine, "llm_response", lambda *a, **k: next(responses))
 
     from minicc.tools import freshness
 
     freshness.record("target.py")  # satisfy read-before-overwrite (see test_freshness)
     history = [{"role": "user", "content": "rewrite target"}]
     checkpoints.start(1, "rewrite target")
-    agent.agent_loop(history)
+    engine.agent_loop(history)
 
     assert Path("target.py").read_text() == "REWRITTEN"        # agent actually wrote it
     assert checkpoints.restore_files(1) == (1, [])             # hook captured it

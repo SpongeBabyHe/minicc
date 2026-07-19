@@ -311,7 +311,7 @@ class _Resp:
 
 def _drive(monkeypatch, replies, session_id="s1"):
     """Run agent_loop against canned end_turn replies; returns (messages, calls)."""
-    from minicc import agent
+    from minicc import query_engine as engine
 
     queue = list(replies)
     calls = []
@@ -320,10 +320,10 @@ def _drive(monkeypatch, replies, session_id="s1"):
         calls.append(len(messages))
         return _Resp(queue.pop(0) if queue else "done")
 
-    monkeypatch.setattr(agent, "llm_response", fake_llm)
-    monkeypatch.setattr(agent.sessions, "append_message", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "llm_response", fake_llm)
+    monkeypatch.setattr(engine.sessions, "append_message", lambda *a, **k: None)
     messages = [{"role": "user", "content": "hi"}]
-    agent.agent_loop(messages, session_id=session_id)
+    engine.agent_loop(messages, session_id=session_id)
     return messages, calls
 
 

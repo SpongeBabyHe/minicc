@@ -43,13 +43,14 @@ the bare query).
 from datetime import date
 from pathlib import Path
 
-from minicc import memory, skills, watch
+from minicc import agents, memory, skills, watch
 from minicc.prompts import system as psys
 
 # In-context markers: distinctive first lines of each reminder kind, used to
 # detect whether a live copy is still in the history (vs compacted/rewound away).
 _CLAUDE_MARKER = "As you answer the user's questions, you can use the following context:"
 _SKILLS_MARKER = "The following skills are available for use with the Skill tool:"
+_AGENTS_MARKER = "Available agent types for the Agent tool:"
 
 _last: dict = {}  # kind → last injected text
 _pollers: dict = {}  # kind → watch.Poller
@@ -124,9 +125,21 @@ def _skills_text() -> str:
     return f"<system-reminder>\n{_SKILLS_MARKER}\n\n{listing}\n</system-reminder>"
 
 
+def _agents_snapshot() -> dict:
+    # built-in types are constant; only agent definition files change (mtime).
+    return watch.mtime_snapshot(agents.agent_md_paths())
+
+
+def _agents_text() -> str:
+    # always non-empty — the built-in types (general-purpose/explore) always
+    # exist, so this reminder rides every session the way CC's does.
+    return f"<system-reminder>\n{_AGENTS_MARKER}\n\n{agents.listing_text()}\n</system-reminder>"
+
+
 _KINDS = [
     ("claude_md", _CLAUDE_MARKER, _claude_md_snapshot, _claude_md_text),
     ("skills", _SKILLS_MARKER, _skills_snapshot, _skills_text),
+    ("agents", _AGENTS_MARKER, _agents_snapshot, _agents_text),
 ]
 
 

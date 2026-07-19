@@ -15,7 +15,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import json
 
-from minicc import agent, sessions
+from minicc import query_engine as engine, sessions
 
 
 class _Text:
@@ -46,11 +46,11 @@ class _Resp:
 def test_max_tokens_partial_tool_use_discarded(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # sessions write under cwd/.minicc
     monkeypatch.setattr(
-        agent, "llm_response",
+        engine, "llm_response",
         lambda *a, **k: _Resp([_Text("half-done"), _ToolUse()], "max_tokens"),
     )
     messages = [{"role": "user", "content": "go"}]
-    agent.agent_loop(messages, session_id="trunc1")
+    engine.agent_loop(messages, session_id="trunc1")
 
     def _btype(b):
         return b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
@@ -69,10 +69,10 @@ def test_max_tokens_partial_tool_use_discarded(monkeypatch, tmp_path):
 def test_all_tool_use_content_gets_placeholder(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
-        agent, "llm_response", lambda *a, **k: _Resp([_ToolUse()], "max_tokens")
+        engine, "llm_response", lambda *a, **k: _Resp([_ToolUse()], "max_tokens")
     )
     messages = [{"role": "user", "content": "go"}]
-    agent.agent_loop(messages, session_id=None)
+    engine.agent_loop(messages, session_id=None)
     assert messages[-1]["content"] == [
         {"type": "text", "text": "[response truncated at the output-token limit]"}
     ]

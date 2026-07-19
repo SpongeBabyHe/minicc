@@ -36,7 +36,7 @@ context; subagents avoid filling it in the first place).
 Options: (A) model-invoked — expose an `agent` tool the model calls when it
 judges a subtask is heavy; (B) user-invoked — a `/agent <task>` command.
 
-**Choice: A, a `task` tool** (matches CC). The model decides to delegate, because
+**Choice: A, an `agent` tool** (CC renamed Task→Agent). The model decides to delegate, because
 it's the one that knows a subtask will be exploration-heavy. Signature:
 `task(description: str)` → returns the subagent's final text. (User-invoked can
 be added later; not needed for v1.)
@@ -177,7 +177,7 @@ the display calm.
 ## Implementation sketch
 
 ```python
-# tools/task.py
+# tools/agent.py
 SCHEMA = {
     "name": "task",
     "description": (

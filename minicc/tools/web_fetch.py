@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
-from .task import SUBAGENT_MODEL   # the same cheap-model tier as sub-agents
+from minicc.agents import EXPLORE_MODEL   # the same cheap-model tier as sub-agents
 
 MAX_CONTENT_CHARS = 50_000       # truncate before processing (L2 convention)
 _MAX_FETCH_BYTES = 2_000_000     # stop reading the body past this
@@ -220,7 +220,7 @@ def _extract(page_text: str, url: str, prompt: str) -> str:
         system=_EXTRACT_SYSTEM,
         stream=False,
         tools=[],                          # the extractor gets no tools
-        model=SUBAGENT_MODEL,              # cheap tier, like sub-agents
+        model=EXPLORE_MODEL,               # cheap tier, like sub-agents
     )
     answer = "".join(
         b.text for b in resp.content if getattr(b, "type", None) == "text"

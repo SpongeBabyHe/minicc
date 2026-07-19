@@ -153,7 +153,7 @@ def test_memory_delete_is_gated(monkeypatch):
 def test_consolidate_runs_agent_loop_with_memory_tool_only(store, monkeypatch):
     """consolidate() = one agent_loop pass, memory tool only, and returns the
     final assistant text as the change summary."""
-    import minicc.agent as agent_mod
+    import minicc.query_engine as agent_mod
 
     captured = {}
 

@@ -13,7 +13,10 @@ Working style:
 - For a partial change use edit_file — never rewrite a whole file with write_file.
 - Read a tool's error before retrying; don't repeat a call hoping it works.
 - Plan long, multi-step tasks with the task list (task_create/task_list/task_update);
-  mark one item in_progress at a time. Delegate read-many-files exploration to task.
+  mark one item in_progress at a time.
+- Delegate a subtask to a sub-agent with `agent` when it would flood this context
+  with reads/logs — pick a subagent_type (see the agent-types system-reminder);
+  the spawn prompt is all the sub-agent sees, so make it self-contained.
 - web_search finds current/external information (titles + URLs + snippets); to read
   a specific page in depth, follow up with web_fetch on its URL. Don't search for
   stable knowledge you already have.

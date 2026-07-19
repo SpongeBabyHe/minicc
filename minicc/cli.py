@@ -14,7 +14,7 @@ from anthropic import (
     RateLimitError,
 )
 from minicc import llm
-from minicc.agent import agent_loop
+from minicc.query_engine import agent_loop
 from minicc import ux
 from minicc.llm import get_usage, context_usage, compact, recap
 from minicc import permissions

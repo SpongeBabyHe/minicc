@@ -38,6 +38,17 @@ def _history_with(*notes):
     return [{"role": "user", "content": n} for n in notes]
 
 
+# The agent-types reminder always injects (built-ins always exist), so tests
+# targeting the claudeMd reminder pick it out by its unique disclaimer line
+# rather than assuming it's the only block.
+_CLAUDE_DISCLAIMER = "may or may not be relevant"
+
+
+def _pick(out, marker):
+    hits = [t for t in out if marker in t]
+    return hits[0] if hits else None
+
+
 # ─── watch.Poller ─────────────────────────────────────────────────────────────
 
 def test_poller_first_call_and_change_detection(tmp_path):
@@ -60,8 +71,8 @@ def test_first_prompt_injects_claude_md_cc_format(_isolated):
     proj, _ = _isolated
     (proj / "CLAUDE.md").write_text("Use uv for everything.")
     out = reminders.for_prompt([])
-    assert len(out) == 1  # no skills installed → only the claudeMd reminder
-    text = out[0]
+    text = _pick(out, "# claudeMd")
+    assert text is not None
     assert text.startswith("<system-reminder>\n") and text.endswith("</system-reminder>")
     assert "# claudeMd" in text
     assert "These instructions OVERRIDE any default behavior" in text
@@ -75,18 +86,17 @@ def test_first_prompt_injects_claude_md_cc_format(_isolated):
 
 
 def test_no_claude_md_still_carries_current_date(_isolated):
-    out = reminders.for_prompt([])
-    assert len(out) == 1
-    assert "# claudeMd" not in out[0]  # no sources → no section
-    assert "# currentDate" in out[0]  # but the date always arrives (CC parity)
+    text = _pick(reminders.for_prompt([]), _CLAUDE_DISCLAIMER)
+    assert "# claudeMd" not in text  # no sources → no section
+    assert "# currentDate" in text  # but the date always arrives (CC parity)
 
 
 def test_stable_context_injects_nothing(_isolated):
     proj, _ = _isolated
     (proj / "CLAUDE.md").write_text("rules")
-    (first,) = reminders.for_prompt([])
-    # copy in context + nothing changed → silence
-    assert reminders.for_prompt(_history_with(first)) == []
+    out = reminders.for_prompt([])
+    # every reminder now in context + nothing changed → silence
+    assert reminders.for_prompt(_history_with(*out)) == []
 
 
 def test_mid_session_edit_not_reinjected_cc_parity(_isolated):
@@ -96,10 +106,10 @@ def test_mid_session_edit_not_reinjected_cc_parity(_isolated):
     proj, _ = _isolated
     md = proj / "CLAUDE.md"
     md.write_text("v1")
-    (first,) = reminders.for_prompt([])
+    out = reminders.for_prompt([])
     md.write_text("v2")
     os.utime(md, (md.stat().st_atime, md.stat().st_mtime + 2))
-    assert reminders.for_prompt(_history_with(first)) == []  # edit ignored
+    assert reminders.for_prompt(_history_with(*out)) == []  # edit ignored
 
 
 def test_lost_copy_reinjects_fresh_from_disk(_isolated):
@@ -109,10 +119,11 @@ def test_lost_copy_reinjects_fresh_from_disk(_isolated):
     proj, _ = _isolated
     md = proj / "CLAUDE.md"
     md.write_text("v1")
-    (first,) = reminders.for_prompt([])
-    assert reminders.for_prompt([]) == [first]  # lost, unchanged → same copy
+    first = _pick(reminders.for_prompt([]), _CLAUDE_DISCLAIMER)
+    # history lost everything → claudeMd re-injects unchanged
+    assert _pick(reminders.for_prompt([]), _CLAUDE_DISCLAIMER) == first
     md.write_text("v2")  # edit + loss → the re-injected copy is FRESH
-    (updated,) = reminders.for_prompt([])
+    updated = _pick(reminders.for_prompt([]), _CLAUDE_DISCLAIMER)
     assert "v2" in updated and "v1" not in updated
 
 
@@ -145,10 +156,10 @@ def test_memory_toggle_needs_invalidate(_isolated, monkeypatch):
     (home / "memories").mkdir()
     (home / "memories" / "MEMORY.md").write_text("- [F](f.md) — hook")
     monkeypatch.setattr(memory, "_enabled", True)
-    (first,) = reminders.for_prompt([])
-    assert "auto-memory" in first
+    out = reminders.for_prompt([])
+    assert "auto-memory" in _pick(out, _CLAUDE_DISCLAIMER)
     monkeypatch.setattr(memory, "_enabled", False)  # no file signature
-    assert reminders.for_prompt(_history_with(first)) == []  # poller can't see it
+    assert reminders.for_prompt(_history_with(*out)) == []  # poller can't see it
     reminders.invalidate()
-    (updated,) = reminders.for_prompt(_history_with(first))
+    updated = _pick(reminders.for_prompt(_history_with(*out)), _CLAUDE_DISCLAIMER)
     assert "auto-memory" not in updated  # index gone from the rebuilt reminder

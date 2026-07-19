@@ -50,10 +50,12 @@ Where each kind of fact belongs:
 
 Minimalism applies to the **number of tools** and the **size of responses** — not
 to per-tool semantic detail. minicc keeps a small set of focused, non-overlapping
-tools (12 as of 2026-07: file/search six + task, todo_write, memory, skill,
-web_fetch, web_search); each one earns a detailed description. (`skill` keeps
-its description static and small — the volatile listing rides a
-`<system-reminder>` instead; see SKILL_DESIGN.md.)
+tools (14 as of 2026-07: file/search six + `agent` (sub-agent spawn) +
+task_create/get/list/update (the coordination task list) + memory + skill +
+web_fetch + web_search); each earns a detailed description. (`skill` and
+`agent` keep their descriptions static and small — the volatile skill/agent-type
+listings ride `<system-reminder>` blocks instead; see SKILL_DESIGN.md /
+CC_AGENTS_COORDINATOR_DESIGN.md.)
 
 ---
 
@@ -69,8 +71,9 @@ Each row: the defect (description ≠ code, or a description that misled), and t
 | **write_file** | Returned `len(content)` labelled "**bytes**" — actually a character count (wrong for any non-ASCII content). | Reports true UTF-8 byte count (and chars). Added a prefer-`edit_file` caveat + per-parameter descriptions. |
 | **bash** | Safety filter used **substring** matching: `rm -rf /` blocked the legitimate `rm -rf /tmp/x`; `sudo` blocked `echo pseudocode`; `> /dev/` blocked the ubiquitous `2>/dev/null`. The 120s timeout was undocumented. | Filter is now **anchored/word-boundaried** regex — catches `rm -rf /`, `sudo`, `shutdown`, `reboot`, `mkfs`, raw-disk writes, while allowing the legitimate forms above. The 120s cap is a standing caveat in the description **and** a just-in-time "timed out after 120s" message. |
 
-The `task` and `todo_write` descriptions were reviewed and left unchanged — they
-already match their handlers and steer well.
+(`todo_write` was replaced by the Task* coordination tools, 2026-07-19; the
+subagent tool was renamed `task`→`agent` to match CC's Task→Agent rename and to
+free the "task" name for the task list. See CC_AGENTS_COORDINATOR_DESIGN.md.)
 
 Tests: `tests/test_tools.py` pins each promised behavior (edit uniqueness, grep
 `file:line:` prefixes, read offset/limit window, write byte count, bash filter

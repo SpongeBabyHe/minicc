@@ -38,7 +38,7 @@ def test_web_search_enabled_default_and_optout(monkeypatch, tmp_path):
 
 # ─── pause_turn: resend the paused assistant message unchanged ───────────────
 def test_agent_loop_continues_on_pause_turn(monkeypatch):
-    from minicc import agent
+    from minicc import query_engine as engine
 
     calls = {"n": 0}
 
@@ -54,9 +54,9 @@ def test_agent_loop_continues_on_pause_turn(monkeypatch):
         calls["n"] += 1
         return _Resp("pause_turn" if calls["n"] == 1 else "end_turn")
 
-    monkeypatch.setattr(agent, "llm_response", fake_llm)
+    monkeypatch.setattr(engine, "llm_response", fake_llm)
     msgs = [{"role": "user", "content": "search something"}]
-    agent.agent_loop(msgs, stream=False)
+    engine.agent_loop(msgs, stream=False)
     assert calls["n"] == 2                             # paused once, resumed, finished
     # both assistant messages are in history (the paused one resent unchanged)
     assert [m["role"] for m in msgs] == ["user", "assistant", "assistant"]

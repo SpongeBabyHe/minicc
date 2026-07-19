@@ -211,7 +211,7 @@ def consolidate() -> str:
     """One agent_loop pass over the store with the memory tool only (the model
     does the judging — policy stays in the model, mechanism here). Returns the
     model's summary of what changed."""
-    from minicc.agent import agent_loop          # lazy: avoid an import cycle
+    from minicc.query_engine import agent_loop          # lazy: avoid an import cycle
     from minicc.tools import TOOLS
 
     mem_tools = [t for t in TOOLS if t["name"] == "memory"]

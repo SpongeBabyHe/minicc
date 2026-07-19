@@ -185,7 +185,8 @@ def test_extract_routes_through_llm_response(monkeypatch):
     out = wf._extract("PAGE TEXT", "https://x.test", "find the thing")
     assert out == "the answer"
     assert captured["tools"] == []                     # extractor gets no tools
-    assert captured["model"] == wf.SUBAGENT_MODEL      # cheap tier
+    from minicc.agents import EXPLORE_MODEL
+    assert captured["model"] == EXPLORE_MODEL          # cheap tier
     assert "PAGE TEXT" in captured["msg"] and "find the thing" in captured["msg"]
 
 

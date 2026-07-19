@@ -1,12 +1,12 @@
 from minicc import config
-from . import bash, read_file, write_file, edit_file, glob, grep, task, memory, skill, web_fetch, web_search
+from . import bash, read_file, write_file, edit_file, glob, grep, agent, memory, skill, web_fetch, web_search
 from . import task_create, task_list, task_get, task_update
 
-# The Task* coordination tools replace the old stateless todo_write (D1): a
-# stateful, id-keyed store with a dependency graph — the substrate the
-# coordinator/teams tiers stand on. See minicc/tasks.py.
+# `agent` (tools/agent.py) is CC's Agent spawn tool; the Task* tools are the
+# separate coordination task-list (D1) — a stateful, id-keyed store with a
+# dependency graph. See tools/agent.py, minicc/agents.py, minicc/tasks.py.
 _MODULES = [
-    bash, read_file, write_file, edit_file, glob, grep, task,
+    bash, read_file, write_file, edit_file, glob, grep, agent,
     task_create, task_list, task_get, task_update,
     memory, skill, web_fetch,
 ]
