@@ -22,9 +22,8 @@ original read-only exploration behavior). Nested sub-agents are cut for phase-1
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
-from minicc import skills  # reuse parse_frontmatter + the discovery-root pattern
+from minicc import config, skills  # reuse config's discovery roots + the frontmatter parser
 
 # CC's Explore/Plan run read-only on a cheap model; general-purpose inherits.
 EXPLORE_MODEL = "claude-haiku-4-5-20251001"
@@ -74,16 +73,9 @@ def _norm_tools(raw) -> list[str] | None:
     return out or None
 
 
-def _roots():
-    cwd = Path.cwd()
-    for d in [*reversed(cwd.parents), cwd]:   # project: cwd + ancestors
-        yield d / ".minicc" / "agents"
-    yield Path.home() / ".minicc" / "agents"  # personal LAST — wins a clash
-
-
 def agent_md_paths():
     """Every agent .md on disk — the reminder's watch-snapshot surface."""
-    for root in _roots():
+    for root in config.config_roots("agents"):
         if root.is_dir():
             yield from sorted(root.glob("*.md"))
 

@@ -182,17 +182,10 @@ class Skill:
         return str(h or "")
 
 
-def _skill_roots():
-    cwd = Path.cwd()
-    for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd, so closest wins
-        yield d / ".minicc" / "skills"
-    yield Path.home() / ".minicc" / "skills"  # personal LAST — overrides project
-
-
 def discover() -> dict[str, Skill]:
     """Rescan all skill roots. Later roots override earlier on a name clash."""
     found: dict[str, Skill] = {}
-    for root in _skill_roots():
+    for root in config.config_roots("skills"):
         if not root.is_dir():
             continue
         for md in sorted(root.glob("*/SKILL.md")):
@@ -211,7 +204,7 @@ def lookup(name: str) -> Skill | None:
 def skill_md_paths():
     """Every SKILL.md currently on disk — the watch-snapshot surface for the
     skills reminder (adds/removes/edits all change the mtime dict)."""
-    for root in _skill_roots():
+    for root in config.config_roots("skills"):
         if root.is_dir():
             yield from sorted(root.glob("*/SKILL.md"))
 

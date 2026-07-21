@@ -416,6 +416,54 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None):
             sessions.append_message(session_id, notice)
 
 
+def _cmd_clear(history, session_id: str) -> str:
+    """Rotate to a fresh session: end the old one, reset per-session state, and
+    return the new session id (the pre-clear transcript stays on disk; new turns
+    record to a fresh `<id>.jsonl`). The caller resets its turn counter."""
+    _fire_session_end(session_id, "clear")  # old session ends (CC reason "clear")
+    history.clear()
+    new_id = sessions.new_id()
+    llm.reset_context_size()  # stale size would trigger a spurious compact
+    permissions.reset()
+    permissions.preload(config.allowed_tools())  # keep settings-trusted tools
+    checkpoints.reset()
+    hooks.reset()  # re-read hook config (settings may have changed)
+    freshness.reset()  # new session: read-before-edit starts over
+    skills.reset(new_id)  # new session id; forget loaded skills
+    reminders.reset()  # fresh claudeMd/skills reminders on next prompt
+    # refresh env/git + SessionStart(source="clear") hook context
+    llm.set_session_context(_session_context_with_hooks(new_id, "clear"))
+    ux.say("conversation, permissions reset", style=ux.S_INFO)
+    return new_id
+
+
+def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
+    """The framed session header: identity, persisted trust that skips prompts,
+    available skills, and a resume note."""
+    ux.console.rule()
+    ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
+    if pre_approved:
+        ux.say(
+            f"pre-approved (no prompt) from settings: {', '.join(sorted(pre_approved))}",
+            style=ux.S_INFO,
+        )
+    if bash_rules := config.permission_allow_rules():
+        ux.say(  # persistent trust stays visible (PERMISSIONS.md principle)
+            f"bash allow rules from settings: {', '.join(bash_rules)}", style=ux.S_INFO
+        )
+    if skill_names := sorted(skills.discover()):
+        ux.say(f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
+    if refused:
+        ux.say(
+            f"settings list {', '.join(refused)} but it can't be pre-approved "
+            "(approve per session — see PERMISSIONS.md)",
+            style=ux.S_INFO,
+        )
+    if history:
+        ux.say(f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO)
+    ux.console.rule()
+
+
 def _init_session():
     """Parse --continue/--resume and return (history, session_id)."""
     parser = argparse.ArgumentParser(prog="minicc")
@@ -560,33 +608,7 @@ def main():
     llm.set_session_context(
         _session_context_with_hooks(session_id, "resume" if history else "startup")
     )
-    ux.console.rule()
-    ux.say(ux.kv_block(list(_session_info().items()), indent=""), style=ux.S_INFO)
-    if pre_approved:
-        ux.say(
-            f"pre-approved (no prompt) from settings: {', '.join(sorted(pre_approved))}",
-            style=ux.S_INFO,
-        )
-    bash_rules = config.permission_allow_rules()
-    if bash_rules:
-        ux.say(  # persistent trust stays visible (PERMISSIONS.md principle)
-            f"bash allow rules from settings: {', '.join(bash_rules)}",
-            style=ux.S_INFO,
-        )
-    skill_names = sorted(skills.discover())
-    if skill_names:
-        ux.say(f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
-    if refused:
-        ux.say(
-            f"settings list {', '.join(refused)} but it can't be pre-approved "
-            "(approve per session — see PERMISSIONS.md)",
-            style=ux.S_INFO,
-        )
-    if history:
-        ux.say(
-            f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO
-        )
-    ux.console.rule()
+    _print_startup_banner(pre_approved, refused, session_id, history)
     turn = 0
     while True:
         try:
@@ -616,45 +638,25 @@ def main():
         elif query.startswith("/"):
             # split into command word + optional argument (e.g. /compact <focus>)
             parts = query.split(maxsplit=1)
-            cmd = parts[0]
-            arg = parts[1] if len(parts) > 1 else None
-            if cmd == "/help":
-                _cmd_help()
-            elif cmd == "/clear":
-                _fire_session_end(session_id, "clear")  # old session ends (CC reason "clear")
-                history.clear()
-                session_id = sessions.new_id()  # fresh transcript; old one kept on disk
-                llm.reset_context_size()  # stale size would trigger a spurious compact
-                permissions.reset()
-                permissions.preload(
-                    config.allowed_tools()
-                )  # keep settings-trusted tools
-                checkpoints.reset()
-                hooks.reset()  # re-read hook config (settings may have changed)
-                freshness.reset()  # new session: read-before-edit starts over
-                skills.reset(session_id)  # new session id; forget loaded skills
-                reminders.reset()  # fresh claudeMd/skills reminders on next prompt
+            cmd, arg = parts[0], (parts[1] if len(parts) > 1 else None)
+            # built-in commands → handlers (closures capture this turn's
+            # history/arg/session_id). /clear is special — it rotates the
+            # session, so it reassigns session_id/turn instead of joining here.
+            builtins = {
+                "/help": _cmd_help,
+                "/cost": _cmd_cost,
+                "/context": lambda: _cmd_context(history),
+                "/model": lambda: _cmd_model(arg),
+                "/compact": lambda: _cmd_compact(history, focus=arg, session_id=session_id),
+                "/recap": lambda: _cmd_recap(history),
+                "/memory": lambda: _cmd_memory(arg),
+                "/rewind": lambda: _cmd_rewind(history, arg, session_id=session_id),
+            }
+            if cmd == "/clear":
+                session_id = _cmd_clear(history, session_id)
                 turn = 0
-                # refresh env/git + SessionStart(source="clear") hook context
-                llm.set_session_context(_session_context_with_hooks(session_id, "clear"))
-                ux.say(
-                    "conversation, permissions reset",
-                    style=ux.S_INFO,
-                )
-            elif cmd == "/cost":
-                _cmd_cost()
-            elif cmd == "/model":
-                _cmd_model(arg)
-            elif cmd == "/context":
-                _cmd_context(history)
-            elif cmd == "/compact":
-                _cmd_compact(history, focus=arg, session_id=session_id)
-            elif cmd == "/recap":
-                _cmd_recap(history)
-            elif cmd == "/memory":
-                _cmd_memory(arg)
-            elif cmd == "/rewind":
-                _cmd_rewind(history, arg, session_id=session_id)
+            elif cmd in builtins:
+                builtins[cmd]()
             else:
                 # not a built-in — try a skill (built-ins win a name clash, like
                 # CC's built-in commands; skills can't shadow /clear or /help)

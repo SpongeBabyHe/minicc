@@ -43,6 +43,16 @@ def _project() -> Path:
     return Path.cwd() / ".minicc" / "settings.json"
 
 
+def config_roots(subdir: str):
+    """The `.minicc/<subdir>/` directories to scan, in override order: project
+    (cwd + every ancestor, outermost first) then personal (`~/.minicc`), so a
+    later root wins a name clash. Shared by skills and agents discovery."""
+    cwd = Path.cwd()
+    for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd, so closest wins
+        yield d / ".minicc" / subdir
+    yield Path.home() / ".minicc" / subdir  # personal LAST — overrides project
+
+
 def _read(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
