@@ -32,8 +32,6 @@ TOOL_HANDLERS = {
     if hasattr(m, m.SCHEMA["name"])
 }
 
-# Read-only subset for sub-agents (SUBAGENTS.md D3): no bash/write/edit, and no
-# `task` either — sub-agents don't spawn nested sub-agents. Read-only tools are
-# ungated, so a sub-agent never triggers a permission prompt (resolves D4).
-_READ_ONLY_NAMES = {"read_file", "glob", "grep"}
-READ_ONLY_TOOLS = [t for t in TOOLS if t["name"] in _READ_ONLY_NAMES]
+# Sub-agent tool subsets are no longer defined here: each AgentDef carries its
+# own allowlist (agents.py — the built-in `explore` type is the read-only set),
+# and tools/agent.py derives the schemas per spawn, always minus `agent` (D6).

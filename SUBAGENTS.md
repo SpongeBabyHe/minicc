@@ -48,9 +48,9 @@ prompt. We already added the hook for this in L1:
 `agent_loop(messages, system=...)`. So:
 
 ```python
-def task(description: str) -> str:
-    sub_messages = [{"role": "user", "content": description}]
-    agent_loop(sub_messages, system=SUBAGENT_PROMPT)   # the L1 system override hook
+def agent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]
+    agent_loop(sub_messages, system=adef.prompt)   # the L1 system override hook
     return _final_text(sub_messages)
 ```
 
@@ -177,32 +177,20 @@ the display calm.
 ## Implementation sketch
 
 ```python
-# tools/agent.py
-SCHEMA = {
-    "name": "task",
-    "description": (
-        "Delegate an exploration-heavy subtask to a subagent with its own "
-        "context. Use ONLY when answering would require reading many files — "
-        "the subagent explores in isolation and returns a concise summary, "
-        "keeping this conversation's context clean. Read-only (no edits/bash)."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {"description": {"type": "string"}},
-        "required": ["description"],
-    },
-}
-
-def task(description: str) -> str:
-    from minicc.agent import agent_loop          # local import avoids a cycle
-    sub = [{"role": "user", "content": description}]
-    agent_loop(sub, system=SUBAGENT_PROMPT, tools=READ_ONLY_TOOLS,
-               max_turns=SUBAGENT_MAX_TURNS, ui="subagent")
+# tools/agent.py (the current core; the v1 read-only `task` tool grew into this)
+def agent(prompt: str, subagent_type: str | None = None) -> str:
+    from minicc.query_engine import agent_loop   # local import avoids a cycle
+    adef = agents.resolve(subagent_type)         # built-in or .minicc/agents/*.md
+    sub = [{"role": "user", "content": prompt}]
+    agent_loop(sub, system=adef.prompt, tools=_tool_schemas(adef.tools),
+               max_turns=SUBAGENT_MAX_TURNS, indent="  ", model=adef.model)
     return _final_text(sub)
 ```
 
-This requires `agent_loop` to accept `tools`, `max_turns`, and a `ui` mode —
-small additions to the signature (the `system` param already exists from L1).
+This requires `agent_loop` to accept `tools`, `max_turns`, `indent`, and `model`
+— small additions to the signature (the `system` param already exists from L1).
+Each sub-agent's tool subset comes from its AgentDef (the built-in `explore`
+type is the read-only set), always minus `agent` itself (no nesting, D6).
 
 ## Status
 implemented

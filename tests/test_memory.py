@@ -86,10 +86,11 @@ def test_tool_dispatch(store):
 
 
 def test_memory_not_offered_to_subagents():
-    """Sub-agents get read-only tools; memory (a writer) must not be among them."""
-    from minicc.tools import READ_ONLY_TOOLS, TOOLS
+    """The read-only explore sub-agent must not carry memory (a writer)."""
+    from minicc import agents
+    from minicc.tools import TOOLS
     assert "memory" in {t["name"] for t in TOOLS}
-    assert "memory" not in {t["name"] for t in READ_ONLY_TOOLS}
+    assert "memory" not in agents.resolve("explore").tools
 
 
 # ─── gating (writes gated, view free) ────────────────────────────────────────

@@ -219,10 +219,9 @@ def test_tools_carry_no_cache_breakpoint():
     """Tools are cached via the system-prompt breakpoint (tools render first), so
     none of them carry their own cache_control — keeping us inside the 4/request
     budget. See tools/__init__.py."""
-    from minicc.tools import TOOLS, READ_ONLY_TOOLS
+    from minicc.tools import TOOLS
 
     assert all("cache_control" not in t for t in TOOLS)
-    assert all("cache_control" not in t for t in READ_ONLY_TOOLS)
 
 
 def test_request_stays_within_four_breakpoints(monkeypatch):

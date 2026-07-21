@@ -61,9 +61,15 @@ def _read(path: Path) -> dict:
         return {}
 
 
+def _settings() -> tuple[dict, dict]:
+    """(global, project) settings dicts, re-read from disk each call. Each caller
+    applies its own merge rule (override / union / concatenate)."""
+    return _read(_global()), _read(_project())
+
+
 def resolve_model() -> str:
     """Startup model: project default_model > global default_model > DEFAULT_MODEL."""
-    g, p = _read(_global()), _read(_project())
+    g, p = _settings()
     return p.get("default_model") or g.get("default_model") or DEFAULT_MODEL
 
 
@@ -87,7 +93,7 @@ def web_search_enabled() -> bool:
     `"web_search": false` (project or global) to drop it — required if the org
     disabled web search in the Console, since any request including the tool
     would 400 there."""
-    g, p = _read(_global()), _read(_project())
+    g, p = _settings()
     v = p.get("web_search", g.get("web_search", True))
     return v is not False
 
@@ -96,7 +102,7 @@ def skill_shell_disabled() -> bool:
     """CC's `disableSkillShellExecution` setting (same key, either file): when
     true, !`cmd` / ```! blocks in skills are replaced with a policy notice
     instead of running. Default false."""
-    g, p = _read(_global()), _read(_project())
+    g, p = _settings()
     return bool(
         g.get("disableSkillShellExecution") or p.get("disableSkillShellExecution")
     )
@@ -106,7 +112,7 @@ def resolve_cache_ttl() -> str:
     """Cache TTL for the stable prefix layers: project > global > "5m".
     Only "5m" and "1h" are valid (the API's two tiers); anything else falls back
     to "5m" so a typo can't silently break caching."""
-    g, p = _read(_global()), _read(_project())
+    g, p = _settings()
     ttl = p.get("cache_ttl") or g.get("cache_ttl") or "5m"
     return ttl if ttl in ("5m", "1h") else "5m"
 
@@ -124,7 +130,7 @@ def load_hooks() -> tuple[dict, bool]:
     allowed_tools which is a set-union) — global first, then project. `disabled` is
     true if either file sets "disableAllHooks". Shape mirrors CC's settings.json so a
     hook written for Claude Code drops in unchanged. See HOOKS.md."""
-    g, p = _read(_global()), _read(_project())
+    g, p = _settings()
     disabled = bool(g.get("disableAllHooks")) or bool(p.get("disableAllHooks"))
     merged: dict = {}
     for src in (g, p):
@@ -143,7 +149,7 @@ def permission_allow_rules() -> list:
     drops in unchanged (tool name case-insensitive; non-bash rules ignored for
     now). See PERMISSIONS.md."""
     seen, rules = set(), []
-    for d in (_read(_global()), _read(_project())):
+    for d in _settings():
         perms = d.get("permissions")
         allow = perms.get("allow", []) if isinstance(perms, dict) else []
         for entry in allow if isinstance(allow, list) else []:

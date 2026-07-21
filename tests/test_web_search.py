@@ -8,7 +8,7 @@ os.environ.setdefault("MODEL_ID", "test-model")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 from minicc import config, sessions
-from minicc.tools import TOOLS, TOOL_HANDLERS, READ_ONLY_TOOLS
+from minicc.tools import TOOLS, TOOL_HANDLERS
 
 
 # ─── registration: a server tool, not a client tool ──────────────────────────
@@ -20,8 +20,9 @@ def test_server_tool_entry_shape():
 
 
 def test_no_client_handler_and_not_for_subagents():
+    from minicc import agents
     assert "web_search" not in TOOL_HANDLERS           # server-executed
-    assert "web_search" not in {t["name"] for t in READ_ONLY_TOOLS}
+    assert "web_search" not in agents.resolve("explore").tools
 
 
 # ─── config opt-out ──────────────────────────────────────────────────────────

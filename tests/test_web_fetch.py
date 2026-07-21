@@ -192,10 +192,11 @@ def test_extract_routes_through_llm_response(monkeypatch):
 
 # ─── registration + gating ───────────────────────────────────────────────────
 def test_registered_but_not_for_subagents():
-    from minicc.tools import TOOLS, READ_ONLY_TOOLS, TOOL_HANDLERS
+    from minicc import agents
+    from minicc.tools import TOOLS, TOOL_HANDLERS
     assert "web_fetch" in TOOL_HANDLERS
     assert "web_fetch" in {t["name"] for t in TOOLS}
-    assert "web_fetch" not in {t["name"] for t in READ_ONLY_TOOLS}
+    assert "web_fetch" not in agents.resolve("explore").tools
     schema = next(t for t in TOOLS if t["name"] == "web_fetch")
     assert schema["input_schema"]["required"] == ["url", "prompt"]   # CC shape
 

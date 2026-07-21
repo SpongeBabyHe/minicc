@@ -151,8 +151,7 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
         ux.say(f"{indent}[Stop hook blocked stopping — continuing]", style=ux.S_INFO)
         fb = {"role": "user", "content": note}
         messages.append(fb)
-        if session_id:
-            sessions.append_message(session_id, fb)
+        sessions.append_message(session_id, fb)  # session_id is non-empty here
         return True
 
     if d.additional_context:
@@ -161,8 +160,7 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
         # as UserPromptSubmit context, which the API accepts (live-verified).
         ctx = {"role": "user", "content": "\n".join(d.additional_context)}
         messages.append(ctx)
-        if session_id:
-            sessions.append_message(session_id, ctx)
+        sessions.append_message(session_id, ctx)
     return False
 
 

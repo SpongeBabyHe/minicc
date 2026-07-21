@@ -39,7 +39,7 @@ def get_model() -> str:
 
 
 def set_model(model_id: str) -> None:
-    """Switch the model for in-session."""
+    """Switch the session's model in place (see /model; not persisted)."""
     global MODEL
     MODEL = model_id
 
@@ -191,7 +191,7 @@ def _estimate_tokens(messages) -> int:
     """
     try:
         return len(json.dumps(messages, default=str)) // 4
-    except Exception as e:
+    except Exception:
         return 0
 
 
@@ -286,6 +286,19 @@ def _find_cut_index(messages) -> int | None:
     return None
 
 
+def _record_usage(usage) -> tuple[int, int]:
+    """Accumulate one response's token usage into the session counters (/cost).
+    Returns (cache_read, cache_creation) — llm_response also needs them to
+    compute the next turn's real input size."""
+    cache_r = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_c = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    _USAGE["input"] += usage.input_tokens
+    _USAGE["output"] += usage.output_tokens
+    _USAGE["cache_read"] += cache_r
+    _USAGE["cache_creation"] += cache_c
+    return cache_r, cache_c
+
+
 def _summarize(
     messages,
     focus: str | None = None,
@@ -305,8 +318,9 @@ def _summarize(
     it falls back to a normal — same-sized — request). See CONTEXT_MANAGEMENT.md.
 
     `system`/`tools` MUST match the caller's live turn (a sub-agent passes its own
-    SUBAGENT_PROMPT + READ_ONLY_TOOLS) — otherwise the prefix mismatches and the
-    call both misses the cache and summarizes under the wrong context. `focus`
+    system prompt + tool subset from its AgentDef) — otherwise the prefix
+    mismatches and the call both misses the cache and summarizes under the wrong
+    context. `focus`
     steers what to preserve (`/compact <focus>`); `model` lets a sub-agent's
     compaction run on its own model. Returns None if the model produced no text
     (e.g. it emitted only a tool_use), so the caller can refuse to destroy history.
@@ -320,10 +334,7 @@ def _summarize(
         tools=tools if tools is not None else TOOLS,
         messages=_cacheable(list(messages) + [instruction]),
     )
-    _USAGE["input"] += resp.usage.input_tokens
-    _USAGE["output"] += resp.usage.output_tokens
-    _USAGE["cache_read"] += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
-    _USAGE["cache_creation"] += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+    _record_usage(resp.usage)
     # tools are in scope, so the model *could* answer with a tool_use and no text.
     # Return the first text block, or None — never a fake summary (a caller that
     # replaces history with an empty summary would silently destroy context).
@@ -560,12 +571,7 @@ def llm_response(
         params["messages"] = _cacheable(messages)
         response = _send_request(params, stream)
 
-    cache_r = getattr(response.usage, "cache_read_input_tokens", 0) or 0
-    cache_c = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-    _USAGE["input"] += response.usage.input_tokens
-    _USAGE["output"] += response.usage.output_tokens
-    _USAGE["cache_read"] += cache_r
-    _USAGE["cache_creation"] += cache_c
+    cache_r, cache_c = _record_usage(response.usage)
     # Server-tool usage (web_search): billed per search ($10/1k), shown in /cost.
     stu = getattr(response.usage, "server_tool_use", None)
     if stu:
@@ -585,7 +591,8 @@ def context_usage(messages) -> dict:
 
     `estimated_tokens` is the real input size of the last request
     (response.usage), or a char-estimate before the first response. `budget` is
-    the compaction trigger: min(95% of the model window, the safe ceiling).
+    the compaction trigger: the model window minus COMPACT_BUFFER_TOKENS
+    (CC's `effectiveContextWindow - 13K`; see _effective_budget).
     """
     tokens = _context_size(messages)
     budget = _effective_budget(MODEL)

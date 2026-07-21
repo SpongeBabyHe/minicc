@@ -235,26 +235,26 @@ def _repair_dangling_tool_uses(msgs: list) -> list:
     return out
 
 
-def load(session_id: str) -> list | None:
-    """Replay the transcript into the working set (dict-form, API-ready). None if
-    the session doesn't exist."""
+def _load(session_id: str, upto: int | None) -> list | None:
+    """Replay the transcript into a working set (dict-form, API-ready), optionally
+    stopping after the first `upto` events. None if the session doesn't exist or
+    the file is unreadable/corrupt."""
     path = _path(session_id)
     if not path.exists():
         return None
     try:
-        return _replay(path.read_text(encoding="utf-8").splitlines())
+        return _replay(path.read_text(encoding="utf-8").splitlines(), upto=upto)
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def load(session_id: str) -> list | None:
+    """The full transcript replayed into the working set (--continue/--resume)."""
+    return _load(session_id, upto=None)
 
 
 def load_upto(session_id: str, n_events: int) -> list | None:
     """The working set as of the first `n_events` transcript events — the state a
     conversation rewind restores to. Replaying (not slicing the live history)
-    means it works across compaction boundaries. None if the session doesn't exist."""
-    path = _path(session_id)
-    if not path.exists():
-        return None
-    try:
-        return _replay(path.read_text(encoding="utf-8").splitlines(), upto=n_events)
-    except (json.JSONDecodeError, OSError):
-        return None
+    means it works across compaction boundaries."""
+    return _load(session_id, upto=n_events)
