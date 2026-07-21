@@ -1,7 +1,7 @@
 from minicc.llm import llm_response
 from minicc.tools import TOOLS, TOOL_HANDLERS
 from minicc.permissions import confirm
-from minicc import ux
+from minicc import compact, ux
 from minicc import checkpoints
 from minicc import sessions
 from minicc import hooks
@@ -20,6 +20,7 @@ def agent_loop(
     indent: str = "",
     model: str | None = None,
     session_id: str | None = None,
+    ctx: compact.ContextState | None = None,
 ):
     """Run the agent loop until the model stops requesting tools.
 
@@ -28,12 +29,17 @@ def agent_loop(
     max_turns : cap the number of model turns (sub-agents pass a limit so a
                 runaway exploration can't loop forever).
     indent    : prefix for tool-call/result lines, so a sub-agent's activity
-                nests visually under the parent's `task(...)` call.
+                nests visually under the parent's `agent(...)` call.
     model     : per-call model override (sub-agents run on a cheaper model);
                 None = the global MODEL. Threaded to llm_response without
                 mutating the global, so the parent's cache/model are untouched.
+    ctx       : this conversation's context-trigger state (compact.ContextState).
+                The main session passes its persistent one; omitted (sub-agents,
+                /memory consolidate) a fresh one is created here — one per
+                conversation, so loops never share trigger state.
     """
     tools = tools if tools is not None else TOOLS
+    ctx = ctx if ctx is not None else compact.ContextState()
     allowed = {t["name"] for t in tools}  # guard: model can't call un-advertised tools
     turns = 0
     stop_blocks = 0  # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
@@ -49,6 +55,7 @@ def agent_loop(
             tools=tools,
             model=model,
             session_id=session_id,
+            ctx=ctx,
         )
         assistant_msg = {"role": "assistant", "content": response.content}
         messages.append(assistant_msg)

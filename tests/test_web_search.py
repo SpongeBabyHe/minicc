@@ -51,7 +51,7 @@ def test_agent_loop_continues_on_pause_turn(monkeypatch):
             self.stop_reason = stop
             self.content = [_Blk()]
 
-    def fake_llm(messages, system=None, stream=True, tools=None, model=None, session_id=None):
+    def fake_llm(messages, system=None, stream=True, tools=None, model=None, session_id=None, ctx=None):
         calls["n"] += 1
         return _Resp("pause_turn" if calls["n"] == 1 else "end_turn")
 
@@ -86,7 +86,8 @@ def test_llm_response_counts_web_searches(monkeypatch):
         stop_reason = "end_turn"
 
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: _Resp())
-    monkeypatch.setattr(llm, "_effective_budget", lambda model: 10_000_000)
+    from minicc import compact
+    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
     before = llm.get_usage()["web_searches"]
     llm.llm_response([{"role": "user", "content": "hi"}], stream=False)
     assert llm.get_usage()["web_searches"] == before + 3

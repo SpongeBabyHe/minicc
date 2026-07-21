@@ -13,10 +13,10 @@ from anthropic import (
     APITimeoutError,
     RateLimitError,
 )
-from minicc import llm
+from minicc import compact, llm
 from minicc.query_engine import agent_loop
 from minicc import ux
-from minicc.llm import get_usage, context_usage, compact, recap
+from minicc.llm import get_usage
 from minicc import permissions
 from minicc import sessions
 from minicc import config
@@ -58,21 +58,21 @@ _INIT_PROMPT = (
     "tests. Include the necessary commands to develop in this codebase, such as "
     "how to run a single test.\n"
     "2. High-level code architecture and structure so that future instances can be "
-    "productive more quickly. Focus on the \"big picture\" architecture that "
+    'productive more quickly. Focus on the "big picture" architecture that '
     "requires reading multiple files to understand.\n\n"
     "Usage notes:\n"
     "- VERIFY each command works by actually running it (bash) before documenting "
     "it; if it needs env vars or a .env file, say so next to the command. If you "
     "cannot verify a command, do not present it as working.\n"
-    "- Before writing a claim containing \"all\", \"only\", \"both\" or "
-    "\"never\", check each member it quantifies over.\n"
+    '- Before writing a claim containing "all", "only", "both" or '
+    '"never", check each member it quantifies over.\n'
     "- Explore with glob/grep/read_file; batch independent file reads as parallel "
     "tool calls in a single turn — each extra turn re-reads the whole context.\n"
     "- If there's already a CLAUDE.md, improve it in place rather than duplicating.\n"
     "- Do not repeat yourself and do not include obvious instructions like "
-    "\"Provide helpful error messages to users\", \"Write unit tests for all new "
-    "utilities\", \"Never include sensitive information (API keys, tokens) in "
-    "code or commits\".\n"
+    '"Provide helpful error messages to users", "Write unit tests for all new '
+    'utilities", "Never include sensitive information (API keys, tokens) in '
+    'code or commits".\n'
     "- Avoid listing every component or file structure that can be easily "
     "discovered.\n"
     "- Don't include generic development practices.\n"
@@ -80,8 +80,8 @@ _INIT_PROMPT = (
     "rules (in .github/copilot-instructions.md), make sure to include the "
     "important parts.\n"
     "- If there is a README.md, make sure to include the important parts.\n"
-    "- Do not make up information such as \"Common Development Tasks\", \"Tips "
-    "for Development\", \"Support and Documentation\" unless this is expressly "
+    '- Do not make up information such as "Common Development Tasks", "Tips '
+    'for Development", "Support and Documentation" unless this is expressly '
     "included in other files that you read.\n"
     "- Be sure to prefix the file with the following text:\n\n"
     "```\n"
@@ -124,7 +124,9 @@ def _fire_session_end(session_id: str, reason: str) -> None:
     """Run SessionEnd hooks (reason: "clear" | "prompt_input_exit" — CC's other
     reasons target absent infra). Informational only: exit codes and decision
     fields are ignored per CC's contract; only systemMessage surfaces."""
-    d = hooks.run("SessionEnd", session_id=session_id, match_value=reason, reason=reason)
+    d = hooks.run(
+        "SessionEnd", session_id=session_id, match_value=reason, reason=reason
+    )
     for m in d.system_messages:
         ux.say(f"[hook] {m}", style=ux.S_INFO)
 
@@ -171,7 +173,10 @@ def _cmd_help():
                 ),
                 ("/compact [focus]", "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
-                ("/memory [file|on|off|consolidate]", "Browse, toggle, or tidy cross-session memory"),
+                (
+                    "/memory [file|on|off|consolidate]",
+                    "Browse, toggle, or tidy cross-session memory",
+                ),
                 (
                     "/rewind [N] [mode]",
                     "List restore points; restore code (default) | conversation | both",
@@ -198,7 +203,7 @@ def _cmd_cost():
         + u["cache_read"] * _PRICE_CACHE_READ_PER_M
         + u["cache_creation"] * _PRICE_CACHE_WRITE_PER_M
     ) / 1_000_000
-    cost += u.get("web_searches", 0) * 0.01   # server web_search: $10 per 1,000
+    cost += u.get("web_searches", 0) * 0.01  # server web_search: $10 per 1,000
     total_in = u["input"] + u["cache_read"] + u["cache_creation"]
     hit = (u["cache_read"] / total_in * 100) if total_in else 0
     ux.say(
@@ -215,11 +220,11 @@ def _cmd_cost():
     )
 
 
-def _cmd_context(messages):
+def _cmd_context(messages, ctx):
     """
     Show context token usage vs the compaction budget.
     """
-    c = context_usage(messages)
+    c = compact.context_usage(ctx, messages, model=llm.get_model())
     ux.say(
         ux.kv_block(
             [
@@ -227,7 +232,10 @@ def _cmd_context(messages):
                     "context tokens",
                     f"{c['estimated_tokens']:,}  (~{c['pct_of_budget']:.0f}% of compaction budget)",
                 ),
-                ("compaction budget", f"{c['budget']:,}  (auto-compaction triggers above this)"),
+                (
+                    "compaction budget",
+                    f"{c['budget']:,}  (auto-compaction triggers above this)",
+                ),
                 ("messages", str(c["messages"])),
                 ("tool_results", f"{c['tool_results']} total, {c['evicted']} evicted"),
                 ("eviction events", str(c["eviction_events"])),
@@ -241,9 +249,13 @@ def _cmd_context(messages):
     )
 
 
-def _cmd_compact(messages, focus: str | None = None, session_id: str | None = None):
-    """Manually compact history (L6b). Mutates `messages` in place."""
-    did = compact(messages, focus=focus, session_id=session_id)
+def _cmd_compact(
+    messages, ctx, focus: str | None = None, session_id: str | None = None
+):
+    """Manually compact history. Mutates `messages` in place."""
+    did = compact.compact(
+        ctx, messages, focus=focus, session_id=session_id, trigger="manual"
+    )
     if did:
         ux.say("conversation history compacted", style=ux.S_INFO)
     else:
@@ -251,8 +263,8 @@ def _cmd_compact(messages, focus: str | None = None, session_id: str | None = No
 
 
 def _cmd_recap(messages):
-    """Show a summary of the conversation without changing it (L6c)."""
-    summary = recap(messages)
+    """Show a summary of the conversation without changing it."""
+    summary = compact.recap(messages)
     ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
     ux.markdown(summary)
 
@@ -266,7 +278,9 @@ def _cmd_memory(arg: str | None):
         memory.set_enabled(arg == "on")
         # no file changed, so the reminder poller wouldn't notice — force it
         reminders.invalidate()
-        ux.say(f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO)
+        ux.say(
+            f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO
+        )
         return
     if arg == "consolidate":
         if not memory.enabled():
@@ -346,7 +360,7 @@ def _cmd_model(arg: str | None):
     ux.say(f"model → {target}  (this session)", style=ux.S_INFO)
 
 
-def _cmd_rewind(history, arg: str | None, session_id: str | None = None):
+def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=None):
     """List restore points, or `/rewind N [code|conversation|both]` to restore.
     N is the position in the /rewind list (every turn is a restore point, like
     CC's one-checkpoint-per-prompt). Modes: `code` (default) reverts files and
@@ -400,7 +414,8 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None):
             return
         history[:] = rewound
         sessions.log_rewind(session_id, history)  # append-only: a reset event
-        llm.reset_context_size()  # forget the pre-rewind size (avoid spurious compact)
+        if ctx:
+            ctx.reset_size()  # forget the pre-rewind size (avoid spurious compact)
         ux.say(
             f"conversation rewound to before turn {turn}; its prompt was: {ux.truncate(query, 80)}",
             style=ux.S_INFO,
@@ -423,7 +438,6 @@ def _cmd_clear(history, session_id: str) -> str:
     _fire_session_end(session_id, "clear")  # old session ends (CC reason "clear")
     history.clear()
     new_id = sessions.new_id()
-    llm.reset_context_size()  # stale size would trigger a spurious compact
     permissions.reset()
     permissions.preload(config.allowed_tools())  # keep settings-trusted tools
     checkpoints.reset()
@@ -460,7 +474,9 @@ def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
             style=ux.S_INFO,
         )
     if history:
-        ux.say(f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO)
+        ux.say(
+            f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO
+        )
     ux.console.rule()
 
 
@@ -605,6 +621,9 @@ def main():
         _session_context_with_hooks(session_id, "resume" if history else "startup")
     )
     _print_startup_banner(pre_approved, refused, session_id, history)
+    ctx = (
+        compact.ContextState()
+    )  # this conversation's trigger state (rotated on /clear)
     turn = 0
     while True:
         try:
@@ -641,15 +660,20 @@ def main():
             builtins = {
                 "/help": _cmd_help,
                 "/cost": _cmd_cost,
-                "/context": lambda: _cmd_context(history),
+                "/context": lambda: _cmd_context(history, ctx),
                 "/model": lambda: _cmd_model(arg),
-                "/compact": lambda: _cmd_compact(history, focus=arg, session_id=session_id),
+                "/compact": lambda: _cmd_compact(
+                    history, ctx, focus=arg, session_id=session_id
+                ),
                 "/recap": lambda: _cmd_recap(history),
                 "/memory": lambda: _cmd_memory(arg),
-                "/rewind": lambda: _cmd_rewind(history, arg, session_id=session_id),
+                "/rewind": lambda: _cmd_rewind(
+                    history, arg, session_id=session_id, ctx=ctx
+                ),
             }
             if cmd == "/clear":
                 session_id = _cmd_clear(history, session_id)
+                ctx = compact.ContextState()  # fresh conversation, fresh trigger state
                 turn = 0
             elif cmd in builtins:
                 builtins[cmd]()
@@ -715,7 +739,9 @@ def main():
         checkpoints.start(turn, query, events=events)  # files + conversation anchor
 
         try:
-            agent_loop(history, session_id=session_id)  # streams; records incrementally
+            agent_loop(
+                history, session_id=session_id, ctx=ctx
+            )  # streams; records incrementally
         except KeyboardInterrupt:
             # Ctrl-C during a slow tool (e.g. bash) leaves an assistant tool_use
             # with no following tool_result. The next request then 400s:

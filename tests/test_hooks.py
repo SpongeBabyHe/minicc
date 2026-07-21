@@ -214,7 +214,7 @@ def test_load_hooks_disable_in_either_file(tmp_path, monkeypatch):
     assert disabled
 
 
-# ─── wiring: PreCompact / PostCompact around llm._compact ───────────────────
+# ─── wiring: PreCompact / PostCompact around compact.compact ────────────────
 
 def _alternating(n):
     """n messages of valid user/assistant alternation (odd indices = assistant),
@@ -226,20 +226,20 @@ def _alternating(n):
 
 
 def test_precompact_block_stops_compaction_before_llm(monkeypatch):
-    from minicc import llm
+    from minicc import compact
 
     _use({"PreCompact": [_group("echo 'not now' >&2; exit 2", matcher="manual")]}, monkeypatch=monkeypatch)
     monkeypatch.setattr(
-        llm, "_summarize", lambda *a, **k: pytest.fail("summary LLM call ran despite block")
+        compact, "_summarize", lambda *a, **k: pytest.fail("summary LLM call ran despite block")
     )
     msgs = _alternating(10)
     before = list(msgs)
-    assert llm.compact(msgs) is False
+    assert compact.compact(compact.ContextState(), msgs, trigger="manual") is False
     assert msgs == before  # history untouched
 
 
 def test_postcompact_fires_with_compact_reason(tmp_path, monkeypatch):
-    from minicc import llm
+    from minicc import compact
 
     out = tmp_path / "post.txt"
     cmd = (
@@ -247,20 +247,20 @@ def test_postcompact_fires_with_compact_reason(tmp_path, monkeypatch):
         f"pathlib.Path(r'{out}').write_text(json.load(sys.stdin)['compact_reason'])\""
     )
     _use({"PostCompact": [_group(cmd, matcher="manual")]}, monkeypatch=monkeypatch)
-    monkeypatch.setattr(llm, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(compact, "_summarize", lambda *a, **k: "SUMMARY")
     msgs = _alternating(10)
-    assert llm.compact(msgs) is True
+    assert compact.compact(compact.ContextState(), msgs, trigger="manual") is True
     assert msgs[0]["role"] == "user" and "SUMMARY" in msgs[0]["content"]
     assert out.read_text() == "manual"  # CC payload field, matcher matched
 
 
 def test_precompact_auto_matcher_skips_manual_compact(monkeypatch):
-    from minicc import llm
+    from minicc import compact
 
     _use({"PreCompact": [_group("exit 2", matcher="auto")]}, monkeypatch=monkeypatch)
-    monkeypatch.setattr(llm, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(compact, "_summarize", lambda *a, **k: "SUMMARY")
     msgs = _alternating(10)
-    assert llm.compact(msgs) is True  # auto-scoped hook must not block /compact
+    assert compact.compact(compact.ContextState(), msgs, trigger="manual") is True  # auto-scoped hook must not block /compact
 
 
 # ─── wiring: SessionStart / SessionEnd in the CLI ───────────────────────────
