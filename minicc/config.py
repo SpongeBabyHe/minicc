@@ -53,6 +53,27 @@ def config_roots(subdir: str):
     yield Path.home() / ".minicc" / subdir  # personal LAST — overrides project
 
 
+def _self_ignore(minicc_dir: Path) -> None:
+    """Drop a self-ignoring .gitignore into a .minicc/ dir (once) — so nothing
+    minicc writes there can ever be git-tracked, even in a project whose own
+    .gitignore doesn't cover it."""
+    gi = minicc_dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n")
+
+
+def ensure_project_dir(subdir: str = "") -> Path:
+    """`.minicc/<subdir>` under cwd, created if needed and self-ignoring. The
+    shared home for minicc's on-disk state (sessions, tasks, checkpoints, bash
+    outputs, repl history). Settings writers derive from _project() instead —
+    that path is a test seam and must stay the single source of truth."""
+    root = Path.cwd() / ".minicc"
+    d = root / subdir if subdir else root
+    d.mkdir(parents=True, exist_ok=True)
+    _self_ignore(root)
+    return d
+
+
 def _read(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
@@ -78,10 +99,7 @@ def set_default_model(model_id: str, scope: str = "global") -> Path:
     path = _global() if scope == "global" else _project()
     path.parent.mkdir(parents=True, exist_ok=True)
     if scope == "project":
-        # keep project .minicc/ self-ignoring, like sessions + repl_history
-        gi = path.parent / ".gitignore"
-        if not gi.exists():
-            gi.write_text("*\n")
+        _self_ignore(path.parent)  # keep project .minicc/ self-ignoring
     data = _read(path)
     data["default_model"] = model_id
     path.write_text(json.dumps(data, indent=2))
@@ -166,9 +184,7 @@ def add_allow_rule(pattern: str) -> Path:
     convention; read back case-insensitively."""
     path = _project()
     path.parent.mkdir(parents=True, exist_ok=True)
-    gi = path.parent / ".gitignore"  # keep project .minicc/ self-ignoring
-    if not gi.exists():
-        gi.write_text("*\n")
+    _self_ignore(path.parent)  # keep project .minicc/ self-ignoring
     data = _read(path)
     # tolerate hand-edited malformation (permissions: [] etc.) — a crash here
     # would land in the middle of an approval prompt

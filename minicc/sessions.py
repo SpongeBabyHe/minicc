@@ -28,6 +28,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from minicc import config
+
 _SESSIONS_SUBDIR = ".minicc/sessions"
 
 
@@ -78,18 +80,8 @@ def _serialize_messages(messages) -> list:
     return [_serialize_message(m) for m in messages]
 
 
-def _ensure_dir() -> Path:
-    d = _dir()
-    d.mkdir(parents=True, exist_ok=True)
-    # self-ignoring .minicc/ so session files never get git-tracked
-    gitignore = d.parent / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("*\n")
-    return d
-
-
 def _append_event(session_id: str, event: dict) -> None:
-    _ensure_dir()
+    config.ensure_project_dir("sessions")
     with _path(session_id).open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 

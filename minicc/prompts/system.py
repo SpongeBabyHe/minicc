@@ -110,44 +110,6 @@ def build_session_context() -> str:
     return "\n".join(lines)
 
 
-def _read_claude_md(path: Path) -> str:
-    """One CLAUDE.md, in full. "" if missing/empty.
-
-    No truncation: CC's memory doc is explicit — "CLAUDE.md files are loaded
-    in full regardless of length"; the 200-line/25KB limit "applies only to
-    MEMORY.md" (which minicc enforces in memory.load_index). This function
-    truncated until 2026-07-16, citing "CC's limits" — a misattribution of the
-    MEMORY.md-only limit, caught by re-reading the official page."""
-    if not path.exists():
-        return ""
-    try:
-        return path.read_text().strip()
-    except OSError:
-        return ""
-
-
-def claude_md_files() -> list[tuple[Path, str]]:
-    """(path, text) for CLAUDE.md in cwd AND every ancestor directory.
-
-    CC's monorepo behavior: parent directories' CLAUDE.md files are pulled in
-    automatically alongside the project's own (root conventions + subproject
-    specifics), outermost first so the nearest file reads last and wins where
-    they disagree. Each file loads IN FULL (see _read_claude_md).
-
-    Consumed by reminders.py, which injects each file as a labeled
-    "Contents of <path> …" section of the claudeMd system-reminder — CC's
-    message-stream mechanism, NOT a system-prompt cache layer (the old
-    load_project_context design; see reminders.py for why it moved).
-    Recorded divergences (memory doc, re-read 2026-07-16): no ~/.claude global
-    CLAUDE.md (auto-memory covers that role), no CLAUDE.local.md, no on-demand
-    child-directory loading, no ./.claude/CLAUDE.md alternate location, no
-    @path imports (CC expands them at launch, depth 4), no stripping of
-    block-level HTML comments before injection.
-    """
-    cwd = Path.cwd()
-    out = []
-    for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd
-        text = _read_claude_md(d / "CLAUDE.md")
-        if text:
-            out.append((d / "CLAUDE.md", text))
-    return out
+# CLAUDE.md discovery lives in reminders.py: CLAUDE.md is delivered by the
+# claudeMd system-reminder (CC's message-stream mechanism), not by any prompt
+# layer this module builds.

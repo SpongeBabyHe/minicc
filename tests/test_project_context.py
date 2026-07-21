@@ -12,7 +12,7 @@ import os
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
-from minicc.prompts.system import claude_md_files
+from minicc.reminders import claude_md_files
 
 
 def test_cwd_claude_md_loads(tmp_path, monkeypatch):

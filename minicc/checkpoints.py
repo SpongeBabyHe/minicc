@@ -11,6 +11,8 @@ prompt); each records the session transcript's event count at turn start, so
 
 from pathlib import Path
 
+from minicc import config
+
 ABSENT = None  # sentinel: file did not exist at checkpoint time → delete on rewind
 
 _DIR_NAME = ".minicc/checkpoints"
@@ -63,11 +65,7 @@ def before_write(path):
         cp["files"][path] = ABSENT
         return
     if cp["dir"] is None:
-        cp["dir"] = _root() / str(cp["turn"])
-        cp["dir"].mkdir(parents=True, exist_ok=True)
-        gi = _root().parent / ".gitignore"  # keep .minicc/ self-ignoring
-        if not gi.exists():
-            gi.write_text("*\n")
+        cp["dir"] = config.ensure_project_dir(f"checkpoints/{cp['turn']}")
     backup_id = str(len(cp["files"]))
     (cp["dir"] / backup_id).write_bytes(p.read_bytes())
     cp["files"][path] = backup_id

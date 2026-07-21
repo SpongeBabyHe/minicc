@@ -1,7 +1,8 @@
 import re
 import subprocess
-from pathlib import Path
 import uuid
+
+from minicc import config
 
 DEFAULT_MAX_OUTPUT = 30_000      # CC's default
 PREVIEW_CHARS = 2_000             # how much to show inline when truncated
@@ -55,20 +56,6 @@ _DANGEROUS = [
 ]
 
 
-def _ensure_output_dir() -> Path:
-    """Return .minicc/bash_outputs/ in the current project, creating it if needed.
-
-    Also writes a self-ignoring .gitignore inside .minicc/ so even if the project
-    doesn't have .minicc/ in its own .gitignore, contents stay untracked.
-    """
-    out_dir = Path.cwd() / ".minicc" / "bash_outputs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    gitignore = out_dir.parent / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("*\n")
-    return out_dir
-
-
 def bash(command: str, timeout: int | None = None) -> str:
     if any(p.search(command) for p in _DANGEROUS):
         return "Error: command blocked by safety filter (matched a destructive pattern)"
@@ -96,7 +83,7 @@ def bash(command: str, timeout: int | None = None) -> str:
         return out
 
     # Output too large — save full to disk, return path + preview
-    out_dir = _ensure_output_dir()
+    out_dir = config.ensure_project_dir("bash_outputs")
     file_id = uuid.uuid4().hex[:8]
     path = out_dir / f"{file_id}.txt"
     path.write_text(out)

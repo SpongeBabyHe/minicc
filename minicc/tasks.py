@@ -32,6 +32,8 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
+from minicc import config
+
 try:
     import fcntl
 except ImportError:  # non-unix: locking degrades to a no-op (darwin/linux have it)
@@ -42,12 +44,7 @@ _MARK = {"completed": "✓", "in_progress": "▶", "pending": "☐"}
 
 
 def _dir() -> Path:
-    d = Path.cwd() / ".minicc" / "tasks"
-    d.mkdir(parents=True, exist_ok=True)
-    gi = d.parent / ".gitignore"  # keep .minicc/ self-ignoring (sessions precedent)
-    if not gi.exists():
-        gi.write_text("*\n")
-    return d
+    return config.ensure_project_dir("tasks")
 
 
 @contextmanager

@@ -497,11 +497,7 @@ def _setup_history():
         readline.parse_and_bind("set enable-bracketed-paste on")
     except Exception:
         pass  # editline or old readline: _read_query's drain is the fallback
-    histfile = Path.cwd() / ".minicc" / "repl_history"
-    histfile.parent.mkdir(parents=True, exist_ok=True)
-    gi = histfile.parent / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n")
+    histfile = config.ensure_project_dir() / "repl_history"
     try:
         readline.read_history_file(histfile)
     except (FileNotFoundError, OSError):
