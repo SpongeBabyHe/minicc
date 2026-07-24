@@ -73,8 +73,40 @@ def _load() -> tuple[dict, bool]:
 
 @dataclass
 class Decision:
-    """Normalized outcome of the hooks for one event. Sticky where it must be: once a
-    hook blocks, a later hook can't un-block it (CC: deny wins)."""
+    """Normalized outcome of ALL hooks that matched one event.
+
+    This is deliberately a UNION of every event's possible outcome: `run` is
+    mechanism-only and doesn't know what the fields mean, so each CALL SITE picks
+    the ones its event defines. Read a field against the matrix below — in
+    isolation the type says nothing about what is meaningful when.
+
+    | event            | consumer                    | fields it reads                                    |
+    |------------------|-----------------------------|----------------------------------------------------|
+    | PreToolUse       | query_engine._run_tool      | block · allow · ask · reason · updated_input · ctx  |
+    | PostToolUse      | query_engine._post_tool     | block+reason (as a note) · updated_output · ctx     |
+    | Stop             | query_engine._stop_gate     | block · stop · reason · ctx                         |
+    | UserPromptSubmit | cli.main                    | block · stop · reason · ctx                         |
+    | PreCompact       | compact.compact             | block · stop · reason                               |
+    | PostCompact      | compact.compact             | (notification only)                                 |
+    | SessionStart     | cli._fire_session_start     | ctx (joins the session-context layer)               |
+    | SessionEnd       | cli._fire_session_end       | (notification only)                                 |
+
+    `system_messages` is the one field EVERY site reads (surfaced via `surface`).
+    `additional_context` ("ctx" above) is injected five different ways: appended
+    to the tool result (PreToolUse), added as notes (PostToolUse), entered into
+    the conversation (Stop), added as an extra user message (UserPromptSubmit),
+    or folded into the session-context layer (SessionStart).
+
+    ACCUMULATION across the hooks of one event (`run` threads one instance
+    through all of them):
+      - lists (`system_messages`, `additional_context`) APPEND;
+      - booleans (`block`, `allow`, `stop`) LATCH True and never fall back —
+        that's CC's deny-wins stickiness (precedence between block and stop is
+        resolved at the call site, not here — see `run`);
+      - scalars (`reason`, `updated_input`, `updated_output`) are
+        LAST-WRITER-WINS: with two hooks rewriting the same tool input, the
+        earlier rewrite is silently dropped.
+    """
 
     block: bool = False  # a hook said "block" (meaning is per-event)
     allow: bool = False  # PreToolUse "allow": bypass the permission gate
@@ -86,6 +118,14 @@ class Decision:
     updated_output: str | None = None  # PostToolUse: replace the tool result text
     system_messages: list = field(default_factory=list)  # shown to the user
     additional_context: list = field(default_factory=list)  # injected for the model
+
+
+def surface(decision: Decision, indent: str = "") -> None:
+    """Show a Decision's `system_messages` to the user — the one field every call
+    site consumes, identically. Kept here so the "[hook] …" presentation has a
+    single home instead of eight copies of the same loop."""
+    for m in decision.system_messages:
+        ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
 
 
 def _match(matcher, value: str) -> bool:
@@ -119,7 +159,16 @@ def run(
     """Fire every configured command hook for `event` whose matcher accepts
     `match_value` (the tool name for tool events; "" for events without matchers).
     `payload` is merged into the JSON sent on the hook's stdin. Returns a Decision the
-    caller interprets. No hooks / disabled → an empty (no-op) Decision."""
+    caller interprets. No hooks / disabled → an empty (no-op) Decision.
+
+    Mechanism only: this never decides what `block` MEANS, and never resolves the
+    block-vs-stop precedence — both are per-event and belong to the call site. The
+    two shapes in use, and why they differ:
+      - `block or stop`  (UserPromptSubmit, PreCompact) — both mean "don't
+        proceed", so either one is enough to refuse.
+      - `block and not stop`  (Stop) — here they are OPPOSITES: `block` means
+        "don't end the turn" while `stop` (continue:false) means "end it now", so
+        continue:false must override the block (CC's precedence)."""
     events, disabled = _load()
     decision = Decision()
     if disabled:

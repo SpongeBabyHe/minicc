@@ -172,11 +172,12 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
         b.text for b in response.content if getattr(b, "type", "") == "text"
     )
     d = hooks.run("Stop", session_id=session_id, last_assistant_message=last_text)
-    for m in d.system_messages:
-        ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
+    hooks.surface(d, indent)
     if d.stop and d.stop_reason:
         ux.say(f"{indent}[Stop hook: {d.stop_reason}]", style=ux.S_INFO)
 
+    # `and not d.stop`: for Stop these are OPPOSITES — block says "keep going",
+    # continue:false says "end now" — so continue:false wins (CC precedence).
     if d.block and not d.stop and blocks_so_far >= MAX_STOP_BLOCKS:
         ux.say(
             f"{indent}[Stop hook still blocking after {MAX_STOP_BLOCKS} attempts — "
@@ -218,8 +219,7 @@ def _run_tool(block, allowed, session_id, indent) -> str:
         tool_name=block.name,
         tool_input=block.input,
     )
-    for m in pre.system_messages:
-        ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
+    hooks.surface(pre, indent)
 
     handler = TOOL_HANDLERS.get(block.name)
     tool_input = pre.updated_input if pre.updated_input is not None else block.input
@@ -261,8 +261,7 @@ def _post_tool(block, tool_input, output, session_id, indent) -> str:
         tool_input=tool_input,
         tool_response={"type": "text", "text": output},
     )
-    for m in post.system_messages:
-        ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
+    hooks.surface(post, indent)
     if post.updated_output is not None:
         output = post.updated_output
     notes = list(post.additional_context)

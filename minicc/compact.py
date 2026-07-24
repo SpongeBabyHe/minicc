@@ -299,8 +299,9 @@ def compact(
     pre = hooks.run(
         "PreCompact", session_id=session_id, match_value=trigger, compact_reason=trigger
     )
-    for m in pre.system_messages:
-        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    hooks.surface(pre)
+    # `or`: for PreCompact both mean "do not compact" (unlike Stop, where
+    # block and continue:false are opposites).
     if pre.block or pre.stop:
         reason = pre.reason or pre.stop_reason or "no reason given"
         ux.say(f"[compaction blocked by PreCompact hook: {reason}]", style=ux.S_INFO)
@@ -337,8 +338,7 @@ def compact(
     post = hooks.run(
         "PostCompact", session_id=session_id, match_value=trigger, compact_reason=trigger
     )
-    for m in post.system_messages:
-        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    hooks.surface(post)
     return True
 
 

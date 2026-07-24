@@ -106,8 +106,7 @@ def _fire_session_start(session_id: str, source: str) -> str:
         source=source,
         model=llm.get_model(),
     )
-    for m in d.system_messages:
-        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    hooks.surface(d)
     return "\n".join(d.additional_context)
 
 
@@ -127,8 +126,7 @@ def _fire_session_end(session_id: str, reason: str) -> None:
     d = hooks.run(
         "SessionEnd", session_id=session_id, match_value=reason, reason=reason
     )
-    for m in d.system_messages:
-        ux.say(f"[hook] {m}", style=ux.S_INFO)
+    hooks.surface(d)
 
 
 def _git_sha() -> str:
@@ -698,8 +696,9 @@ def main():
             session_id=session_id,
             user_prompt=expansion[1] if expansion else query,
         )
-        for m in prompt_hook.system_messages:
-            ux.say(f"[hook] {m}", style=ux.S_INFO)
+        hooks.surface(prompt_hook)
+        # `or`: for UserPromptSubmit both mean "do not proceed", so either
+        # one refuses the prompt (unlike Stop, where they are opposites).
         if prompt_hook.block or prompt_hook.stop:
             reason = prompt_hook.reason or prompt_hook.stop_reason or "no reason given"
             ux.say(f"prompt blocked by hook: {reason}", style=ux.S_ERROR)
