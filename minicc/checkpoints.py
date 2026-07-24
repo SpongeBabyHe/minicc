@@ -1,12 +1,28 @@
-"""File checkpoint / rewind — back up files before the agent edits them, so
-`/rewind N` can restore them to an earlier turn. See CHECKPOINT.md.
+"""File checkpoint / rewind — snapshot a file's bytes before the agent first
+edits it in a turn, so `/rewind N` can undo back to an earlier turn. See
+CHECKPOINT.md.
 
-Design: per-file copy (D1), per-turn (D2), backups on disk (D4) so memory stays
-flat. Only write_file/edit_file are tracked; bash-made changes are not
-(PERMISSIONS.md). Every turn is a restore point (like CC: one checkpoint per
-prompt); each records the session transcript's event count at turn start, so
-`/rewind N conversation|both` can replay the transcript back to that state
-(works across compaction boundaries — see SESSIONS.md).
+The model (one checkpoint per turn, like CC's one-checkpoint-per-prompt):
+
+- `_stack` holds one checkpoint per turn in memory. Within a turn a file is
+  backed up ONCE, on first write (later edits in the same turn restore to the
+  turn's starting state, not to an intermediate one).
+- Backup BYTES live on disk (`.minicc/checkpoints/<turn>/`), not in memory, so
+  the stack stays flat however large the files are. The turn's dir is created
+  lazily on the first backup — a read-only turn costs nothing.
+- Only write_file/edit_file are tracked; bash-made changes are invisible to it
+  (PERMISSIONS.md), so a rewind can't undo them.
+- A file that did NOT exist at checkpoint time is recorded as `ABSENT` and
+  "restored" by deletion.
+
+Two rewind flavors ride on this:
+
+- CODE: `restore_files(turn)` reverts every checkpoint from the top down to and
+  including `turn` (newest-first, so the oldest backup wins), then discards them.
+- CONVERSATION: each checkpoint also records the transcript event count at turn
+  start (`events`); `/rewind N conversation|both` replays the transcript back to
+  that point via sessions.load_upto — which works across compaction boundaries
+  (see SESSIONS.md) because it replays the log rather than slicing live history.
 """
 
 from pathlib import Path
@@ -16,7 +32,8 @@ from minicc import config
 ABSENT = None  # sentinel: file did not exist at checkpoint time → delete on rewind
 
 _DIR_NAME = ".minicc/checkpoints"
-_stack = []  # [{turn, query, events, dir: Path, files: {path: backup_id | ABSENT}}]
+# [{turn, query, events, dir: Path, files: {path: backup_id | ABSENT}}] per turn
+_stack = []
 
 
 def _root() -> Path:
@@ -103,8 +120,10 @@ def restore_files(turn: int):
                 if backup_id is ABSENT:
                     Path(path).unlink(missing_ok=True)
                 else:
-                    Path(path).parent.mkdir(parents=True, exist_ok=True)   # dir may be gone
-                    Path(path).write_bytes((cp["dir"] / backup_id).read_bytes())
+                    Path(path).parent.mkdir(parents=True,
+                                            exist_ok=True)   # dir may be gone
+                    Path(path).write_bytes(
+                        (cp["dir"] / backup_id).read_bytes())
                 restored += 1
             except OSError:
                 failed.append(path)

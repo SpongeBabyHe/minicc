@@ -313,7 +313,9 @@ def _run_shell(cmd: str) -> str:
 
 def render(sk: Skill, args: str = "") -> str:
     body, used_args = _substitute(sk.body, sk, args or "")
-    body = _SHELL.sub(lambda m: _run_shell(m.group("fenced") or m.group("inline")), body)
+    body = _SHELL.sub(
+        lambda m: _run_shell(m.group("fenced") or m.group("inline")), body
+    )
     if (args or "").strip() and not used_args:
         # CC: args with no placeholder to receive them are appended verbatim
         body += f"\n\nARGUMENTS: {args}"
@@ -366,7 +368,10 @@ def user_invoke(name: str, args: str = "") -> tuple[str, str] | None:
     sk = lookup(name)
     if sk is None or sk.meta.get("user-invocable") is False:
         return None
-    tags = [f"<command-message>{name}</command-message>", f"<command-name>/{name}</command-name>"]
+    tags = [
+        f"<command-message>{name}</command-message>",
+        f"<command-name>/{name}</command-name>",
+    ]
     if args:
         tags.append(f"<command-args>{args}</command-args>")
     return "\n".join(tags), expand(sk, args)

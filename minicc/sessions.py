@@ -34,30 +34,60 @@ _SESSIONS_SUBDIR = ".minicc/sessions"
 
 
 def _dir() -> Path:
+    """Return the sessions directory for the current working directory."""
     return Path.cwd() / _SESSIONS_SUBDIR
 
 
 def _path(session_id: str) -> Path:
+    """Return the JSONL transcript path for ``session_id``.
+
+    Args:
+        session_id: Session identifier (file stem).
+
+    Returns:
+        Path to ``<session_id>.jsonl`` under the sessions directory.
+    """
     return _dir() / f"{session_id}.jsonl"
 
 
 def path(session_id: str | None) -> Path | None:
-    """Public transcript path for a session (None if no session). Hooks put this
-    in their stdin payload as `transcript_path`, matching CC."""
+    """Return the public transcript path for a session, or None if unset.
+
+    Hooks expose this as ``transcript_path`` in their stdin payload (CC parity).
+
+    Args:
+        session_id: Session id, or None when there is no session.
+
+    Returns:
+        Transcript path, or None when ``session_id`` is None.
+    """
     return _path(session_id) if session_id else None
 
 
 def new_id() -> str:
-    """A timestamp-based session id, e.g. 20260616_143022."""
+    """Allocate a timestamp-based session id.
+
+    Returns:
+        Id such as ``20260616_143022``.
+    """
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _serialize_message(m) -> dict:
-    """One message → a JSON-serializable, API-clean dict.
+    """Convert one message into a JSON-serializable, API-clean dict.
 
-    SDK Block objects → model_dump(exclude_none=True); strings and existing dicts
-    pass through. Fails loud on an unknown block type rather than saving a dead
-    repr that can't round-trip back to the API.
+    SDK Block objects become ``model_dump(exclude_none=True)`` dicts; plain
+    strings and existing dicts pass through. Unknown block types raise so a
+    non-round-trippable repr is never written.
+
+    Args:
+        m: Message dict with ``role`` and ``content``.
+
+    Returns:
+        Dict with ``role`` and serialized ``content``.
+
+    Raises:
+        TypeError: A content block is neither a dict nor an SDK model.
     """
     content = m.get("content")
     if isinstance(content, list):
@@ -76,24 +106,45 @@ def _serialize_message(m) -> dict:
 
 
 def _serialize_messages(messages) -> list:
-    """A list of messages → JSON-serializable dicts (see _serialize_message)."""
+    """Serialize a list of messages for transcript storage.
+
+    Args:
+        messages: Iterable of message dicts.
+
+    Returns:
+        List of JSON-serializable message dicts (see ``_serialize_message``).
+    """
     return [_serialize_message(m) for m in messages]
 
 
 def _append_event(session_id: str, event: dict) -> None:
+    """Append one JSON event line to the session transcript.
+
+    Args:
+        session_id: Target session id.
+        event: Event dict to serialize as one JSONL line.
+    """
     config.ensure_project_dir("sessions")
     with _path(session_id).open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def append_message(session_id: str, message, usage=None, meta=False) -> None:
-    """Append one message to the transcript (append-only, in conversation order).
-    `usage` (assistant messages): the API response's usage object; recorded so
-    process analysis gets per-turn token counts for free. `meta` marks a
-    harness-generated expansion (a slash command's rendered content) — CC's
-    transcripts mark these `isMeta: true` as the second record of a two-record
-    pair (tags message + expansion message; probed live 2026-07-17). The flag
-    rides the transcript RECORD only, never the API message."""
+    """Append one conversation message to the transcript.
+
+    Writes an append-only ``msg`` event in conversation order. ``usage`` and
+    ``meta`` ride the transcript record only — never the API message body.
+
+    Args:
+        session_id: Target session id.
+        message: API-shaped message (may contain SDK Block objects).
+        usage: Optional API usage object (assistant turns). Records
+            ``input_tokens``, ``output_tokens``, ``cache_read_input_tokens``,
+            and ``cache_creation_input_tokens`` for cost analysis.
+        meta: If True, mark a harness expansion (slash-command rendered
+            content). Matches CC's ``isMeta`` on the second record of a
+            tags + expansion pair.
+    """
     event = {
         "t": "msg",
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -115,10 +166,15 @@ def append_message(session_id: str, message, usage=None, meta=False) -> None:
 
 
 def log_compaction(session_id: str, working_set) -> None:
-    """Record a compaction: the post-compaction working set (summary + kept tail).
+    """Record a compaction boundary with the post-compaction working set.
 
-    On load this RESETS the reconstructed history to this state, so the raw `msg`
-    events before it stay on disk (lossless) without re-inflating the working set.
+    On load, a ``compact`` event resets reconstructed history to this state.
+    Earlier ``msg`` events remain on disk (lossless) but do not re-inflate the
+    working set.
+
+    Args:
+        session_id: Target session id.
+        working_set: Messages after compaction (summary + kept tail).
     """
     _append_event(
         session_id, {"t": "compact", "state": _serialize_messages(working_set)}
@@ -126,17 +182,32 @@ def log_compaction(session_id: str, working_set) -> None:
 
 
 def log_rewind(session_id: str, working_set) -> None:
-    """Record a conversation rewind: the post-rewind working set. Same reset
-    semantics as `compact` on replay — the transcript stays append-only, so the
-    rewound-away messages remain on disk (lossless)."""
+    """Record a conversation rewind with the post-rewind working set.
+
+    Replay resets to this state like ``compact``. Rewound-away messages stay
+    on disk because the transcript is append-only.
+
+    Args:
+        session_id: Target session id.
+        working_set: Messages after the rewind.
+    """
     _append_event(
         session_id, {"t": "rewind", "state": _serialize_messages(working_set)}
     )
 
 
 def event_count(session_id: str) -> int:
-    """Number of events currently in the transcript (0 if none). Recorded by
-    checkpoints at turn start so a conversation rewind can replay back to it."""
+    """Count events currently in the transcript.
+
+    Checkpoints record this at turn start so a conversation rewind can replay
+    back to that position.
+
+    Args:
+        session_id: Target session id.
+
+    Returns:
+        Number of non-empty JSONL lines, or 0 if the file is missing.
+    """
     path = _path(session_id)
     if not path.exists():
         return 0
@@ -144,7 +215,11 @@ def event_count(session_id: str) -> int:
 
 
 def latest_id() -> str | None:
-    """Most recently modified session id in this cwd, or None."""
+    """Return the most recently modified session id in this cwd.
+
+    Returns:
+        Session id (file stem), or None if no transcripts exist.
+    """
     d = _dir()
     if not d.exists():
         return None
@@ -153,8 +228,19 @@ def latest_id() -> str | None:
 
 
 def _replay(lines, upto: int | None = None) -> list:
-    """Replay transcript events into a working set. `msg` appends; `compact` and
-    `rewind` RESET to their recorded state. `upto` limits to the first N events."""
+    """Replay transcript event lines into a working-set message list.
+
+    ``msg`` appends; ``compact`` and ``rewind`` replace the working set with
+    their recorded ``state``. Always runs dangling-``tool_use`` repair on the
+    result.
+
+    Args:
+        lines: Iterable of JSONL lines (possibly blank).
+        upto: If set, stop after this many non-empty events.
+
+    Returns:
+        API-ready working-set messages (dict form).
+    """
     working: list = []
     seen = 0
     for line in lines:
@@ -173,11 +259,20 @@ def _replay(lines, upto: int | None = None) -> list:
 
 
 def _repair_dangling_tool_uses(msgs: list) -> list:
-    """Make a replayed working set API-valid: every tool_use must be answered
-    by a tool_result in the NEXT message, or the request 400s. Transcripts
-    written before the max_tokens truncation fix can carry an unanswered
-    partial tool_use (dogfood R5: output cap hit mid tool-call); repair by
-    inserting/merging a synthetic result rather than refusing to resume."""
+    """Ensure every ``tool_use`` has a matching ``tool_result`` in the next message.
+
+    The API 400s on unanswered ``tool_use`` ids. Older transcripts (e.g. mid
+    ``tool_use`` cut by ``max_tokens``) may lack results; this inserts or merges
+    synthetic ``tool_result`` blocks so resume can proceed.
+
+    Args:
+        msgs: Replayed working-set messages.
+
+    Returns:
+        A new list that is API-valid for tool-use pairing. May mutate the
+        content list of an existing next user message when merging partial
+        results.
+    """
     out: list = []
     for i, m in enumerate(msgs):
         out.append(m)
@@ -228,9 +323,17 @@ def _repair_dangling_tool_uses(msgs: list) -> list:
 
 
 def _load(session_id: str, upto: int | None) -> list | None:
-    """Replay the transcript into a working set (dict-form, API-ready), optionally
-    stopping after the first `upto` events. None if the session doesn't exist or
-    the file is unreadable/corrupt."""
+    """Load and replay a session transcript into a working set.
+
+    Args:
+        session_id: Session to load.
+        upto: If set, replay only the first ``upto`` events; otherwise the
+            full transcript.
+
+    Returns:
+        Dict-form, API-ready messages, or None if the session is missing or
+        the file is unreadable/corrupt.
+    """
     path = _path(session_id)
     if not path.exists():
         return None
@@ -241,12 +344,28 @@ def _load(session_id: str, upto: int | None) -> list | None:
 
 
 def load(session_id: str) -> list | None:
-    """The full transcript replayed into the working set (--continue/--resume)."""
+    """Load a session's full working set (``--continue`` / ``--resume``).
+
+    Args:
+        session_id: Session to load.
+
+    Returns:
+        Replayed working-set messages, or None if unavailable.
+    """
     return _load(session_id, upto=None)
 
 
 def load_upto(session_id: str, n_events: int) -> list | None:
-    """The working set as of the first `n_events` transcript events — the state a
-    conversation rewind restores to. Replaying (not slicing the live history)
-    means it works across compaction boundaries."""
+    """Load the working set as of the first ``n_events`` transcript events.
+
+    Used by conversation rewind. Replaying (not slicing live history) works
+    across compaction boundaries.
+
+    Args:
+        session_id: Session to load.
+        n_events: Number of leading transcript events to replay.
+
+    Returns:
+        Replayed working-set messages, or None if unavailable.
+    """
     return _load(session_id, upto=n_events)

@@ -118,7 +118,8 @@ def _strip_wrappers(toks: list) -> list:
 
 def _subcommand_is_readonly(toks: list) -> bool:
     toks = _strip_wrappers(list(toks))
-    if not toks or "=" in toks[0]:  # empty, or env-var prefix (PATH=/evil ls) — prompt
+    # empty, or env-var prefix (PATH=/evil ls) — prompt
+    if not toks or "=" in toks[0]:
         return False
     cmd = toks[0]
     if cmd == "cd":
@@ -139,13 +140,14 @@ def _subcommand_is_readonly(toks: list) -> bool:
         )
     if cmd == "find":
         # find is read-only EXCEPT its exec/mutate flags (CC prompts for these too)
-        banned = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fls"}
+        banned = {"-exec", "-execdir", "-ok",
+                  "-okdir", "-delete", "-fprint", "-fls"}
         return not banned.intersection(toks)
     return cmd in _READONLY_CMDS
 
 
 def is_readonly_command(command: str) -> bool:
-    """True iff every subcommand of `command` is in the read-only carve-out, so the
+    """True if every subcommand of `command` is in the read-only carve-out, so the
     call may skip the permission prompt."""
     groups = _split_subcommands(command)
     return groups is not None and all(_subcommand_is_readonly(g) for g in groups)
@@ -187,7 +189,8 @@ def _compile_rule(pattern: str):
 def _rules() -> list:
     global _RULES
     if _RULES is None:
-        _RULES = [(p, _compile_rule(p)) for p in config.permission_allow_rules()]
+        _RULES = [(p, _compile_rule(p))
+                  for p in config.permission_allow_rules()]
     return _RULES
 
 
@@ -238,7 +241,8 @@ def _is_gated(tool_name: str, tool_input: dict) -> bool:
     if tool_name not in GATED_TOOLS:
         return False
     if tool_name in _SKILL_TOOLS:
-        return False  # granted by an active skill's allowed-tools (until next prompt)
+        # granted by an active skill's allowed-tools (until next prompt)
+        return False
     if tool_name == "bash" and _bash_allowed(tool_input.get("command", "")):
         return False
     gated_cmds = _GATED_COMMANDS.get(tool_name)
@@ -306,7 +310,8 @@ def _read_answer(prompt: str) -> str:
         answer = input(prompt).strip().lower()
         if answer:
             return answer
-        ux.say("(empty answer ignored — type yes, no, all, or always)", style=ux.S_INFO)
+        ux.say("(empty answer ignored — type yes, no, all, or always)",
+               style=ux.S_INFO)
 
 
 def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
@@ -323,7 +328,8 @@ def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
         if tool_name in _ALLOWED:
             return True
     ux.say(_format_args(tool_name, tool_input))
-    save_rules = derive_rules(tool_input.get("command", "")) if tool_name == "bash" else []
+    save_rules = derive_rules(tool_input.get(
+        "command", "")) if tool_name == "bash" else []
     options = "[yes/no/all]"
     if save_rules:
         ux.say(

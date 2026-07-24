@@ -756,7 +756,7 @@ def main():
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
         # The transcript is written incrementally (sessions.append_message +
-        # llm.log_compaction) as the turn happens — no turn-end save() needed.
+        # sessions.log_compaction) as the turn happens — no turn-end save() needed.
 
     # loop exited (q/exit/EOF/Ctrl-C): SessionEnd hook, then persist input history.
     # All minicc exits leave from the prompt, so the reason is always
