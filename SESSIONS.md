@@ -1,171 +1,154 @@
-# Session persistence (Tier 1) — focused note
+# Session Persistence — Design
 
-Save the conversation to disk so a session can be resumed after quitting (or a
-crash). Daily-use value is high (don't lose a long working session). Two
-non-obvious decisions: **(1)** serializing the messages list (below), and **(2)**
-an **append-only transcript** so in-session compaction doesn't lose history on disk
-(see "Append-only transcript").
+## 1. Purpose & scope
 
-## The one real decision: serializing `history` for a safe round-trip
+Durably persist a conversation so it survives process exit, crash, and in-session
+context compaction — and can be resumed or rewound into a **valid API request**.
 
-The whole feature is one round-trip:
+**Goals**
+- Resume a prior session (`--continue` / `--resume`) exactly where it left off.
+- Rewind the conversation to an earlier turn (`/rewind N conversation|both`).
+- **Losslessness**: the raw conversation survives even after compaction discards
+  it from the in-memory working set.
+- Every reconstruction is a valid Messages API request (resume never 400s).
+- Zero-cost fidelity to CC's transcript shape, so process analysis + tooling transfer.
 
-```
-record:  each message ──serialize──► appended to a JSONL transcript on disk
-resume:  JSONL ──replay──► working set ──► client.messages.create(messages=...)
-```
+**Non-goals**
+- Session listing / picker UI (deferred; `--continue` covers the common case).
+- Cross-machine sync / upload — transcripts are local, per-project.
+- Secret redaction / encryption of the log.
+- Sub-agent transcripts — their context is deliberately isolated (I5).
 
-The hard part is the last arrow: the loaded data is sent **back to the API**, so
-it must be a valid request. Everything below is in service of "resume doesn't
-400."
+## 2. The model: two tiers
 
-### Why `history` can't just be `json.dumps`'d
+Two representations of a conversation exist; every decision follows from keeping
+them correctly related.
 
-`history` is heterogeneous:
-
-| message | `content` type | JSON-native? |
+| | Working set | Transcript |
 |---|---|---|
-| user query | `str` | ✅ |
-| assistant | `list[SDK Block]` (`TextBlock`/`ToolUseBlock`, Pydantic) | ❌ |
-| tool_result | `list[dict]` | ✅ |
+| where | RAM (`history`) | disk (`<id>.jsonl`) |
+| role | what's sent to the API each turn | durable source of truth |
+| lifetime | ephemeral; lost on exit | permanent, append-only |
+| mutation | rewritten in place by compaction | never rewritten |
 
-`json.dumps(ToolUseBlock(...))` → `TypeError: not JSON serializable`. So the SDK
-blocks must be converted. Two options:
+The transcript is **not a serialization of the working set** — it's an event log
+from which the working set is *replayed*. That indirection is what lets
+losslessness and in-place compaction coexist (§4, I2).
 
-- `str(block)` → `"ToolUseBlock(id=...)"`, a **repr string**. Loads back as a
-  dead string — you can't feed it to the API as a tool_use. ❌
-- `block.model_dump(...)` → a structured **dict** of the block's fields. JSON-
-  native, and round-trips back into a real content block. ✅
+## 3. Data model
 
-So `model_dump` is the only option that survives the round-trip.
-
-### What the API actually accepts (the input schema)
-
-This is the "API safety" target. From the SDK's input `*Param` TypedDicts
-(`Required[...]` = mandatory):
-
-| Block | required | optional |
-|---|---|---|
-| message | `role`, `content` | — |
-| text | `type`, `text` | `cache_control`, `citations` |
-| tool_use | `type`, `id`, `name`, `input` | `cache_control`, `caller` |
-| tool_result | `type`, `tool_use_id` | `content`, `is_error`, `cache_control` |
-
-"API-safe" means the loaded data matches this schema on **two** levels:
-
-- **(A) field shape** — each block has its required fields and no field with an
-  invalid value.
-- **(B) structure** — every `tool_use` is followed by its matching
-  `tool_result`, and roles alternate. (This is the rule we hit live: a stray
-  `tool_use` with no `tool_result` → *"tool_use ids were found without
-  tool_result blocks"* 400.)
-
-### Why `exclude_none=True` (and not plain `model_dump()`)
-
-Plain `model_dump()` keeps optional SDK fields set to `None`:
+One file per session: `.minicc/sessions/<id>.jsonl`, `<id>` = startup timestamp.
+One JSON event per line, appended, never rewritten. Three event kinds:
 
 ```
-ToolUseBlock.model_dump()              → {type, id, name, input, caller: None}
-ToolUseBlock.model_dump(exclude_none=True) → {type, id, name, input}      # caller dropped
-TextBlock.model_dump(exclude_none=True)    → {type, text}                 # citations dropped
+{"t":"msg",     "ts":<iso>, "m":<message>[, "usage":{…}][, "meta":true]}
+{"t":"compact", "state":[<messages>]}   # working set after a compaction
+{"t":"rewind",  "state":[<messages>]}   # working set after a /rewind
 ```
 
-`exclude_none=True` yields **exactly the required-field set** — the minimal valid
-form. That guarantees level (A): required fields present, zero optional fields,
-so nothing can have an invalid value.
+- `m` — one API-shaped message (§5).
+- `ts` / `usage` — timing + per-turn token counts (CC-parity fields); the
+  substrate for offline process analysis. Never read on replay.
+- `meta:true` — a slash-command expansion record (CC's `isMeta`); transcript-only.
 
-> **Corrected from an earlier draft.** I first said keeping `caller: None` risks
-> an "unexpected field" rejection. The schema above shows that's imprecise:
-> `caller`/`citations` **are** recognized optional input fields, not unknown
-> ones. The real (still-untested) risk is that they're *typed* (`caller: Caller`,
-> not nullable), so sending `None` as their value is of uncertain validity — the
-> API might reject it or ignore it. `exclude_none=True` is safe **regardless**,
-> because it doesn't emit any optional field at all. That's the actual reason to
-> prefer it: it sidesteps the question instead of betting on the answer.
+Replay reads only `t`, `m`, `state`; **unknown keys are ignored** → the format is
+forward/backward compatible.
 
-### Why structure (B) survives too
+## 4. Invariants (each → a mechanism → a test)
 
-`_serialize_messages` walks messages and converts blocks **1:1, in order** — it
-never drops, adds, or reorders. So a `tool_use` and its following `tool_result`
-stay adjacent and paired, and roles stay alternating. The serialization can't
-create the orphaned-tool_use 400.
+- **I1 — Replay yields a valid API request.**
+  - *field shape*: required fields present, no invalid value → `model_dump(exclude_none=True)` (§5).
+  - *structure*: every `tool_use` answered by a `tool_result` → two-layer defense (§6).
+- **I2 — Losslessness.** Raw `msg` events are never deleted/rewritten; a compaction
+  is a *new* `compact` event. Pre-compaction messages stay on disk forever.
+- **I3 — Append-only.** Every write is `open("a")` + one line; no update-in-place.
+- **I4 — Reminders never persist.** CLAUDE.md/memory/skills reminders are re-derived
+  at request time; the transcript stores only the bare typed/expanded text.
+- **I5 — Sub-agent context is never recorded.** Sub-agents run `session_id=None`.
 
-### The resumed history is *mixed* — and that's fine
+## 5. Serialization: the round-trip contract
 
-On resume, old messages are dicts (from `model_dump`); new turns append SDK
-objects (fresh `response.content`). The API accepts dict-form content, and
-minicc's helpers were already built to handle **both** dicts and SDK objects
-(`_serialize_for_summary`, `_estimate_tokens`, `_evict_old_tool_result`). So a
-mixed history works everywhere.
+`history` is heterogeneous — user content `str`, tool_result `list[dict]`, but
+assistant content `list[SDK Block]` (Pydantic; not JSON-native). Per block
+(`_serialize_message`): dicts pass through; SDK blocks → `model_dump(exclude_none=True)`;
+anything else raises (never persist a dead repr).
 
-### Confidence (honest)
+`exclude_none=True` emits **exactly the required-field set** — the minimal valid
+form. It sidesteps whether a typed-but-`None` optional (e.g. `caller`) is legal
+input by never emitting one. Generic across block types: a `thinking` block keeps
+`{type, thinking, signature}`, so the replay-critical `signature` survives.
 
-- **Verified**: `exclude_none` produces the required-field shape; it JSON
-  round-trips; a 14-message session **including a `tool_use` turn** resumed via
-  `--continue` with no 400 (live test). So the chosen design works end-to-end.
-- **Untested**: whether plain `model_dump()` (with `caller:None`) would 400.
-  Not claimed — `exclude_none` removes the need to know.
+On resume the working set is **mixed** (old dicts + new SDK objects). Every helper
+that walks history (`compact.estimate_tokens`, `compact.evict_old_tool_results`,
+`llm._cacheable`) branches on `isinstance`, so mixed content works everywhere.
 
-## Append-only transcript (compaction stays lossless)
+## 6. Structural integrity: the dangling `tool_use`
 
-Storage is a **JSONL event log** (`<id>.jsonl`), one event per line, never
-rewritten. Three event kinds: `{"t":"msg","m":<message>}`,
-`{"t":"compact","state":[...]}`, and `{"t":"rewind","state":[...]}` (a
-conversation `/rewind` — see CHECKPOINT.md D3). `load` replays: a `msg` appends;
-a `compact` or `rewind` RESETS the working set to its recorded state.
+The one structural rule that breaks in practice — a `tool_use` with no following
+`tool_result` → 400. A turn can be cut mid-tool (Ctrl-C, `max_tokens`). Two layers:
 
-**Why not overwrite a single JSON each turn (the old design)?** In-session L4
-compaction rewrites `history` in place (summary + recent), so overwriting on save
-persisted the *compacted* history — the raw pre-compaction messages were silently
-lost. An append-only log fixes this: the raw `msg` events stay on disk (line count
-only grows), while the `compact` event lets a resume reconstruct the small working
-set instead of re-inflating the whole raw log. Mirrors Claude Code's JSONL
-transcript + `compact_boundary` design.
+- **Produce-time (prevent):** the assistant message and its `tool_result`s are
+  recorded *together, only after both exist*; a `max_tokens` partial `tool_use` is
+  discarded before recording. New transcripts never contain an orphan. This layer
+  also keeps the *live* session valid (the load path never runs mid-session).
+- **Load-time (repair):** `_replay` runs `_repair_dangling_tool_uses` — an
+  unanswered `tool_use` gets a synthetic `tool_result` inserted/merged. Backstop
+  for legacy transcripts or anything that slips through.
 
-**Recording points** (`session_id` threaded `agent_loop → llm_response → _compact`;
-sub-agents pass `None`, so their isolated context is never recorded):
-- the user message — appended before the turn runs;
-- assistant + its tool_results — appended **together, only after both exist**, so a
-  Ctrl-C mid-tool never persists a dangling `tool_use` (which would 400 on resume);
-- a `compact` event — written from inside `_compact`, in conversation order.
+## 7. Interfaces
 
-## Routine decisions (no design depth)
+- **Record** (during a turn): `append_message` (user; then assistant+results together),
+  `log_compaction`, `log_rewind`. `session_id` threaded `agent_loop → llm_response
+  → compact.compact`.
+- **Read**: `load` (full replay — resume) · `load_upto(n)` (first n events — rewind) ·
+  `event_count` (turn-start anchor) · `path` (transcript_path for hooks). `load`/
+  `load_upto` share `_replay`; a missing/corrupt file → `None`.
 
-- **Storage**: `.minicc/sessions/<id>.jsonl` in the cwd (append-only; see above).
-  Reuses the self-ignoring `.minicc/` dir convention. One file per session;
-  per-project by construction (sessions live under the project's cwd).
-- **Session id**: startup timestamp, e.g. `20260616_143022`.
-- **Recording**: incremental, as the turn happens (no turn-end overwrite). A
-  crash/quit loses at most the in-flight turn; the interrupt-safe recording order
-  means the transcript never ends on a dangling `tool_use`.
-- **Resume interface**: CLI flags (resume must happen at startup, before the
-  loop — a flag is more natural than a slash command):
-  - `--continue` → resume the most recent session in this cwd.
-  - `--resume <id>` → resume a specific session.
-  - no flag → fresh session.
-- **On resume**: load history, continue. CLAUDE.md/memory/skills context arrives
-  fresh via `<system-reminder>` injection on the first prompt (reminders.py) —
-  the transcript carries **no reminders** (CC parity: they're re-derived at
-  request time, never persisted), so a resumed session can't replay stale ones.
-- **Slash expansions** (`/init`, `/skill-name`): persisted as CC's two-record
-  pair — the command-tags user message, then the expanded content with
-  `meta: true` on the record (CC's `isMeta`; probed live 2026-07-17). The flag
-  is transcript-only; replay returns plain API messages. So the transcript has
-  three persistence levels: normal messages (full) / expansions (two records,
-  second marked meta) / reminders (never).
+## 8. Failure modes
 
-## Scope
-- ✅ serialize + append-only transcript + `--continue` + `--resume <id>`
-- ✅ `/clear` rotates to a new session id — the pre-clear transcript stays on disk;
-  new turns record to a fresh `<id>.jsonl`.
-- ⬜ session listing UI / picker — defer (just `--continue` for the common case)
-- ✅ conversation-level `/rewind` — `/rewind N conversation|both` replays the
-  transcript back to just before turn N's prompt (`load_upto` + a checkpoint-recorded
-  event anchor), works across compaction boundaries, and logs an append-only
-  `rewind` reset event. See [CHECKPOINT.md](CHECKPOINT.md) D3.
+- **Interrupt mid-turn** — memory rolled back; transcript keeps the partial turn.
+  Replay: repair fixes any orphan; a lone user message merges (API allows
+  consecutive same-role). Divergence is intentional (append-only lossless record).
+- **Crash** — loses at most the in-flight line.
+- **Corrupt trailing line** — `_load` returns `None` (whole-session load fails).
+  *Debt: could tolerate a corrupt last line instead.*
+- **Model boundary** — thinking blocks from a *different* model must drop on replay;
+  minicc doesn't switch model mid-transcript, so untested. *Gap.*
 
-## Status
-✅ Implemented. serialize + append-only transcript + `--continue`/`--resume`;
-`/clear` rotates sessions; compaction records a boundary so a resume reconstructs
-`[summary]+tail` losslessly. Unit tests cover the serialize round-trip, boundary
-reconstruction, and append-only losslessness.
+## 9. CC fidelity & divergences
+
+**Parity** (verified against a real CC transcript, 2026-07-24): per-session
+append-only JSONL; per-message `timestamp` + `usage`; `isMeta` on slash-command
+expansions; `tool_use` blocks inside message content; reminders re-derived at
+request time, not persisted.
+
+**Divergences** — minicc simplifies CC's transcript; the first two are
+architectural, not cosmetic:
+
+1. **Flat log vs tree.** CC's transcript is a parent-pointer DAG (`parentUuid` /
+   `uuid` / `isSidechain` on every message) that can represent branches and
+   sub-agent sidechains. minicc is a flat append-only list with `compact` / `rewind`
+   reset events — it cannot structurally represent a branch. (Upgrading to the tree
+   is what rewind-as-branch or full teams replay would require.)
+2. **Sub-agents unrecorded vs sidechains.** CC records sub-agent conversations in
+   the transcript as sidechains (`isSidechain`). minicc deliberately does NOT record
+   sub-agent context (I5) — a sub-agent runs `session_id=None`. A scope choice (keep
+   sub-agents isolated; transcript = main line only), NOT parity.
+3. **Compact shape.** CC flags the summary message with `isCompactSummary`; minicc
+   writes a separate `{"t":"compact","state":[…]}` reset event.
+4. **Event vocabulary.** CC's transcript also logs UI/harness events (titles, mode
+   changes, attachments, queue operations, per-message `cwd`/`version`/`gitBranch`);
+   minicc records only the conversation (`msg`/`compact`/`rewind`).
+
+Plus: session id is a startup timestamp, not CC's UUID; no `~/.claude` global store;
+local-only (never uploaded).
+
+## 10. Testing
+
+Round-trip (14-msg incl. a tool_use turn resumes, no 400) · boundary reconstruction
+(`[summary]`+tail) · append-only losslessness · dangling-repair (insert + merge paths).
+
+## 11. Open / future
+
+Session picker · corrupt-tail tolerance · secret redaction · teammate transcripts
+(teams tier — per-process session ids + dirs).
