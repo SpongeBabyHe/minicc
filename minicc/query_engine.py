@@ -45,6 +45,14 @@ def agent_loop(
     stop_blocks = 0  # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
     while True:
         if max_turns is not None and turns >= max_turns:
+            # Say it out loud: a sub-agent cut off here may still have emitted
+            # text last turn, and the caller's _final_text would then hand that
+            # partial work up as if it were a finished summary.
+            ux.say(
+                f"{indent}[stopped at the {max_turns}-turn limit — "
+                "the work may be incomplete]",
+                style=ux.S_ERROR,
+            )
             return
         turns += 1
         # streaming shows its own spinner-until-first-token, so no ux.thinking()
@@ -66,6 +74,20 @@ def agent_loop(
             if session_id:
                 sessions.append_message(session_id, assistant_msg, usage=response.usage)
             continue
+        if response.stop_reason == "refusal":
+            # A safety classifier declined (HTTP 200, not an error). A pre-output
+            # refusal carries an EMPTY content array, and an empty assistant
+            # message is invalid as next-turn input — letting it into history (or
+            # the transcript) poisons both, the same class of bug as a dangling
+            # tool_use. So roll it back, tell the user, and end the turn without
+            # recording it or running the Stop hook (the turn never really ran).
+            messages.pop()
+            ux.say(
+                f"{indent}the model declined this request "
+                "(stop_reason=refusal) — nothing was recorded; try rephrasing",
+                style=ux.S_ERROR,
+            )
+            return
         if response.stop_reason != "tool_use":
             # A non-tool_use stop can still CARRY tool_use blocks: max_tokens
             # cutting the stream mid tool-call leaves a partial call with
@@ -82,6 +104,15 @@ def agent_loop(
                 ux.say(
                     f"{indent}response stopped ({response.stop_reason}) mid tool-call; "
                     "the partial call was discarded — say 'continue' to resume",
+                    style=ux.S_ERROR,
+                )
+            elif response.stop_reason == "max_tokens":
+                # Text-only truncation: the content stays valid, so nothing to
+                # discard — but ending silently leaves the user unable to tell a
+                # cut-off answer from a finished one.
+                ux.say(
+                    f"{indent}response hit the output-token limit and was cut off "
+                    "— say 'continue' to resume",
                     style=ux.S_ERROR,
                 )
             if session_id:  # terminal assistant → record alone
@@ -109,6 +140,10 @@ def agent_loop(
                 )
         tool_msg = {"role": "user", "content": results}
         messages.append(tool_msg)
+        # A productive round breaks the Stop-hook block CHAIN: CC's guard is "8
+        # CONSECUTIVE blocks", so real work between blocks restores the hook's
+        # full budget instead of letting a cumulative count silently retire it.
+        stop_blocks = 0
         # Record assistant + its tool_results together, only now that both exist —
         # so a Ctrl-C mid-tool never persists a dangling tool_use to the transcript.
         if session_id:
@@ -186,13 +221,18 @@ def _run_tool(block, allowed, session_id, indent) -> str:
     for m in pre.system_messages:
         ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
 
-    handler = TOOL_HANDLERS.get(block.name) if block.name in allowed else None
+    handler = TOOL_HANDLERS.get(block.name)
     tool_input = pre.updated_input if pre.updated_input is not None else block.input
 
     if pre.block:
         output = f"Blocked by a PreToolUse hook. {pre.reason or ''}".rstrip()
-    elif handler is None:
+    elif handler is None:  # no such tool anywhere — the model invented the name
         output = f"Unknown tool: {block.name}"
+    elif block.name not in allowed:
+        # Real tool, just not advertised to THIS agent (e.g. a read-only
+        # sub-agent reaching for bash). Saying "unknown" would be misleading and
+        # invites a retry; name the real reason so the model can re-plan.
+        output = f"Tool {block.name} is not available to this agent."
     elif not (pre.allow or confirm(block.name, tool_input, force=pre.ask)):
         output = f"User declined to run {block.name}."
     else:

@@ -119,3 +119,51 @@ def test_replay_merges_into_partial_results(tmp_path, monkeypatch):
     assert len(loaded) == 2  # merged, not inserted
     ids = {b["tool_use_id"] for b in loaded[1]["content"]}
     assert ids == {"a", "b"}
+
+
+# ─── stop_reason coverage: refusal + text-only max_tokens ────────────────────
+
+def test_refusal_never_enters_history_or_transcript(monkeypatch, tmp_path):
+    """A refusal is HTTP 200 with an EMPTY content array. An empty assistant
+    message is invalid as next-turn input, so it must not reach history or the
+    transcript — same poisoning class as a dangling tool_use."""
+    import types
+    from minicc import query_engine as engine, ux, sessions
+
+    monkeypatch.chdir(tmp_path)
+    said, recorded = [], []
+    monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
+    monkeypatch.setattr(sessions, "append_message",
+                        lambda *a, **k: recorded.append(a))
+    monkeypatch.setattr(
+        engine, "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason="refusal", content=[], usage=None),
+    )
+
+    msgs = [{"role": "user", "content": "something"}]
+    engine.agent_loop(msgs, session_id="s1")
+
+    assert msgs == [{"role": "user", "content": "something"}]  # rolled back
+    assert recorded == []                                      # nothing persisted
+    assert any("declined" in s for s in said), said
+
+
+def test_text_only_max_tokens_is_announced(monkeypatch):
+    """Truncation with no tool_use block keeps valid content, but ending silently
+    hides a cut-off answer. It must still say so."""
+    import types
+    from minicc import query_engine as engine, ux
+
+    said = []
+    monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
+    monkeypatch.setattr(
+        engine, "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason="max_tokens",
+            content=[types.SimpleNamespace(type="text", text="half a sen")],
+            usage=None),
+    )
+
+    engine.agent_loop([{"role": "user", "content": "write an essay"}])
+    assert any("output-token limit" in s for s in said), said
