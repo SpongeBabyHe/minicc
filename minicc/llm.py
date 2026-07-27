@@ -1,9 +1,11 @@
+"""This module is the client: request assembly, cache layering, streaming, usage accounting."""
+
 import os
 from dotenv import load_dotenv
 from anthropic import Anthropic, APIStatusError
 from minicc.tools import TOOLS
 from minicc.prompts.system import build_system_prompt
-from minicc import compact, config, ux
+from minicc import config, context_management, ux
 
 load_dotenv()  # ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL only; model lives in config
 MODEL = config.resolve_model()
@@ -39,12 +41,8 @@ def set_model(model_id: str) -> None:
     MODEL = model_id
 
 
-# Context management (budgets / eviction / compaction / ContextState) lives in
-# compact.py — CC keeps it in services/compact/, a peer of the API client, and
-# so does minicc (docs/CC_CONTEXT_MANAGEMENT.md §7). This module is the client:
-# request assembly, cache layering, streaming, usage accounting.
-
-_USAGE = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "web_searches": 0}
+_USAGE = {"input": 0, "output": 0, "cache_read": 0,
+          "cache_creation": 0, "web_searches": 0}
 _SESSION_CONTEXT = ""
 
 
@@ -62,7 +60,7 @@ def _build_system_block(system: str | None = None) -> list:
     Claude Code:
       1. System prompt — rarely changes. Its breakpoint's prefix is `tools +
          system` (tools render first), so this single marker caches the tool
-         definitions too — no separate tools breakpoint needed (see tools/__init__).
+         definitions too — no separate tools breakpoint needed.
       2. Session context — env + git snapshot, VOLATILE-LAST so a change here (only
          on /clear) never busts layer 1. Mirrors CC, whose system prompt also
          carries env + gitStatus.
@@ -119,7 +117,8 @@ def _thinking_param(model: str) -> dict | None:
     Thinking blocks come back in `response.content` and minicc already appends
     content verbatim to history + transcript, which is exactly the replay
     contract (pass thinking blocks back unchanged on the same model)."""
-    known_adaptive = ("sonnet-4-6", "opus-4-6", "opus-4-7", "opus-4-8", "fable")
+    known_adaptive = ("sonnet-4-6", "opus-4-6",
+                      "opus-4-7", "opus-4-8", "fable")
     if any(k in model for k in known_adaptive):
         return {"type": "adaptive"}
     return None
@@ -140,7 +139,8 @@ def _cacheable(messages):
     # not deepcopy, only normalize string content to a text block, keep the rest of the message as is and as where it is.
     out = [
         (
-            {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+            {"role": m["role"], "content": [
+                {"type": "text", "text": m["content"]}]}
             if isinstance(m.get("content"), str)
             else m
         )
@@ -155,6 +155,19 @@ def _cacheable(messages):
                 "content": c[:-1] + [{**c[-1], "cache_control": {"type": "ephemeral"}}],
             }
     return out
+
+
+def summary_runtime() -> context_management.SummaryRuntime:
+    """Expose only the request capabilities needed by context summarization."""
+    return context_management.SummaryRuntime(
+        default_model=MODEL,
+        default_tools=TOOLS,
+        build_system_block=_build_system_block,
+        cacheable=_cacheable,
+        thinking_param=_thinking_param,
+        create_message=client.messages.create,
+        record_usage=_record_usage,
+    )
 
 
 def _send_request(params: dict, stream: bool):
@@ -178,7 +191,7 @@ def llm_response(
     tools=None,
     model: str | None = None,
     session_id: str | None = None,
-    ctx: "compact.ContextState | None" = None,
+    ctx: "context_management.ContextState | None" = None,
 ):
     m = (
         model if model is not None else MODEL
@@ -187,73 +200,160 @@ def llm_response(
     # conversation; a bare single-shot call gets a fresh throwaway — so a nested
     # call (sub-agent, web_fetch extraction, /memory consolidate) can never
     # poison another conversation's trigger, in either direction.
-    ctx = ctx if ctx is not None else compact.ContextState()
-    size = ctx.context_size(messages)           # real (last usage) or cold estimate
-    budget = compact.effective_budget(m)
+    ctx = ctx if ctx is not None else context_management.ContextState()
+    # real (last usage) or cold estimate
+    size = ctx.context_size(messages)
+    budget = context_management.effective_budget(m)
     if size > budget:
         # Over the compaction budget → L4 compaction (the bigger reset). We do NOT
         # also evict this turn: compaction replaces the old messages anyway, and
         # skipping eviction keeps the summary call on a warm cache.
-        if ctx.compact_attempts >= compact.MAX_COMPACT_ATTEMPTS:  # L5 thrash guard
+        if ctx.compact_attempts >= context_management.MAX_COMPACT_ATTEMPTS:
             ux.say(
                 "[Autocompact is thrashing: still over budget after "
-                f"{compact.MAX_COMPACT_ATTEMPTS} compactions. A single message is "
+                f"{context_management.MAX_COMPACT_ATTEMPTS} compactions. "
+                "A single message is "
                 "likely too large. Try /clear, or read large files in smaller "
                 "chunks (offset/limit).]",
                 style=ux.S_ERROR,
             )
             raise RuntimeError("compact thrashing")
-        ctx.compact_attempts += 1
         # Thread system/tools so a sub-agent compacts under ITS prefix; session_id
         # so the main session records the compaction boundary to its transcript.
-        compact.compact(ctx, messages, model=m, system=system, tools=tools, session_id=session_id)
+        result = context_management.compact(
+            ctx,
+            messages,
+            model=m,
+            system=system,
+            tools=tools,
+            session_id=session_id,
+            runtime=summary_runtime(),
+        )
+        # Count toward the thrash guard only when compaction was ATTEMPTED — a
+        # PreCompact hook veto (result is None) is the user's choice: proceed
+        # uncompacted without counting, so a standing veto never crashes.
+        if result is not None:
+            ctx.compact_attempts += 1
     else:
         ctx.compact_attempts = 0
-        # L3: CC-style incremental tool_result eviction between CLEAR_TRIGGER and
-        # the compaction budget — cheap (no LLM call), guarded by clear_at_least so
-        # it only breaks the cache when it frees ≥ CLEAR_AT_LEAST tokens.
-        if size > compact.CLEAR_TRIGGER:
-            evicted = compact.evict_old_tool_results(messages, min_free=compact.CLEAR_AT_LEAST)
+        # L3: local fallback between the 100K trigger and compaction budget.
+        # Only re-fetchable tools are eligible, five recent results stay intact,
+        # and the cache is broken only for an estimated ≥20K net saving.
+        if size > context_management.TOOL_RESULT_EVICTION_TRIGGER_TOKENS:
+            eviction_kwargs = {
+                "min_savings_tokens": (
+                    context_management.TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS
+                )
+            }
+            if session_id:
+                eviction_kwargs["session_id"] = session_id
+            evicted = context_management.evict_old_tool_results(
+                messages,
+                **eviction_kwargs,
+            )
             if evicted:
-                ctx.evictions += 1
+                ctx.record_eviction(evicted)
+                count = getattr(evicted, "count", evicted)
+                saved = getattr(evicted, "estimated_tokens_saved", 0)
                 ux.say(
-                    f"[evicted {evicted} old tool_results to reclaim context]",
+                    f"[evicted {count} old tool_results"
+                    + (
+                        f", reclaiming ~{saved:,} tokens]"
+                        if saved
+                        else " to reclaim context]"
+                    ),
                     style=ux.S_INFO,
                 )
 
     params = dict(
         model=m,
-        messages=_cacheable(messages),  # L1: cache the conversation history too
+        # L1: cache the conversation history too
+        messages=_cacheable(messages),
         # Thinking tokens share this budget — 8000 starved long turns once
         # adaptive thinking landed, so the ceiling doubles (well under Sonnet's
         # 64K output cap; max_tokens is a safety ceiling, not a target).
-        max_tokens=16_000,
+        max_tokens=context_management.MAX_OUTPUT_TOKENS,
         system=_build_system_block(system),
         tools=tools if tools is not None else TOOLS,
     )
     thinking = _thinking_param(m)
     if thinking:
         params["thinking"] = thinking
+    sent_message_tokens = context_management.estimate_tokens(messages)
     try:
         response = _send_request(params, stream)
     except APIStatusError as e:
-        # Reactive compaction (CC-style fallback).
-        #  413: request too large for the window (proactive trigger under-fired, or
-        #       a single turn overflowed) → must shrink. SDK does NOT auto-retry 413.
-        #  429: rate limited. The SDK already retried with backoff; if it still
-        #       persists AND the context is large, a single request likely exceeds
-        #       the per-minute input budget (the PAIN.md case), which only shrinking
-        #       fixes. A small-context 429 is a transient/quota limit compaction
-        #       can't help, so it surfaces (don't destroy history over a temporary cap).
+        # Reactive compaction for structural request-size failures only.
+        #  400 "prompt is too long": input alone exceeds the context window — the
+        #       token-overflow case. 400 is broad, so match the message.
+        #  413: request exceeds the 32MB request-BYTE limit (Cloudflare, before the
+        #       API). A bounded prefix summary can recover without resending the
+        #       same oversized body. 429 is deliberately excluded: it can mean RPM,
+        #       token, acceleration, or workspace limits, so deleting history is not
+        #       a justified response after the SDK's normal retries.
         code = getattr(e, "status_code", None)
-        if code not in (413, 429):
+        msg = " ".join(
+            str(part)
+            for part in (
+                getattr(e, "message", ""),
+                getattr(e, "body", ""),
+            )
+            if part
+        ).lower()
+        token_overflow_400 = code == 400 and "too long" in msg
+        if code != 413 and not token_overflow_400:
             raise
-        if code == 429 and compact.estimate_tokens(messages) <= compact.CLEAR_TRIGGER:
-            raise
-        ux.say("[request rejected — compacting and retrying]", style=ux.S_ERROR)
-        if not compact.compact(ctx, messages, model=m, system=system, tools=tools, session_id=session_id):
-            raise  # nothing compactable → let the error surface
+        ux.say("[request rejected — shrinking context and retrying]", style=ux.S_ERROR)
+        recovery = "bytes" if code == 413 else "tokens"
+        # First discard oversized tool outputs locally, including recent ones:
+        # unlike normal L3 eviction, a rejected request cannot afford to protect
+        # five blocks that may themselves be the cause.
+        eviction_kwargs = {
+            "min_savings_tokens": 0,
+            "keep_recent": 0,
+            "allow_lossy_fallback": True,
+        }
+        if session_id:
+            eviction_kwargs["session_id"] = session_id
+        evicted = context_management.evict_old_tool_results(
+            messages,
+            **eviction_kwargs,
+        )
+        if evicted:
+            ctx.record_eviction(evicted)
+            ctx.rebase(messages)
+
+        # A single legal summary request can only consume one model window. Very
+        # large byte/token failures may therefore need several bounded chunks.
+        # Never issue the live retry while local bounds still say it will fail.
+        must_compact = not evicted
+        recovery_compactions = 0
+        while must_compact or context_management.recovery_needed(
+            messages,
+            m,
+            recovery,
+        ):
+            if (
+                recovery_compactions
+                >= context_management.MAX_RECOVERY_COMPACTIONS
+            ):
+                raise
+            result = context_management.compact(
+                ctx,
+                messages,
+                model=m,
+                system=system,
+                tools=tools,
+                session_id=session_id,
+                recovery=recovery,
+                runtime=summary_runtime(),
+            )
+            if not result:
+                raise  # nothing compactable → let the original error surface
+            recovery_compactions += 1
+            must_compact = False
         params["messages"] = _cacheable(messages)
+        sent_message_tokens = context_management.estimate_tokens(messages)
         response = _send_request(params, stream)
 
     cache_r, cache_c = _record_usage(response.usage)
@@ -261,8 +361,13 @@ def llm_response(
     stu = getattr(response.usage, "server_tool_use", None)
     if stu:
         _USAGE["web_searches"] += getattr(stu, "web_search_requests", 0) or 0
-    # Real total input of THIS request → this conversation's next trigger read.
-    ctx.last_input_tokens = response.usage.input_tokens + cache_r + cache_c
+    # Anchor real total input to the exact stored messages that produced it. The
+    # next trigger adds any estimated message growth instead of using stale usage
+    # unchanged for a newly appended user/tool message.
+    ctx.record_input(
+        response.usage.input_tokens + cache_r + cache_c,
+        sent_message_tokens,
+    )
     return response
 
 

@@ -10,7 +10,7 @@ import json
 import pytest
 from anthropic.types import TextBlock, ToolUseBlock
 
-from minicc import sessions
+from minicc import context_management as compact, sessions
 
 
 def _history():
@@ -125,6 +125,65 @@ def test_compaction_is_append_only_lossless(tmp_path, monkeypatch):
     assert after == before + 1                        # only grew
     text = path.read_text()
     assert '"m0"' in text and '"m1"' in text and '"m2"' in text  # raw events intact
+
+
+def test_context_edit_persists_output_and_replays_delta(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sid = "s-edit"
+    original = "full result\n" + ("X" * 10_000)
+    working = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tool/../1",
+                    "name": "read_file",
+                    "input": {"path": "x.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool/../1",
+                    "content": original,
+                }
+            ],
+        },
+    ]
+    for message in working:
+        sessions.append_message(sid, message)
+
+    result = compact.evict_old_tool_results(
+        working,
+        min_savings_tokens=0,
+        keep_recent=0,
+        session_id=sid,
+    )
+
+    assert result.count == 1
+    replacement = working[2]["content"][0]["content"]
+    assert replacement.startswith("<persisted-output>\n")
+    output_path = sessions.tool_result_output_path(
+        sid,
+        "tool/../1",
+        original,
+    )
+    assert output_path.read_text(encoding="utf-8") == original
+    assert output_path.is_relative_to(tmp_path / ".minicc" / "tool_outputs")
+
+    events = [
+        json.loads(line)
+        for line in sessions.path(sid).read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["t"] == "context_edit"
+    assert original in events[2]["m"]["content"][0]["content"]
+    assert sessions.load(sid) == working
+    assert sessions.load_upto(sid, 3)[2]["content"][0]["content"] == original
 
 
 def test_latest_id(tmp_path, monkeypatch):

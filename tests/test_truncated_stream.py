@@ -149,9 +149,14 @@ def test_refusal_never_enters_history_or_transcript(monkeypatch, tmp_path):
     assert any("declined" in s for s in said), said
 
 
-def test_text_only_max_tokens_is_announced(monkeypatch):
-    """Truncation with no tool_use block keeps valid content, but ending silently
-    hides a cut-off answer. It must still say so."""
+import pytest
+
+
+@pytest.mark.parametrize("reason", ["max_tokens", "model_context_window_exceeded"])
+def test_text_only_truncation_is_announced(monkeypatch, reason):
+    """A text-only truncation keeps valid content, but ending silently hides a
+    cut-off answer. Both max_tokens (output cap) and model_context_window_exceeded
+    (generation ran into the window; 4.5+ models) must be announced."""
     import types
     from minicc import query_engine as engine, ux
 
@@ -160,10 +165,10 @@ def test_text_only_max_tokens_is_announced(monkeypatch):
     monkeypatch.setattr(
         engine, "llm_response",
         lambda *a, **k: types.SimpleNamespace(
-            stop_reason="max_tokens",
+            stop_reason=reason,
             content=[types.SimpleNamespace(type="text", text="half a sen")],
             usage=None),
     )
 
     engine.agent_loop([{"role": "user", "content": "write an essay"}])
-    assert any("output-token limit" in s for s in said), said
+    assert any("cut off" in s and reason in s for s in said), said

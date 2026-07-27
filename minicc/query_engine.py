@@ -1,7 +1,7 @@
 from minicc.llm import llm_response
 from minicc.tools import TOOLS, TOOL_HANDLERS
 from minicc.permissions import confirm
-from minicc import compact, ux
+from minicc import context_management, ux
 from minicc import checkpoints
 from minicc import sessions
 from minicc import hooks
@@ -20,7 +20,7 @@ def agent_loop(
     indent: str = "",
     model: str | None = None,
     session_id: str | None = None,
-    ctx: compact.ContextState | None = None,
+    ctx: context_management.ContextState | None = None,
 ):
     """Run the agent loop until the model stops requesting tools.
 
@@ -33,13 +33,13 @@ def agent_loop(
     model     : per-call model override (sub-agents run on a cheaper model);
                 None = the global MODEL. Threaded to llm_response without
                 mutating the global, so the parent's cache/model are untouched.
-    ctx       : this conversation's context-trigger state (compact.ContextState).
+    ctx       : this conversation's context-trigger state.
                 The main session passes its persistent one; omitted (sub-agents,
                 /memory consolidate) a fresh one is created here — one per
                 conversation, so loops never share trigger state.
     """
     tools = tools if tools is not None else TOOLS
-    ctx = ctx if ctx is not None else compact.ContextState()
+    ctx = ctx if ctx is not None else context_management.ContextState()
     allowed = {t["name"] for t in tools}  # guard: model can't call un-advertised tools
     turns = 0
     stop_blocks = 0  # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
@@ -106,12 +106,14 @@ def agent_loop(
                     "the partial call was discarded — say 'continue' to resume",
                     style=ux.S_ERROR,
                 )
-            elif response.stop_reason == "max_tokens":
-                # Text-only truncation: the content stays valid, so nothing to
-                # discard — but ending silently leaves the user unable to tell a
-                # cut-off answer from a finished one.
+            elif response.stop_reason in ("max_tokens", "model_context_window_exceeded"):
+                # Output was truncated — max_tokens (the output cap) or
+                # model_context_window_exceeded (generation ran into the context
+                # window; 4.5+ models return this string, which the SDK enum
+                # doesn't list yet). Content stays valid — nothing to discard —
+                # but ending silently hides a cut-off answer from a finished one.
                 ux.say(
-                    f"{indent}response hit the output-token limit and was cut off "
+                    f"{indent}response was cut off ({response.stop_reason}) "
                     "— say 'continue' to resume",
                     style=ux.S_ERROR,
                 )
@@ -171,13 +173,18 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
     last_text = "".join(
         b.text for b in response.content if getattr(b, "type", "") == "text"
     )
-    d = hooks.run("Stop", session_id=session_id, last_assistant_message=last_text)
+    d = hooks.run(
+        "Stop",
+        session_id=session_id,
+        last_assistant_message=last_text,
+        stop_hook_active=blocks_so_far > 0,
+    )
     hooks.surface(d, indent)
     if d.stop and d.stop_reason:
         ux.say(f"{indent}[Stop hook: {d.stop_reason}]", style=ux.S_INFO)
 
-    # `and not d.stop`: for Stop these are OPPOSITES — block says "keep going",
-    # continue:false says "end now" — so continue:false wins (CC precedence).
+    # continue:false is universal and therefore wins over Stop's event-specific
+    # block decision.
     if d.block and not d.stop and blocks_so_far >= MAX_STOP_BLOCKS:
         ux.say(
             f"{indent}[Stop hook still blocking after {MAX_STOP_BLOCKS} attempts — "
@@ -218,8 +225,10 @@ def _run_tool(block, allowed, session_id, indent) -> str:
         match_value=block.name,
         tool_name=block.name,
         tool_input=block.input,
+        tool_use_id=block.id,
     )
     hooks.surface(pre, indent)
+    hooks.raise_if_stopped(pre, "PreToolUse")
 
     handler = TOOL_HANDLERS.get(block.name)
     tool_input = pre.updated_input if pre.updated_input is not None else block.input
@@ -259,9 +268,11 @@ def _post_tool(block, tool_input, output, session_id, indent) -> str:
         match_value=block.name,
         tool_name=block.name,
         tool_input=tool_input,
+        tool_use_id=block.id,
         tool_response={"type": "text", "text": output},
     )
     hooks.surface(post, indent)
+    hooks.raise_if_stopped(post, "PostToolUse")
     if post.updated_output is not None:
         output = post.updated_output
     notes = list(post.additional_context)

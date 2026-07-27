@@ -2,11 +2,12 @@
 
 Each session is a JSONL file (`<id>.jsonl`), written one event per line and NEVER
 rewritten — so the raw conversation survives even when the in-memory working set is
-compacted (an overwrite-on-save scheme would drop the summarized history). Three event kinds:
+compacted (an overwrite-on-save scheme would drop the summarized history). Four event kinds:
 
     {"t": "msg",     "ts": <iso>, "m": <one API-shaped message>[, "usage": {...}]}
     {"t": "compact", "state": [<messages>]}           # post-compaction working set
     {"t": "rewind",  "state": [<messages>]}           # conversation /rewind reset
+    {"t": "context_edit", "edits": [<tool-result replacements>]}
 
 `ts` (every msg) and `usage` (assistant msgs, token counts from the API response)
 mirror CC's transcript fields — they're what make post-hoc process analysis
@@ -14,9 +15,10 @@ mirror CC's transcript fields — they're what make post-hoc process analysis
 transcripts without them stay loadable.
 
 `load` replays the log: a `msg` event appends; a `compact` or `rewind` event RESETS
-the working set to its recorded state (summary + kept tail). So reconstruction yields exactly
-what the live session held — small and API-ready — no matter how long the raw log
-grew, while the pre-compaction `msg` events stay on disk (lossless).
+the working set to its recorded state (summary + kept tail); a `context_edit`
+event replaces selected old tool-result contents. So reconstruction yields
+exactly what the live session held — small and API-ready — no matter how long the
+raw log grew, while the original `msg` events stay on disk (lossless).
 
 Serialization: assistant messages hold SDK Block objects (TextBlock/ToolUseBlock)
 that don't JSON-serialize; `model_dump(exclude_none=True)` yields minimal, API-clean
@@ -24,13 +26,16 @@ dicts (dropping SDK-only fields like `caller`/`citations`). Strings and existing
 dicts pass through unchanged.
 """
 
+import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
 from minicc import config
 
 _SESSIONS_SUBDIR = ".minicc/sessions"
+_TOOL_OUTPUTS_SUBDIR = ".minicc/tool_outputs"
 
 
 def _dir() -> Path:
@@ -62,6 +67,62 @@ def path(session_id: str | None) -> Path | None:
         Transcript path, or None when ``session_id`` is None.
     """
     return _path(session_id) if session_id else None
+
+
+def _safe_component(value: str, fallback: str) -> str:
+    """Make an opaque id safe for use as one path component."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return safe[:48] or fallback
+
+
+def tool_result_output_path(
+    session_id: str,
+    tool_use_id: str,
+    content,
+) -> Path:
+    """Return the deterministic spill path for one evicted tool result."""
+    safe_session = _safe_component(session_id, "session")
+    safe_tool = _safe_component(tool_use_id, "tool-result")
+    digest = hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()[:10]
+    suffix = ".txt" if isinstance(content, str) else ".json"
+    return (
+        Path.cwd()
+        / _TOOL_OUTPUTS_SUBDIR
+        / safe_session
+        / f"{safe_tool}-{digest}{suffix}"
+    )
+
+
+def persisted_tool_result_marker(output_path: Path) -> str:
+    """Build the in-context pointer left after a tool result is spilled."""
+    return (
+        "<persisted-output>\n"
+        f"Full tool result saved to: {output_path}\n"
+        "Use read_file on this path to inspect the full result.\n"
+        "</persisted-output>"
+    )
+
+
+def persist_tool_result_output(
+    session_id: str,
+    tool_use_id: str,
+    content,
+) -> Path:
+    """Persist an evicted result outside active context and return its path."""
+    config.ensure_project_dir("tool_outputs")
+    output_path = tool_result_output_path(session_id, tool_use_id, content)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, str):
+        serialized = content
+    else:
+        serialized = json.dumps(
+            content,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    output_path.write_text(serialized, encoding="utf-8")
+    return output_path
 
 
 def new_id() -> str:
@@ -181,6 +242,24 @@ def log_compaction(session_id: str, working_set) -> None:
     )
 
 
+def log_context_edit(session_id: str, replacements) -> None:
+    """Record tool-result replacements without copying the full working set.
+
+    The original result remains in its earlier ``msg`` event. Replay applies this
+    delta so resume matches the live working set, while replaying to a point
+    before the edit restores the original result.
+    """
+    edits = [
+        {
+            "tool_use_id": replacement["tool_use_id"],
+            "content": replacement["content"],
+        }
+        for replacement in replacements
+    ]
+    if edits:
+        _append_event(session_id, {"t": "context_edit", "edits": edits})
+
+
 def log_rewind(session_id: str, working_set) -> None:
     """Record a conversation rewind with the post-rewind working set.
 
@@ -231,8 +310,8 @@ def _replay(lines, upto: int | None = None) -> list:
     """Replay transcript event lines into a working-set message list.
 
     ``msg`` appends; ``compact`` and ``rewind`` replace the working set with
-    their recorded ``state``. Always runs dangling-``tool_use`` repair on the
-    result.
+    their recorded ``state``; ``context_edit`` applies tool-result deltas.
+    Always runs dangling-``tool_use`` repair on the result.
 
     Args:
         lines: Iterable of JSONL lines (possibly blank).
@@ -255,7 +334,30 @@ def _replay(lines, upto: int | None = None) -> list:
             working.append(event["m"])
         elif event.get("t") in ("compact", "rewind"):
             working = list(event["state"])
+        elif event.get("t") == "context_edit":
+            _apply_context_edit(working, event.get("edits", []))
     return _repair_dangling_tool_uses(working)
+
+
+def _apply_context_edit(messages: list, edits: list) -> None:
+    """Apply transcript tool-result replacements to a replayed working set."""
+    replacements = {
+        edit.get("tool_use_id"): edit.get("content")
+        for edit in edits
+        if edit.get("tool_use_id")
+    }
+    if not replacements:
+        return
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if tool_use_id in replacements:
+                block["content"] = replacements[tool_use_id]
 
 
 def _repair_dangling_tool_uses(msgs: list) -> list:

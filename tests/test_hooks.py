@@ -13,6 +13,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 import pytest
 
 from minicc import hooks
+from minicc.context_management import manager, summary
 
 
 @pytest.fixture(autouse=True)
@@ -129,8 +130,29 @@ def test_generic_decision_block(monkeypatch):
 def test_continue_false_stops(monkeypatch):
     cmd = """echo '{"continue":false,"stopReason":"halt"}'"""
     _use({"UserPromptSubmit": [_group(cmd)]}, monkeypatch=monkeypatch)
-    d = hooks.run("UserPromptSubmit", user_prompt="hi")
+    d = hooks.run("UserPromptSubmit", prompt="hi")
     assert d.stop and d.stop_reason == "halt"
+
+
+def test_plain_stdout_is_context_for_prompt_and_session_start(monkeypatch):
+    for event, payload in (
+        ("UserPromptSubmit", {"prompt": "hi"}),
+        ("SessionStart", {"source": "startup"}),
+    ):
+        _use({event: [_group("printf 'plain context'")]}, monkeypatch=monkeypatch)
+        d = hooks.run(event, **payload)
+        assert d.additional_context == ["plain context"]
+
+
+def test_plain_stdout_is_ignored_for_other_events(monkeypatch):
+    _use({"PreToolUse": [_group("printf 'not context'")]}, monkeypatch=monkeypatch)
+    d = hooks.run(
+        "PreToolUse",
+        match_value="bash",
+        tool_name="bash",
+        tool_input={},
+    )
+    assert d.additional_context == []
 
 
 # ─── matcher gates which hooks fire ─────────────────────────────────────────
@@ -150,14 +172,39 @@ def test_stdin_payload_reaches_hook(tmp_path, monkeypatch):
     script.write_text(
         "import sys, json\n"
         "d = json.load(sys.stdin)\n"
-        'ctx = d["tool_name"] + "|" + d["hook_event_name"] + "|" + d["cwd"]\n'
+        "assert d['permission_mode'] == 'default'\n"
+        'ctx = d["tool_name"] + "|" + d["hook_event_name"] + "|" + d["cwd"] + "|" + d["tool_use_id"]\n'
         'print(json.dumps({"hookSpecificOutput": {"additionalContext": ctx}}))\n'
     )
     _use({"PreToolUse": [_group(f"{sys.executable} {script}")]}, monkeypatch=monkeypatch)
-    d = hooks.run("PreToolUse", match_value="bash", tool_name="bash", tool_input={"command": "ls"})
+    d = hooks.run(
+        "PreToolUse",
+        match_value="bash",
+        tool_name="bash",
+        tool_input={"command": "ls"},
+        tool_use_id="tu1",
+    )
     assert len(d.additional_context) == 1
-    tool_name, event, cwd = d.additional_context[0].split("|")
-    assert tool_name == "bash" and event == "PreToolUse" and cwd  # common fields present
+    tool_name, event, cwd, tool_use_id = d.additional_context[0].split("|")
+    assert tool_name == "bash" and event == "PreToolUse" and cwd
+    assert tool_use_id == "tu1"
+
+
+def test_user_prompt_submit_payload_uses_official_prompt_field(tmp_path, monkeypatch):
+    script = tmp_path / "prompt_payload.py"
+    script.write_text(
+        "import sys, json\n"
+        "d = json.load(sys.stdin)\n"
+        "assert d['prompt'] == 'hello'\n"
+        "assert 'user_prompt' not in d\n"
+        "print('ok')\n"
+    )
+    _use(
+        {"UserPromptSubmit": [_group(f"{sys.executable} {script}")]},
+        monkeypatch=monkeypatch,
+    )
+    d = hooks.run("UserPromptSubmit", prompt="hello")
+    assert d.additional_context == ["ok"]
 
 
 # ─── timeout is non-blocking, surfaced to the user ──────────────────────────
@@ -214,7 +261,7 @@ def test_load_hooks_disable_in_either_file(tmp_path, monkeypatch):
     assert disabled
 
 
-# ─── wiring: PreCompact / PostCompact around compact.compact ────────────────
+# ─── wiring: PreCompact / PostCompact around manager.compact ────────────────
 
 def _alternating(n):
     """n messages of valid user/assistant alternation (odd indices = assistant),
@@ -226,41 +273,83 @@ def _alternating(n):
 
 
 def test_precompact_block_stops_compaction_before_llm(monkeypatch):
-    from minicc import compact
+    from minicc import context_management as compact
 
     _use({"PreCompact": [_group("echo 'not now' >&2; exit 2", matcher="manual")]}, monkeypatch=monkeypatch)
     monkeypatch.setattr(
-        compact, "_summarize", lambda *a, **k: pytest.fail("summary LLM call ran despite block")
+        summary,
+        "_summarize",
+        lambda *a, **k: pytest.fail("summary LLM call ran despite block"),
     )
     msgs = _alternating(10)
     before = list(msgs)
-    assert compact.compact(compact.ContextState(), msgs, trigger="manual") is False
+    assert compact.compact(compact.ContextState(), msgs, trigger="manual") is None  # vetoed
     assert msgs == before  # history untouched
 
 
-def test_postcompact_fires_with_compact_reason(tmp_path, monkeypatch):
-    from minicc import compact
+def test_manual_compact_veto_has_no_misleading_nothing_message(monkeypatch):
+    from minicc import cli, context_management as compact, ux
+
+    monkeypatch.setattr(compact, "compact", lambda *args, **kwargs: None)
+    said = []
+    monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
+
+    cli._cmd_compact([], compact.ContextState(), session_id="s1")
+    assert not any("nothing to compact" in message for message in said)
+
+
+def test_postcompact_fires_with_official_payload(tmp_path, monkeypatch):
+    from minicc import context_management as compact
 
     out = tmp_path / "post.txt"
     cmd = (
         f"{sys.executable} -c \"import sys,json,pathlib; "
-        f"pathlib.Path(r'{out}').write_text(json.load(sys.stdin)['compact_reason'])\""
+        f"d=json.load(sys.stdin); "
+        f"pathlib.Path(r'{out}').write_text(d['trigger']+'|'+d['compact_summary'])\""
     )
     _use({"PostCompact": [_group(cmd, matcher="manual")]}, monkeypatch=monkeypatch)
-    monkeypatch.setattr(compact, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(summary, "_summarize", lambda *a, **k: "SUMMARY")
     msgs = _alternating(10)
     assert compact.compact(compact.ContextState(), msgs, trigger="manual") is True
     assert msgs[0]["role"] == "user" and "SUMMARY" in msgs[0]["content"]
-    assert out.read_text() == "manual"  # CC payload field, matcher matched
+    assert out.read_text() == "manual|SUMMARY"
 
 
 def test_precompact_auto_matcher_skips_manual_compact(monkeypatch):
-    from minicc import compact
+    from minicc import context_management as compact
 
     _use({"PreCompact": [_group("exit 2", matcher="auto")]}, monkeypatch=monkeypatch)
-    monkeypatch.setattr(compact, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(summary, "_summarize", lambda *a, **k: "SUMMARY")
     msgs = _alternating(10)
     assert compact.compact(compact.ContextState(), msgs, trigger="manual") is True  # auto-scoped hook must not block /compact
+
+
+def test_precompact_payload_and_continue_false_precedence(tmp_path, monkeypatch):
+    from minicc import context_management as compact
+
+    seen = tmp_path / "pre.txt"
+    cmd = (
+        f"{sys.executable} -c \"import sys,json,pathlib; "
+        f"d=json.load(sys.stdin); "
+        f"pathlib.Path(r'{seen}').write_text(d['trigger']+'|'+d['custom_instructions']); "
+        "print('{\\\"decision\\\":\\\"block\\\",\\\"continue\\\":false,"
+        "\\\"stopReason\\\":\\\"halt\\\"}')\""
+    )
+    _use({"PreCompact": [_group(cmd, matcher="manual")]}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(
+        summary,
+        "_summarize",
+        lambda *a, **k: pytest.fail("summary ran after continue:false"),
+    )
+
+    with pytest.raises(hooks.HookStop, match="halt"):
+        compact.compact(
+            compact.ContextState(),
+            _alternating(10),
+            trigger="manual",
+            focus="keep tests",
+        )
+    assert seen.read_text() == "manual|keep tests"
 
 
 # ─── wiring: SessionStart / SessionEnd in the CLI ───────────────────────────
@@ -282,6 +371,38 @@ def test_session_start_matcher_filters_source(monkeypatch):
     _use({"SessionStart": [_group(cmd, matcher="clear")]}, monkeypatch=monkeypatch)
     assert "CLEARED" not in cli._session_context_with_hooks("s1", "startup")
     assert "CLEARED" in cli._session_context_with_hooks("s1", "clear")
+
+
+def test_successful_compaction_fires_compact_session_start(tmp_path, monkeypatch):
+    from minicc import context_management as compact
+
+    seen = tmp_path / "source.txt"
+    cmd = (
+        f"{sys.executable} -c \"import sys,json,pathlib; "
+        f"d=json.load(sys.stdin); pathlib.Path(r'{seen}').write_text(d['source']); "
+        "print('{\\\"hookSpecificOutput\\\":{\\\"additionalContext\\\":"
+        "\\\"post-compact context\\\"}}')\""
+    )
+    _use({"SessionStart": [_group(cmd, matcher="compact")]}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(summary, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(manager.sessions, "log_compaction", lambda *a, **k: None)
+    recorded = []
+    monkeypatch.setattr(
+        manager.sessions,
+        "append_message",
+        lambda session_id, message, **kwargs: recorded.append(message),
+    )
+    msgs = _alternating(10)
+
+    assert compact.compact(
+        compact.ContextState(),
+        msgs,
+        session_id="s1",
+        model="claude-sonnet-4-6",
+    ) is True
+    assert seen.read_text() == "compact"
+    assert msgs[-1] == {"role": "user", "content": "post-compact context"}
+    assert recorded == [msgs[-1]]
 
 
 def test_session_end_is_informational_only(monkeypatch):
@@ -325,6 +446,46 @@ def _drive(monkeypatch, replies, session_id="s1"):
     messages = [{"role": "user", "content": "hi"}]
     engine.agent_loop(messages, session_id=session_id)
     return messages, calls
+
+
+def test_pretool_continue_false_aborts_before_event_decision(monkeypatch):
+    from types import SimpleNamespace
+    from minicc import query_engine as engine
+
+    cmd = (
+        "echo '{\"continue\":false,\"stopReason\":\"halt tool\","
+        "\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}'"
+    )
+    _use({"PreToolUse": [_group(cmd, matcher="bash")]}, monkeypatch=monkeypatch)
+    block = SimpleNamespace(name="bash", input={"command": "echo no"}, id="t1")
+
+    with pytest.raises(hooks.HookStop, match="halt tool"):
+        engine._run_tool(block, {"bash"}, "s1", "")
+
+
+@pytest.mark.parametrize("blocks_so_far, expected", [(0, False), (2, True)])
+def test_stop_payload_includes_stop_hook_active(
+    tmp_path, monkeypatch, blocks_so_far, expected
+):
+    from minicc import query_engine as engine
+
+    seen = tmp_path / f"active-{blocks_so_far}.txt"
+    cmd = (
+        f"{sys.executable} -c \"import sys,json,pathlib; "
+        f"d=json.load(sys.stdin); pathlib.Path(r'{seen}').write_text("
+        "str(d['stop_hook_active']).lower())\""
+    )
+    _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(engine.sessions, "append_message", lambda *a, **k: None)
+
+    assert not engine._stop_gate(
+        _Resp("done"),
+        [{"role": "user", "content": "hi"}],
+        "s1",
+        "",
+        blocks_so_far,
+    )
+    assert seen.read_text() == str(expected).lower()
 
 
 def test_stop_block_feeds_reason_and_continues(tmp_path, monkeypatch):

@@ -13,7 +13,7 @@ from anthropic import (
     APITimeoutError,
     RateLimitError,
 )
-from minicc import compact, llm
+from minicc import context_management, llm
 from minicc.query_engine import agent_loop
 from minicc import ux
 from minicc.llm import get_usage
@@ -94,11 +94,13 @@ _INIT_PROMPT = (
 
 
 def _fire_session_start(session_id: str, source: str) -> str:
-    """Run SessionStart hooks (source: "startup" | "resume" | "clear" — CC's fourth,
-    "compact", has no minicc surface since compaction is in-place, not a session
-    restart). Returns hook-injected context to append to the session-context layer
+    """Run SessionStart hooks (source: startup, resume, clear, or compact).
+
+    context_management.manager fires the compact source after an in-place
+    compaction; the other sources enter here.
+    Returns hook-injected context to append to the session-context layer
     ("" if none) — CC injects additionalContext into context at session start the
-    same way. Cannot block."""
+    same way."""
     d = hooks.run(
         "SessionStart",
         session_id=session_id,
@@ -107,6 +109,7 @@ def _fire_session_start(session_id: str, source: str) -> str:
         model=llm.get_model(),
     )
     hooks.surface(d)
+    hooks.raise_if_stopped(d, "SessionStart")
     return "\n".join(d.additional_context)
 
 
@@ -121,12 +124,13 @@ def _session_context_with_hooks(session_id: str, source: str) -> str:
 
 def _fire_session_end(session_id: str, reason: str) -> None:
     """Run SessionEnd hooks (reason: "clear" | "prompt_input_exit" — CC's other
-    reasons target absent infra). Informational only: exit codes and decision
-    fields are ignored per CC's contract; only systemMessage surfaces."""
+    reasons target absent infra). Event-specific block decisions are ignored;
+    universal continue:false still stops processing."""
     d = hooks.run(
         "SessionEnd", session_id=session_id, match_value=reason, reason=reason
     )
     hooks.surface(d)
+    hooks.raise_if_stopped(d, "SessionEnd")
 
 
 def _git_sha() -> str:
@@ -169,7 +173,8 @@ def _cmd_help():
                     "/model [default] [id]",
                     "Show / switch session / set persistent default model",
                 ),
-                ("/compact [focus]", "Summarize older history now (optional focus)"),
+                ("/compact [focus]",
+                 "Summarize older history now (optional focus)"),
                 ("/recap", "Show a summary without changing history"),
                 (
                     "/memory [file|on|off|consolidate]",
@@ -222,7 +227,11 @@ def _cmd_context(messages, ctx):
     """
     Show context token usage vs the compaction budget.
     """
-    c = compact.context_usage(ctx, messages, model=llm.get_model())
+    c = context_management.context_usage(
+        ctx,
+        messages,
+        model=llm.get_model(),
+    )
     ux.say(
         ux.kv_block(
             [
@@ -235,14 +244,21 @@ def _cmd_context(messages, ctx):
                     f"{c['budget']:,}  (auto-compaction triggers above this)",
                 ),
                 ("messages", str(c["messages"])),
-                ("tool_results", f"{c['tool_results']} total, {c['evicted']} evicted"),
+                ("tool_results",
+                 f"{c['tool_results']} total, {c['evicted']} cleared in working set"),
                 ("eviction events", str(c["eviction_events"])),
+                ("results cleared", str(c["evicted_tool_results"])),
+                ("tokens reclaimed", f"~{c['evicted_tokens']:,}"),
+                (
+                    "last invalidated suffix",
+                    f"~{c['last_eviction_suffix_tokens']:,} tokens",
+                ),
                 ("compaction events", str(c["compaction_events"])),
             ]
         )
     )
     ux.say(
-        "(estimate covers conversation history only, not system prompt + tools)",
+        "(last API total + estimated message delta; cold/reset reads are history-only)",
         style=ux.S_INFO,
     )
 
@@ -251,18 +267,26 @@ def _cmd_compact(
     messages, ctx, focus: str | None = None, session_id: str | None = None
 ):
     """Manually compact history. Mutates `messages` in place."""
-    did = compact.compact(
-        ctx, messages, focus=focus, session_id=session_id, trigger="manual"
+    did = context_management.compact(
+        ctx,
+        messages,
+        focus=focus,
+        session_id=session_id,
+        trigger="manual",
+        runtime=llm.summary_runtime(),
     )
     if did:
         ux.say("conversation history compacted", style=ux.S_INFO)
-    else:
+    elif did is False:
         ux.say("nothing to compact yet", style=ux.S_INFO)
 
 
 def _cmd_recap(messages):
     """Show a summary of the conversation without changing it."""
-    summary = compact.recap(messages)
+    summary = context_management.recap(
+        messages,
+        runtime=llm.summary_runtime(),
+    )
     ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
     ux.markdown(summary)
 
@@ -389,10 +413,12 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=Non
         ux.say("usage: /rewind <n> [code|conversation|both]", style=ux.S_ERROR)
         return
     if mode not in ("code", "conversation", "both"):
-        ux.say(f"unknown mode {mode!r} (code | conversation | both)", style=ux.S_ERROR)
+        ux.say(
+            f"unknown mode {mode!r} (code | conversation | both)", style=ux.S_ERROR)
         return
     if not (1 <= n <= len(points)):
-        ux.say(f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
+        ux.say(
+            f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
         return
     turn, query, _ = points[n - 1]
     # read the conversation anchor BEFORE restore_files trims the stack
@@ -406,7 +432,8 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=Non
         ux.say(msg, style=ux.S_INFO)
 
     if mode in ("conversation", "both"):
-        rewound = sessions.load_upto(session_id, events) if session_id else None
+        rewound = sessions.load_upto(
+            session_id, events) if session_id else None
         if rewound is None:
             ux.say("no transcript to rewind from", style=ux.S_ERROR)
             return
@@ -433,7 +460,8 @@ def _cmd_clear(history, session_id: str) -> str:
     """Rotate to a fresh session: end the old one, reset per-session state, and
     return the new session id (the pre-clear transcript stays on disk; new turns
     record to a fresh `<id>.jsonl`). The caller resets its turn counter."""
-    _fire_session_end(session_id, "clear")  # old session ends (CC reason "clear")
+    _fire_session_end(
+        session_id, "clear")  # old session ends (CC reason "clear")
     history.clear()
     new_id = sessions.new_id()
     permissions.reset()
@@ -464,7 +492,8 @@ def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
             f"bash allow rules from settings: {', '.join(bash_rules)}", style=ux.S_INFO
         )
     if skill_names := sorted(skills.discover()):
-        ux.say(f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
+        ux.say(
+            f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
     if refused:
         ux.say(
             f"settings list {', '.join(refused)} but it can't be pre-approved "
@@ -487,7 +516,8 @@ def _init_session():
         action="store_true",
         help="resume the most recent session in this directory",
     )
-    parser.add_argument("--resume", metavar="ID", help="resume a specific session id")
+    parser.add_argument("--resume", metavar="ID",
+                        help="resume a specific session id")
     args = parser.parse_args()
 
     if args.resume:
@@ -601,26 +631,30 @@ def _friendly_error(e: Exception) -> str:
     return f"agent error: {e!r}"
 
 
-def main():
+def _main():
     history, session_id = _init_session()
     histfile = _setup_history()
-    checkpoints.reset()  # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
+    # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
+    checkpoints.reset()
     hooks.reset()  # load hook config from settings.json for this session
-    skills.reset(session_id)  # ${CLAUDE_SESSION_ID} + fresh already-loaded tracking
+    # ${CLAUDE_SESSION_ID} + fresh already-loaded tracking
+    skills.reset(session_id)
     reminders.reset()  # claudeMd/skills reminders inject on the first prompt
     requested = config.allowed_tools()
-    pre_approved = permissions.preload(requested)  # trusted in settings (bash excluded)
+    # trusted in settings (bash excluded)
+    pre_approved = permissions.preload(requested)
     refused = sorted(set(requested) & permissions.NO_PRELOAD)
     # env + git snapshot (layer 2) + SessionStart hook context (fires here; CC
     # sources: "resume" when picking up an existing transcript, else "startup").
     # CLAUDE.md / memory index / skill listing are NOT loaded here: they ride
     # <system-reminder> messages injected at prompt time (reminders.py, CC parity).
     llm.set_session_context(
-        _session_context_with_hooks(session_id, "resume" if history else "startup")
+        _session_context_with_hooks(
+            session_id, "resume" if history else "startup")
     )
     _print_startup_banner(pre_approved, refused, session_id, history)
     ctx = (
-        compact.ContextState()
+        context_management.ContextState()
     )  # this conversation's trigger state (rotated on /clear)
     turn = 0
     while True:
@@ -640,7 +674,8 @@ def main():
         # A slash-command turn expands into CC's two-message shape (probed live;
         # same in B's /init transcript): a command-tags user message + the
         # expansion user message (transcript marks the second `meta`, CC's isMeta).
-        expansion = None  # (tags, expanded content) when this turn is an expansion
+        # (tags, expanded content) when this turn is an expansion
+        expansion = None
         if query.strip() == "/init":
             ux.say("scanning the project to write CLAUDE.md ...", style=ux.S_INFO)
             expansion = (
@@ -671,16 +706,20 @@ def main():
             }
             if cmd == "/clear":
                 session_id = _cmd_clear(history, session_id)
-                ctx = compact.ContextState()  # fresh conversation, fresh trigger state
+                ctx = context_management.ContextState()
                 turn = 0
             elif cmd in builtins:
-                builtins[cmd]()
+                try:
+                    builtins[cmd]()
+                except hooks.HookStop as error:
+                    ux.say(str(error), style=ux.S_ERROR)
             else:
                 # not a built-in — try a skill (built-ins win a name clash, like
                 # CC's built-in commands; skills can't shadow /clear or /help)
                 expansion = skills.user_invoke(cmd[1:], arg or "")
                 if expansion is None:
-                    ux.say(f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
+                    ux.say(
+                        f"unknown command: {query}  (try /help)", style=ux.S_ERROR)
             if expansion is None:
                 continue
             ux.say(f"skill: {cmd[1:]}", style=ux.S_INFO)
@@ -694,20 +733,24 @@ def main():
         prompt_hook = hooks.run(
             "UserPromptSubmit",
             session_id=session_id,
-            user_prompt=expansion[1] if expansion else query,
+            prompt=expansion[1] if expansion else query,
         )
         hooks.surface(prompt_hook)
-        # `or`: for UserPromptSubmit both mean "do not proceed", so either
-        # one refuses the prompt (unlike Stop, where they are opposites).
-        if prompt_hook.block or prompt_hook.stop:
-            reason = prompt_hook.reason or prompt_hook.stop_reason or "no reason given"
+        # Universal continue:false takes precedence over the event's block output.
+        if prompt_hook.stop:
+            reason = prompt_hook.stop_reason or "no reason given"
+            ux.say(f"prompt processing stopped by hook: {reason}", style=ux.S_ERROR)
+            continue
+        if prompt_hook.block:
+            reason = prompt_hook.reason or "no reason given"
             ux.say(f"prompt blocked by hook: {reason}", style=ux.S_ERROR)
             continue
 
         turn += 1
         ux.say(f">>> USER (turn {turn})", style=ux.S_USER)
 
-        mark = len(history)  # roll-back point if this turn is interrupted/errors
+        # roll-back point if this turn is interrupted/errors
+        mark = len(history)
         # transcript position BEFORE this turn's user message — the replay target
         # if a later `/rewind N conversation` returns to this turn
         events = sessions.event_count(session_id)
@@ -721,26 +764,33 @@ def main():
         if expansion:
             tags, expanded = expansion
             history.append({"role": "user", "content": prefix + tags})
-            sessions.append_message(session_id, {"role": "user", "content": tags})
+            sessions.append_message(
+                session_id, {"role": "user", "content": tags})
             history.append({"role": "user", "content": expanded})
             sessions.append_message(
                 session_id, {"role": "user", "content": expanded}, meta=True
             )
         else:
             history.append({"role": "user", "content": prefix + query})
-            sessions.append_message(session_id, {"role": "user", "content": query})
+            sessions.append_message(
+                session_id, {"role": "user", "content": query})
         # Hook-injected context rides as an extra user message for this turn (CC adds
         # additionalContext to the model's context alongside the prompt).
-        for ctx in prompt_hook.additional_context:
-            ctx_msg = {"role": "user", "content": ctx}
+        for extra_context in prompt_hook.additional_context:
+            ctx_msg = {"role": "user", "content": extra_context}
             history.append(ctx_msg)
             sessions.append_message(session_id, ctx_msg)
-        checkpoints.start(turn, query, events=events)  # files + conversation anchor
+        # files + conversation anchor
+        checkpoints.start(turn, query, events=events)
 
         try:
             agent_loop(
                 history, session_id=session_id, ctx=ctx
             )  # streams; records incrementally
+        except hooks.HookStop as error:
+            del history[mark:]
+            ux.say(str(error), style=ux.S_ERROR)
+            continue
         except KeyboardInterrupt:
             # Ctrl-C during a slow tool (e.g. bash) leaves an assistant tool_use
             # with no following tool_result. The next request then 400s:
@@ -765,6 +815,14 @@ def main():
         readline.write_history_file(histfile)
     except OSError:
         pass
+
+
+def main():
+    """Console entry point with a clean boundary for lifecycle-hook stops."""
+    try:
+        _main()
+    except hooks.HookStop as error:
+        ux.say(str(error), style=ux.S_ERROR)
 
 
 if __name__ == "__main__":

@@ -26,20 +26,22 @@ SessionStart, SessionEnd (lifecycle). Only `type: "command"` runs; http/mcp_tool
 prompt/agent target infrastructure minicc doesn't have. Matchers use minicc's tool
 names (bash, write_file, edit_file), not CC's Bash/Edit. See HOOKS.md.
 
-I/O contract (verbatim-faithful to CC):
+I/O contract:
 - Input: JSON on stdin — common fields (session_id, transcript_path, cwd,
-  hook_event_name) + event-specific (tool_name, tool_input, tool_response,
-  user_prompt).
-- Output: exit 0 → parse JSON stdout for decision control (plain stdout is ignored,
-  goes to a debug log in CC); exit 2 → block, stderr is the reason fed to the model;
-  any other non-zero → non-blocking, stderr's first line shown to the user.
+  permission_mode, hook_event_name) + event-specific (tool_name, tool_input,
+  tool_use_id, tool_response,
+  prompt, trigger, custom_instructions, compact_summary, source).
+- Output: exit 0 → parse JSON stdout for decision control; plain stdout becomes
+  context for SessionStart/UserPromptSubmit and is ignored for other events.
+  Exit 2 → block, stderr is the reason fed to the model; any other non-zero →
+  non-blocking, stderr's first line shown to the user.
 - JSON stdout honored: continue, stopReason, systemMessage, decision ("block"),
   reason, hookSpecificOutput.{permissionDecision (allow|deny|ask),
   permissionDecisionReason, additionalContext, updatedInput, updatedToolOutput}.
 
 The module is mechanism-only: `run` returns a normalized Decision; each CALL SITE
-interprets `block` per its event (deny the tool / reject the prompt / feed back), the
-way CC's own hook system separates the runner from the event semantics.
+interprets `block` per its event. `continue:false` is universal and takes precedence
+over event-specific decisions.
 """
 
 import json
@@ -82,14 +84,14 @@ class Decision:
 
     | event            | consumer                    | fields it reads                                    |
     |------------------|-----------------------------|----------------------------------------------------|
-    | PreToolUse       | query_engine._run_tool      | block · allow · ask · reason · updated_input · ctx  |
-    | PostToolUse      | query_engine._post_tool     | block+reason (as a note) · updated_output · ctx     |
-    | Stop             | query_engine._stop_gate     | block · stop · reason · ctx                         |
-    | UserPromptSubmit | cli.main                    | block · stop · reason · ctx                         |
-    | PreCompact       | compact.compact             | block · stop · reason                               |
-    | PostCompact      | compact.compact             | (notification only)                                 |
-    | SessionStart     | cli._fire_session_start     | ctx (joins the session-context layer)               |
-    | SessionEnd       | cli._fire_session_end       | (notification only)                                 |
+    | PreToolUse       | query_engine._run_tool      | block · allow · ask · reason · updated_input · ctx |
+    | PostToolUse      | query_engine._post_tool     | block+reason · updated_output · ctx                 |
+    | Stop             | query_engine._stop_gate     | block · reason · ctx                                |
+    | UserPromptSubmit | cli.main                    | block · reason · ctx                                |
+    | PreCompact       | context_management.compact  | block · reason                                      |
+    | PostCompact      | context_management.compact  | notification                                        |
+    | SessionStart     | cli / compact               | ctx                                                 |
+    | SessionEnd       | cli._fire_session_end       | notification                                        |
 
     `system_messages` is the one field EVERY site reads (surfaced via `surface`).
     `additional_context` ("ctx" above) is injected five different ways: appended
@@ -100,9 +102,7 @@ class Decision:
     ACCUMULATION across the hooks of one event (`run` threads one instance
     through all of them):
       - lists (`system_messages`, `additional_context`) APPEND;
-      - booleans (`block`, `allow`, `stop`) LATCH True and never fall back —
-        that's CC's deny-wins stickiness (precedence between block and stop is
-        resolved at the call site, not here — see `run`);
+      - booleans (`block`, `allow`, `stop`) LATCH True and never fall back;
       - scalars (`reason`, `updated_input`, `updated_output`) are
         LAST-WRITER-WINS: with two hooks rewriting the same tool input, the
         earlier rewrite is silently dropped.
@@ -112,12 +112,21 @@ class Decision:
     allow: bool = False  # PreToolUse "allow": bypass the permission gate
     ask: bool = False  # PreToolUse "ask": force the permission prompt
     reason: str | None = None  # why blocked / fed back to the model
-    stop: bool = False  # continue:false — halt the whole turn
+    stop: bool = False  # continue:false — stop processing before event decisions
     stop_reason: str | None = None
     updated_input: dict | None = None  # PreToolUse: rewrite the tool arguments
     updated_output: str | None = None  # PostToolUse: replace the tool result text
     system_messages: list = field(default_factory=list)  # shown to the user
     additional_context: list = field(default_factory=list)  # injected for the model
+
+
+class HookStop(RuntimeError):
+    """Control-flow signal for universal hook output `continue:false`."""
+
+    def __init__(self, event: str, reason: str | None = None):
+        self.event = event
+        self.reason = reason or "no reason given"
+        super().__init__(f"{event} hook stopped processing: {self.reason}")
 
 
 def surface(decision: Decision, indent: str = "") -> None:
@@ -126,6 +135,12 @@ def surface(decision: Decision, indent: str = "") -> None:
     single home instead of eight copies of the same loop."""
     for m in decision.system_messages:
         ux.say(f"{indent}[hook] {m}", style=ux.S_INFO)
+
+
+def raise_if_stopped(decision: Decision, event: str) -> None:
+    """Apply the universal continue:false field before event-specific output."""
+    if decision.stop:
+        raise HookStop(event, decision.stop_reason)
 
 
 def _match(matcher, value: str) -> bool:
@@ -149,6 +164,7 @@ def _common(event: str, session_id: str | None) -> dict:
         "session_id": session_id or "",
         "transcript_path": str(tp) if tp else "",
         "cwd": str(Path.cwd()),
+        "permission_mode": "default",
         "hook_event_name": event,
     }
 
@@ -159,16 +175,7 @@ def run(
     """Fire every configured command hook for `event` whose matcher accepts
     `match_value` (the tool name for tool events; "" for events without matchers).
     `payload` is merged into the JSON sent on the hook's stdin. Returns a Decision the
-    caller interprets. No hooks / disabled → an empty (no-op) Decision.
-
-    Mechanism only: this never decides what `block` MEANS, and never resolves the
-    block-vs-stop precedence — both are per-event and belong to the call site. The
-    two shapes in use, and why they differ:
-      - `block or stop`  (UserPromptSubmit, PreCompact) — both mean "don't
-        proceed", so either one is enough to refuse.
-      - `block and not stop`  (Stop) — here they are OPPOSITES: `block` means
-        "don't end the turn" while `stop` (continue:false) means "end it now", so
-        continue:false must override the block (CC's precedence)."""
+    caller interprets. No hooks / disabled → an empty (no-op) Decision."""
     events, disabled = _load()
     decision = Decision()
     if disabled:
@@ -184,11 +191,13 @@ def run(
             continue
         for entry in group.get("hooks", []):
             if isinstance(entry, dict) and entry.get("type", "command") == "command":
-                _run_one(entry, stdin_obj, decision)
+                _run_one(entry, stdin_obj, decision, event)
     return decision
 
 
-def _run_one(entry: dict, stdin_obj: dict, decision: Decision) -> None:
+def _run_one(
+    entry: dict, stdin_obj: dict, decision: Decision, event: str
+) -> None:
     cmd = entry.get("command")
     if not cmd:
         return
@@ -210,10 +219,10 @@ def _run_one(entry: dict, stdin_obj: dict, decision: Decision) -> None:
     except OSError as e:
         decision.system_messages.append(f"hook failed to run: {e}")
         return
-    _apply(proc, decision)
+    _apply(proc, decision, event)
 
 
-def _apply(proc, decision: Decision) -> None:
+def _apply(proc, decision: Decision, event: str) -> None:
     code = proc.returncode
     if code == 2:
         # blocking error: stderr is the reason fed back to the model
@@ -227,13 +236,16 @@ def _apply(proc, decision: Decision) -> None:
         if line:
             decision.system_messages.append(line.strip())
         return
-    # exit 0: JSON stdout is the decision-control channel (plain stdout is ignored)
+    # exit 0: JSON is the decision-control channel. Two lifecycle/prompt events
+    # define plain stdout as context instead.
     out = proc.stdout.strip()
     if not out:
         return
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
+        if event in ("SessionStart", "UserPromptSubmit"):
+            decision.additional_context.append(out)
         return
     if isinstance(data, dict):
         _apply_json(data, decision)
