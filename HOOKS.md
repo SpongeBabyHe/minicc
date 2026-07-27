@@ -2,9 +2,10 @@
 
 User-configured shell commands that fire at points in the agent loop. Faithful to
 [Claude Code's hooks](https://code.claude.com/docs/en/hooks), adapted to minicc's
-surfaces and tool names. Implemented in `minicc/hooks.py`; wired in `minicc/query_engine.py`
-(tool events + the Stop gate), `minicc/cli.py` (prompt + session lifecycle), and
-`minicc/llm.py` (compaction events).
+surfaces and tool names. Implemented in `minicc/hooks.py`; wired in
+`minicc/query_engine.py` (tool events + the Stop gate), `minicc/cli.py` (prompt
+and session lifecycle), and `minicc/context_management/manager.py` (compaction
+events).
 
 ## Why hooks exist
 
@@ -30,12 +31,17 @@ only the events with a real minicc surface are wired:
 |---|---|---|---|
 | **PreToolUse** | `agent._run_tool`, before the permission gate | tool name | block (`deny`), pre-approve (`allow`), force a prompt (`ask`), rewrite args (`updatedInput`), inject context |
 | **PostToolUse** | `agent._run_tool`, after the handler runs | tool name | feed the model a note (`additionalContext` / `decision:block` + `reason`), replace the result (`updatedToolOutput`), warn the user (`systemMessage`) |
-| **UserPromptSubmit** | `cli.main`, before the turn | — | reject the prompt (`block` / `continue:false`), inject context for the turn |
-| **PreCompact** | `llm._compact`, before summarizing | `manual` \| `auto` | block compaction (exit 2 / `decision:"block"`); stdin has `compact_reason` |
-| **PostCompact** | `llm._compact`, after history is replaced | `manual` \| `auto` | notification only (side effects, `systemMessage`); stdin has `compact_reason` |
-| **SessionStart** | `cli`, at startup and `/clear` | `startup` \| `resume` \| `clear` | inject `additionalContext` (appended to the session-context layer); stdin has `source`, `model` |
-| **SessionEnd** | `cli`, at exit and `/clear` | `clear` \| `prompt_input_exit` | informational only — exit codes and decisions ignored per CC; stdin has `reason` |
-| **Stop** | `agent_loop`, when a turn is about to end | — | block the stop (exit 2 / `decision:"block"`) — reason is fed back as a user message and the model keeps working; `continue:false` overrides a block; `additionalContext` without a block enters the conversation but the turn ends; stdin has `last_assistant_message`. Runaway guard: overridden after **8 consecutive blocks** (CC best-practices) |
+| **UserPromptSubmit** | `cli.main`, before the turn | — | reject the prompt (`block`), inject context for the turn; stdin has `prompt` |
+| **PreCompact** | `context_management.manager.compact`, before summarizing | `manual` \| `auto` | block compaction; stdin has `trigger`, `custom_instructions` |
+| **PostCompact** | `context_management.manager.compact`, after history is replaced | `manual` \| `auto` | notification; stdin has `trigger`, `compact_summary` |
+| **SessionStart** | `cli` / `compact`, at lifecycle starts | `startup` \| `resume` \| `clear` \| `compact` | inject `additionalContext`; compact-sourced context joins the new working set; stdin has `source`, `model` |
+| **SessionEnd** | `cli`, at exit and `/clear` | `clear` \| `prompt_input_exit` | no event-specific block control; stdin has `reason` |
+| **Stop** | `agent_loop`, when a turn is about to end | — | block the stop — reason is fed back and the model keeps working; context without a block enters the conversation but the turn ends; stdin has `last_assistant_message`, `stop_hook_active`. Runaway guard: overridden after **8 consecutive blocks** |
+
+The universal JSON field `continue:false` applies to every event and takes
+precedence over the event-specific behavior in this table. It aborts the current
+processing path; for `Stop`, that means ending the turn even if the hook also
+returned `decision:"block"`.
 
 All events with a real minicc surface are now wired.
 Not applicable (no surface): PermissionRequest, PostToolBatch, Notification, Task\*,
@@ -85,21 +91,30 @@ Hook config is read once per session and cached; it reloads at startup and on
 
 ## I/O contract
 
-Verbatim-faithful to CC, so a CC command hook behaves identically.
+The wired events use CC's field names and control semantics. Recorded surface
+differences remain in the final section.
 
 **Input** — JSON on the hook's stdin. Common fields on every event: `session_id`,
-`transcript_path`, `cwd`, `hook_event_name`. Event-specific: `tool_name` +
-`tool_input` (tool events), `tool_response` (`PostToolUse`), `user_prompt`
-(`UserPromptSubmit`).
+`transcript_path`, `cwd`, `permission_mode` (`"default"`; minicc has one mode),
+`hook_event_name`. Event-specific fields include:
+
+- `tool_name` + `tool_input` + `tool_use_id` (`PreToolUse` / `PostToolUse`)
+- `tool_response` (`PostToolUse`)
+- `prompt` (`UserPromptSubmit`)
+- `trigger` + `custom_instructions` (`PreCompact`)
+- `trigger` + `compact_summary` (`PostCompact`)
+- `source` + `model` (`SessionStart`)
+- `last_assistant_message` + `stop_hook_active` (`Stop`)
 
 **Output** — two channels:
 
-- **Exit code.** `0` → parse JSON on stdout for decision control (plain, non-JSON
-  stdout is ignored — in CC it goes to a debug log). `2` → **block**, and stderr is
-  the reason fed back to the model. Any other non-zero → **non-blocking**; the first
-  stderr line is shown to the user and the action proceeds.
-- **JSON stdout** (only on exit 0). Honored fields: `continue` (`false` halts the
-  turn) + `stopReason`, `systemMessage`, `decision` (`"block"`) + `reason`, and
+- **Exit code.** `0` → parse JSON on stdout for decision control. Plain stdout
+  becomes context for `SessionStart` and `UserPromptSubmit`; other events ignore
+  it. `2` → **block**, and stderr is the reason fed back to the model. Any other
+  non-zero → **non-blocking**; the first stderr line is shown to the user.
+- **JSON stdout** (only on exit 0). Honored fields: universal `continue`
+  (`false` stops processing before event-specific decisions) + `stopReason`,
+  `systemMessage`, `decision` (`"block"`) + `reason`, and
   `hookSpecificOutput.{ permissionDecision (allow|deny|ask), permissionDecisionReason,
   additionalContext, updatedInput, updatedToolOutput }`.
 
@@ -147,21 +162,16 @@ exit 0
 - `PreToolUse` `additionalContext` is appended to the tool result;
   `UserPromptSubmit` `additionalContext` rides as an extra user message for the turn
   (CC injects it into the model's context the same way).
-- **SessionStart** has no `compact` source: minicc compaction is in-place within the
-  session, not a session restart. `sessionTitle` / `initialUserMessage` /
-  `watchPaths` / `reloadSkills` are absent-infra (no titles, no `-p` mode, no file
-  watcher, no skills yet).
+- `SessionStart` supports `compact`; `sessionTitle` / `initialUserMessage` /
+  `watchPaths` / `reloadSkills` remain absent-infra.
 - **SessionEnd** reasons are the two with a surface (`clear`, `prompt_input_exit`);
   `logout` / `resume` / `bypass_permissions_disabled` have none.
-- A hook that *persistently* blocks auto-compaction will trip minicc's thrash guard
-  (L5) after `MAX_COMPACT_ATTEMPTS` over-budget turns and error the turn — deliberate:
-  unbounded context growth is the exact failure minicc's context layers exist to
-  prevent, and the user has seen a "[compaction blocked by PreCompact hook]" line per
-  attempt by then.
+- A hook that persistently blocks auto-compaction does not increment the thrash
+  guard: a veto is a user decision, not a failed compaction. If the resulting API
+  request is structurally too large, the original 400/413 surfaces.
 - **Stop** fires for the main session only; sub-agent turn-end is CC's separate
   SubagentStop event (not wired — minicc's `task` sub-agents return a summary to the
   parent, who verifies). The 8-block cap comes from CC's best-practices page ("Claude
   Code overrides the hook and ends the turn after 8 consecutive blocks"); the hooks
-  reference itself documents no cap. No `stop_hook_active` stdin field: the current
-  reference doesn't document one (recorded so it isn't "restored" from older docs) —
-  loop protection is the harness-side cap instead.
+  reference documents `stop_hook_active`. minicc sends the field and enforces the
+  documented cap.

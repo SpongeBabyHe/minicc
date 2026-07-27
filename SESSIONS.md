@@ -38,12 +38,13 @@ losslessness and in-place compaction coexist (§4, I2).
 ## 3. Data model
 
 One file per session: `.minicc/sessions/<id>.jsonl`, `<id>` = startup timestamp.
-One JSON event per line, appended, never rewritten. Three event kinds:
+One JSON event per line, appended, never rewritten. Four event kinds:
 
 ```
 {"t":"msg",     "ts":<iso>, "m":<message>[, "usage":{…}][, "meta":true]}
 {"t":"compact", "state":[<messages>]}   # working set after a compaction
 {"t":"rewind",  "state":[<messages>]}   # working set after a /rewind
+{"t":"context_edit", "edits":[{"tool_use_id":<id>, "content":<replacement>}]}
 ```
 
 - `m` — one API-shaped message (§5).
@@ -51,16 +52,17 @@ One JSON event per line, appended, never rewritten. Three event kinds:
   substrate for offline process analysis. Never read on replay.
 - `meta:true` — a slash-command expansion record (CC's `isMeta`); transcript-only.
 
-Replay reads only `t`, `m`, `state`; **unknown keys are ignored** → the format is
-forward/backward compatible.
+Replay reads only `t`, `m`, `state`, and `edits`; **unknown keys are ignored** →
+the format is forward/backward compatible.
 
 ## 4. Invariants (each → a mechanism → a test)
 
 - **I1 — Replay yields a valid API request.**
   - *field shape*: required fields present, no invalid value → `model_dump(exclude_none=True)` (§5).
   - *structure*: every `tool_use` answered by a `tool_result` → two-layer defense (§6).
-- **I2 — Losslessness.** Raw `msg` events are never deleted/rewritten; a compaction
-  is a *new* `compact` event. Pre-compaction messages stay on disk forever.
+- **I2 — Losslessness.** Raw `msg` events are never deleted/rewritten. Compaction
+  and local context editing append reset/delta events; original messages stay on
+  disk forever.
 - **I3 — Append-only.** Every write is `open("a")` + one line; no update-in-place.
 - **I4 — Reminders never persist.** CLAUDE.md/memory/skills reminders are re-derived
   at request time; the transcript stores only the bare typed/expanded text.
@@ -79,8 +81,9 @@ input by never emitting one. Generic across block types: a `thinking` block keep
 `{type, thinking, signature}`, so the replay-critical `signature` survives.
 
 On resume the working set is **mixed** (old dicts + new SDK objects). Every helper
-that walks history (`compact.estimate_tokens`, `compact.evict_old_tool_results`,
-`llm._cacheable`) branches on `isinstance`, so mixed content works everywhere.
+that walks history (`context_management.estimate_tokens`,
+`context_management.evict_old_tool_results`, `llm._cacheable`) branches on
+`isinstance`, so mixed content works everywhere.
 
 ## 6. Structural integrity: the dangling `tool_use`
 
@@ -98,8 +101,8 @@ The one structural rule that breaks in practice — a `tool_use` with no followi
 ## 7. Interfaces
 
 - **Record** (during a turn): `append_message` (user; then assistant+results together),
-  `log_compaction`, `log_rewind`. `session_id` threaded `agent_loop → llm_response
-  → compact.compact`.
+  `log_compaction`, `log_context_edit`, `log_rewind`. `session_id` threads
+  `agent_loop → llm_response → compact`.
 - **Read**: `load` (full replay — resume) · `load_upto(n)` (first n events — rewind) ·
   `event_count` (turn-start anchor) · `path` (transcript_path for hooks). `load`/
   `load_upto` share `_replay`; a missing/corrupt file → `None`.
@@ -127,9 +130,10 @@ architectural, not cosmetic:
 
 1. **Flat log vs tree.** CC's transcript is a parent-pointer DAG (`parentUuid` /
    `uuid` / `isSidechain` on every message) that can represent branches and
-   sub-agent sidechains. minicc is a flat append-only list with `compact` / `rewind`
-   reset events — it cannot structurally represent a branch. (Upgrading to the tree
-   is what rewind-as-branch or full teams replay would require.)
+   sub-agent sidechains. minicc is a flat append-only list with `compact` /
+   `rewind` resets and `context_edit` deltas — it cannot structurally represent a
+   branch. (Upgrading to the tree is what rewind-as-branch or full teams replay
+   would require.)
 2. **Sub-agents unrecorded vs sidechains.** CC records sub-agent conversations in
    the transcript as sidechains (`isSidechain`). minicc deliberately does NOT record
    sub-agent context (I5) — a sub-agent runs `session_id=None`. A scope choice (keep
@@ -138,7 +142,8 @@ architectural, not cosmetic:
    writes a separate `{"t":"compact","state":[…]}` reset event.
 4. **Event vocabulary.** CC's transcript also logs UI/harness events (titles, mode
    changes, attachments, queue operations, per-message `cwd`/`version`/`gitBranch`);
-   minicc records only the conversation (`msg`/`compact`/`rewind`).
+   minicc records only the conversation and working-set edits
+   (`msg`/`compact`/`rewind`/`context_edit`).
 
 Plus: session id is a startup timestamp, not CC's UUID; no `~/.claude` global store;
 local-only (never uploaded).

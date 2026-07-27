@@ -9,8 +9,9 @@ A from-scratch Python reimplementation of Claude Code's core, built for
 **maximum 1:1 fidelity to CC's behavior and contracts** (tool schemas, prompts,
 mechanisms) — not to CC's file layout. CC is TypeScript; its file conventions
 (PascalCase, dir-per-command, React components) do NOT port. minicc stays
-idiomatic Python: lowercase snake_case modules, flat package + `tools/`
-subpackage. Copy CC's *concepts and vocabulary*, implement them the Python way.
+idiomatic Python: lowercase snake_case modules, flat package + focused `tools/`
+and `context_management/` subpackages. Copy CC's *concepts and vocabulary*,
+implement them the Python way.
 
 ## Module naming (do not let this drift)
 
@@ -24,7 +25,7 @@ The "agent" and "task" words each map to ONE concept — keep them separated:
 | `tasks.py` + `tools/task_*.py` | the coordination task LIST (deps, owner) | `Task*` |
 | `cli.py` | the REPL + entry (`main`) + slash commands | `App` + `cli/` + `commands/` |
 | `llm.py` | the API client (request assembly, cache layers, streaming) | `services/api/` |
-| `compact.py` | context management: budgets/eviction/compaction + per-conversation `ContextState` | `services/compact/` |
+| `context_management/` | budgets, eviction, summary, compaction orchestration + per-conversation `ContextState` | `services/compact/` |
 
 **Reserved** (map to real future CC components — don't repurpose):
 `runner.py` = the process/session spawner (CC `sessionRunner`; future

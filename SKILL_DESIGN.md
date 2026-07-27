@@ -100,7 +100,7 @@ case-insensitively.
   command-tags user message + the expansion user message (base-dir header +
   rendered body); the transcript marks the second record `meta: true` (CC's
   `isMeta`). `/init` uses the same shape. UserPromptSubmit hooks fire for
-  expansion turns with the expanded content as `user_prompt`; built-in
+  expansion turns with the expanded content as `prompt`; built-in
   commands (`/help`, `/compact`, …) skip hooks, as before.
 - **Model path**: the `skill` tool. Description is CC's own text ported
   verbatim minus the plugin / directory-scope / subagent sentences (absent

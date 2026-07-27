@@ -31,13 +31,15 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   - 2026-07-01 re-diagnosed: it was an **ITPM rate limit (429)**, not a
     request-size wall — 450K fits Sonnet 4.6's 1M window (GA since 2026-03-13);
     the SDK re-sent the same oversized body, so waiting couldn't help. The 350K
-    ceiling built on this was **dropped** for CC's `window − 13K` + reactive-429.
-    FIXED (details in `CONTEXT_MANAGEMENT.md`).
+    ceiling built on this was **dropped**. A later audit corrected the replacement
+    too: the trigger is `window − max output − 13K`, while persistent 429 remains a
+    rate-limit error rather than destructively compacting history.
 - 2026-06-15: L4/L5 implemented & validated. Details (cut-point fix, survey-task
   churn, budget invariant, validation, v0.3 gaps) synthesized in
   `CONTEXT_MANAGEMENT.md` → "Dogfood lessons & validation".
 - 2026-07-02: Phase-1 CC alignment landed (two-band L3/L4 with official
-  context-editing defaults, `window − 13K` budget, 9-section summary, append-only
+  context-editing defaults, later-corrected window-relative budget, 9-section
+  summary, append-only
   session transcript, session-context cache layer, auto-memory + /memory).
   Processed into `CONTEXT_MANAGEMENT.md` / `SESSIONS.md` / `MEMORY_DESIGN.md`. **All
   fresh — none of it dogfooded yet** (see retro questions below).
@@ -68,8 +70,7 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
   gate). `minicc/hooks.py` + agent/cli wiring; 19 tests + HOOKS.md. Watch in dogfood:
   is the deterministic PostToolUse-lint a better verify signal than the soft stance?
 - 2026-07-09 (same day, follow-up): **lifecycle hooks** — PreCompact (blockable,
-  matcher manual|auto, `compact_reason` payload — re-fetched the official reference
-  for the exact stdin fields), PostCompact (notify-only), SessionStart
+  matcher manual|auto), PostCompact (notify-only), SessionStart
   (startup|resume|clear; additionalContext → session-context layer), SessionEnd
   (clear|prompt_input_exit; informational per CC). Ordering call: user sequenced
   lifecycle BEFORE Stop — right by risk (none of these touch loop control flow;
@@ -78,9 +79,10 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 - 2026-07-10: shipped **Stop hook** — the deterministic turn-end gate (verify-work's
   enforced tier; RALPH's "done" primitive). block → reason fed back as a user
   message, loop continues; continue:false overrides a block; additionalContext
-  sans block trails into the conversation; cap = 8 consecutive blocks (from
-  best-practices — the hooks reference documents NO cap and NO stop_hook_active
-  field; deliberately did not restore the latter from stale training-data memory).
+  sans block trails into the conversation; cap = 8 consecutive blocks. A later
+  contract audit added the documented `stop_hook_active` field and corrected the
+  compact payloads to `trigger` / `custom_instructions` / `compact_summary`, plus
+  `SessionStart(source="compact")`.
   Main session only (SubagentStop unwired). +5 loop tests (166 green). Hooks
   feature COMPLETE → next: dogfood (llm-wiki worktree twin).
 
