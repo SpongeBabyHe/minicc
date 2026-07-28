@@ -1,4 +1,9 @@
-"""Context sizing, model-window policy, and per-conversation trigger state."""
+"""Token-budget policy and per-conversation context accounting.
+
+This module owns arithmetic, not request orchestration.  Callers provide the
+estimated token size of the complete request input when they have it; the state
+then anchors that estimate to the API's last real input-token usage.
+"""
 
 import json
 import os
@@ -9,8 +14,14 @@ from dataclasses import dataclass
 _MODEL_WINDOWS = {
     "claude-haiku-4-5": 200_000,
     "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
     "claude-opus-4-8": 1_000_000,
+    "claude-opus-5": 1_000_000,
     "claude-fable-5": 1_000_000,
+    "claude-mythos-5": 1_000_000,
+    "claude-mythos-preview": 1_000_000,
 }
 # Conservative fallback for an unmapped model.
 _DEFAULT_WINDOW = 200_000
@@ -23,10 +34,17 @@ MAX_OUTPUT_TOKENS = 16_000
 
 @dataclass
 class ContextState:
-    """Trigger state owned by one conversation, never shared across loops."""
+    """Mutable sizing and edit telemetry for exactly one conversation.
 
-    last_input_tokens: int = 0  # Last request's real total input tokens.
-    last_message_tokens: int | None = None  # Message estimate for that request.
+    A successful request supplies the most reliable baseline.  After a local
+    rewrite, ``rebase`` advances that baseline with an estimated delta until the
+    next successful request replaces it with real usage again.
+    """
+
+    last_input_tokens: int = 0  # Anchored total: real after send, predicted after edit.
+    last_message_tokens: int | None = None  # Messages estimate matching the anchor.
+    last_request_tokens: int | None = None  # Full-input estimate matching the anchor.
+    last_model: str | None = None  # Model whose tokenizer produced the anchor.
     compact_attempts: int = 0  # Consecutive over-budget compaction attempts.
     evictions: int = 0  # Applied eviction batches.
     compactions: int = 0  # Successful full compactions.
@@ -34,31 +52,69 @@ class ContextState:
     evicted_tokens: int = 0  # Estimated net tokens reclaimed by eviction.
     last_eviction_suffix_tokens: int = 0  # Latest invalidated cache suffix.
 
-    def context_size(self, messages) -> int:
-        """Predict the next input from the real baseline plus message growth."""
-        message_tokens = estimate_tokens(messages)
-        if self.last_message_tokens is None:
-            return message_tokens
-        return max(
-            0,
-            self.last_input_tokens + message_tokens - self.last_message_tokens,
-        )
+    def context_size(
+        self,
+        messages,
+        *,
+        request_tokens: int | None = None,
+        model: str | None = None,
+    ) -> int:
+        """Predict the current input size from the last real API measurement.
 
-    def record_input(self, total_input_tokens: int, message_tokens: int) -> None:
-        """Anchor one successful request's real usage and message estimate."""
+        ``request_tokens`` should estimate the complete input payload
+        (system, tools, and messages).  A model change invalidates real usage
+        measured by the old tokenizer, so the current local estimate becomes a
+        cold baseline.  When unavailable, the method falls back to the
+        messages-only delta used by older callers.
+        """
+        message_tokens = estimate_tokens(messages)
+        if model is not None and self.last_model not in (None, model):
+            return request_tokens if request_tokens is not None else message_tokens
+        if self.last_message_tokens is None:
+            return request_tokens if request_tokens is not None else message_tokens
+        if request_tokens is not None and self.last_request_tokens is not None:
+            estimated_delta = request_tokens - self.last_request_tokens
+        else:
+            estimated_delta = message_tokens - self.last_message_tokens
+        return max(0, self.last_input_tokens + estimated_delta)
+
+    def record_input(
+        self,
+        total_input_tokens: int,
+        message_tokens: int,
+        request_tokens: int | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Anchor a successful request's real usage and matching estimates."""
         self.last_input_tokens = total_input_tokens
         self.last_message_tokens = message_tokens
+        self.last_request_tokens = request_tokens
+        self.last_model = model
 
-    def rebase(self, messages) -> None:
-        """Make the current prediction the baseline after an in-place rewrite."""
-        predicted = self.context_size(messages)
+    def rebase(
+        self,
+        messages,
+        *,
+        request_tokens: int | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Promote a rewritten working set's prediction to the new baseline."""
+        predicted = self.context_size(
+            messages,
+            request_tokens=request_tokens,
+            model=model,
+        )
         self.last_input_tokens = predicted
         self.last_message_tokens = estimate_tokens(messages)
+        self.last_request_tokens = request_tokens
+        self.last_model = model
 
     def reset_size(self) -> None:
         """Forget a stale request baseline after history shrinks externally."""
         self.last_input_tokens = 0
         self.last_message_tokens = None
+        self.last_request_tokens = None
+        self.last_model = None
 
     def record_eviction(self, result) -> None:
         """Accumulate one applied local context edit for ``/context``."""
@@ -85,7 +141,22 @@ def estimate_tokens(messages) -> int:
     return _serialized_size(messages) // 4
 
 
+def estimate_request_input_tokens(params: dict) -> int:
+    """Estimate tokenized input fields from one assembled Messages request.
+
+    Output controls such as ``max_tokens`` and ``thinking`` affect request
+    bytes, but the tokenized input is the rendered tools, system, and messages.
+    """
+    input_payload = {
+        key: params[key]
+        for key in ("system", "tools", "messages")
+        if key in params
+    }
+    return estimate_tokens(input_payload)
+
+
 def _json_default(value):
+    """Serialize SDK models while keeping unknown values measurable."""
     if hasattr(value, "model_dump"):
         return value.model_dump(exclude_none=True)
     return str(value)
@@ -103,16 +174,29 @@ def _serialized_size(value) -> int:
 
 
 def _model_window(model: str) -> int:
-    """Context window for a model id, tolerating a date suffix."""
+    """Return the known window or a compatible override for an unknown model.
+
+    Claude Code applies ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` directly to model
+    names it does not recognize, which matters for Anthropic-compatible custom
+    endpoints.  Known Claude models retain their published capacity.
+    """
     for prefix, window in _MODEL_WINDOWS.items():
         if model.startswith(prefix):
             return window
+    raw = os.getenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "")
+    try:
+        override = int(raw)
+    except ValueError:
+        return _DEFAULT_WINDOW
+    if override > 0:
+        return override
     return _DEFAULT_WINDOW
 
 
 def _compaction_capacity(model: str) -> int:
-    """Model window, optionally lowered by Claude Code's compatible override."""
+    """Return the model window used for proactive compaction calculations."""
     model_window = _model_window(model)
+    # Read per call so the environment override is not frozen at module import.
     raw = os.getenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
     try:
         override = int(raw)
@@ -123,14 +207,39 @@ def _compaction_capacity(model: str) -> int:
     return min(model_window, override)
 
 
+def resolve_max_output_tokens() -> int:
+    """Resolve the live request ceiling from Claude Code's compatible override.
+
+    Invalid and non-positive values fall back to minicc's 16K default.  Provider
+    and model-specific hard caps remain the API's responsibility.
+    """
+    raw = os.getenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "")
+    try:
+        override = int(raw)
+    except ValueError:
+        return MAX_OUTPUT_TOKENS
+    return override if override > 0 else MAX_OUTPUT_TOKENS
+
+
 def effective_budget(
-    model: str, max_output_tokens: int = MAX_OUTPUT_TOKENS
+    model: str,
+    max_output_tokens: int | None = None,
 ) -> int:
-    """Auto-compaction threshold after output reserve, buffer, and overrides."""
+    """Return the proactive compaction threshold for ``model``.
+
+    The threshold reserves the same output ceiling sent to the API, then leaves
+    an additional 13K safety buffer.  Claude Code-compatible window and
+    percentage environment overrides are read on every call.
+    """
     capacity = _compaction_capacity(model)
+    output_reserve = (
+        resolve_max_output_tokens()
+        if max_output_tokens is None
+        else max(0, max_output_tokens)
+    )
     default_budget = max(
         0,
-        capacity - max_output_tokens - COMPACT_BUFFER_TOKENS,
+        capacity - output_reserve - COMPACT_BUFFER_TOKENS,
     )
     raw_pct = os.getenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
     try:

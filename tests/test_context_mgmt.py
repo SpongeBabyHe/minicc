@@ -24,7 +24,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 import pytest
 
 from minicc import context_management as compact, llm
-from minicc.context_management import budget, eviction, summary
+from minicc.context_management import budget, eviction, manager, summary
 
 
 # ─── fakes ──────────────────────────────────────────────────────────────────
@@ -196,6 +196,9 @@ def test_summarize_preserves_prefix_settings_and_appends_instruction(monkeypatch
     assert sent[-1]["role"] == "user"
     assert "## Current Work" in sent[-1]["content"][-1]["text"]  # _COMPACT_PROMPT body
     assert "Do not call tools" in sent[-1]["content"][-1]["text"]
+    assert "security-relevant instruction" in sent[-1]["content"][-1]["text"]
+    assert "real role is user" in sent[-1]["content"][-1]["text"]
+    assert '"Human:"' in sent[-1]["content"][-1]["text"]
 
 
 def test_compact_summarizes_only_the_replaced_prefix(monkeypatch):
@@ -657,6 +660,8 @@ def test_recovery_eviction_can_use_explicit_lossy_fallback(monkeypatch):
 def test_effective_budget_reserves_output_and_buffer(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", raising=False)
     b = compact.COMPACT_BUFFER_TOKENS
     out = compact.MAX_OUTPUT_TOKENS
     assert compact.effective_budget("claude-haiku-4-5") == 200_000 - out - b
@@ -665,7 +670,46 @@ def test_effective_budget_reserves_output_and_buffer(monkeypatch):
     assert compact.effective_budget("who-knows") == budget._DEFAULT_WINDOW - out - b
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-sonnet-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+    ],
+)
+def test_current_long_context_models_use_one_million_window(monkeypatch, model):
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+    assert compact.effective_budget(model) == (
+        1_000_000
+        - compact.MAX_OUTPUT_TOKENS
+        - compact.COMPACT_BUFFER_TOKENS
+    )
+
+
+def test_unknown_model_honors_context_window_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "500000")
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+
+    assert compact.effective_budget("custom-provider-model") == (
+        500_000
+        - compact.MAX_OUTPUT_TOKENS
+        - compact.COMPACT_BUFFER_TOKENS
+    )
+    assert budget._model_window("claude-haiku-4-5") == 200_000
+
+
 def test_effective_budget_honors_cc_window_and_percentage_overrides(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "500000")
     assert compact.effective_budget("claude-sonnet-4-6") == (
         500_000 - compact.MAX_OUTPUT_TOKENS - compact.COMPACT_BUFFER_TOKENS
@@ -688,18 +732,80 @@ def test_effective_budget_honors_cc_window_and_percentage_overrides(monkeypatch)
     )
 
 
+def test_max_output_override_drives_request_and_compaction_budget(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000")
+
+    assert compact.resolve_max_output_tokens() == 32_000
+    assert compact.effective_budget("claude-haiku-4-5") == (
+        200_000 - 32_000 - compact.COMPACT_BUFFER_TOKENS
+    )
+    params = llm._build_request_params(
+        [user("hi")],
+        model="claude-haiku-4-5",
+        system=None,
+        tools=None,
+    )
+    assert params["max_tokens"] == 32_000
+
+
+@pytest.mark.parametrize("value", ["", "zero", "0", "-1"])
+def test_invalid_max_output_override_uses_default(monkeypatch, value):
+    monkeypatch.setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", value)
+    assert compact.resolve_max_output_tokens() == compact.MAX_OUTPUT_TOKENS
+
+
+def test_cold_context_size_includes_system_and_tool_prefix(monkeypatch):
+    """A first request must see a large prefix before any real usage exists."""
+    huge_tools = [
+        {
+            "name": "large_schema",
+            "description": "T" * 20_000,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    calls = {"compact": 0}
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 1_000)
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda *args, **kwargs: calls.update(
+            compact=calls["compact"] + 1
+        )
+        or False,
+    )
+
+    manager.prepare_for_request(
+        compact.ContextState(),
+        [user("tiny")],
+        model="claude-haiku-4-5",
+        tools=huge_tools,
+        runtime=llm.summary_runtime(),
+    )
+
+    assert compact.estimate_tokens([user("tiny")]) < 1_000
+    assert calls["compact"] == 1
+
+
 def test_over_budget_compacts_and_skips_eviction(monkeypatch):
     """Upper band: over the compaction budget → L4 compacts directly, and L3
     eviction is deliberately skipped that turn so the summary call reads a warm
     cache (no in-place rewrite right before compaction)."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 1)   # everything over
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 1)
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
     calls = {"compact": 0, "evict": 0}
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: calls.update(compact=calls["compact"] + 1) or True)
     monkeypatch.setattr(
-        compact,
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: calls.update(
+            compact=calls["compact"] + 1
+        ) or True,
+    )
+    monkeypatch.setattr(
+        eviction,
         "evict_old_tool_results",
-        lambda m, min_savings_tokens=0: calls.update(
+        lambda messages, **kwargs: calls.update(
             evict=calls["evict"] + 1
         ) or 0,
     )
@@ -709,29 +815,30 @@ def test_over_budget_compacts_and_skips_eviction(monkeypatch):
     assert calls["evict"] == 0
 
 
-def test_midband_evicts_with_minimum_savings_guard(monkeypatch):
-    """Lower band: trigger < size <= budget runs guarded L3, not L4."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 200_000)
-
+def test_midband_runs_eviction_not_compaction(monkeypatch):
+    """Lower band: trigger < size <= budget delegates to L3, not L4."""
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 200_000)
     monkeypatch.setattr(
-        compact,
+        eviction,
         "TOOL_RESULT_EVICTION_TRIGGER_TOKENS",
         100_000,
     )
-    monkeypatch.setattr(
-        compact,
-        "TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS",
-        20_000,
-    )
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
-    calls = {"compact": 0, "evict": 0, "min_savings_tokens": None}
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: calls.update(compact=calls["compact"] + 1) or True)
+    calls = {"compact": 0, "evict": 0, "kwargs": None}
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: calls.update(
+            compact=calls["compact"] + 1
+        ) or True,
+    )
 
-    def fake_evict(m, min_savings_tokens=0):
+    def fake_evict(messages, **kwargs):
         calls["evict"] += 1
-        calls["min_savings_tokens"] = min_savings_tokens
+        calls["kwargs"] = kwargs
         return 3
-    monkeypatch.setattr(compact, "evict_old_tool_results", fake_evict)
+
+    monkeypatch.setattr(eviction, "evict_old_tool_results", fake_evict)
 
     msgs = [user("hello")]
     state = compact.ContextState(
@@ -741,25 +848,31 @@ def test_midband_evicts_with_minimum_savings_guard(monkeypatch):
     llm.llm_response(msgs, stream=False, ctx=state)
     assert calls["compact"] == 0           # under budget → no compaction
     assert calls["evict"] == 1             # but over local trigger → evict
-    assert calls["min_savings_tokens"] == 20_000
+    assert calls["kwargs"] == {}            # eviction owns its normal guard
 
 
 def test_below_clear_trigger_does_not_evict(monkeypatch):
     """Below the local trigger neither L3 nor L4 fires."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 200_000)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 200_000)
 
     monkeypatch.setattr(
-        compact,
+        eviction,
         "TOOL_RESULT_EVICTION_TRIGGER_TOKENS",
         100_000,
     )
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
     calls = {"compact": 0, "evict": 0}
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: calls.update(compact=calls["compact"] + 1) or True)
     monkeypatch.setattr(
-        compact,
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: calls.update(
+            compact=calls["compact"] + 1
+        ) or True,
+    )
+    monkeypatch.setattr(
+        eviction,
         "evict_old_tool_results",
-        lambda m, min_savings_tokens=0: calls.update(
+        lambda messages, **kwargs: calls.update(
             evict=calls["evict"] + 1
         ) or 0,
     )
@@ -792,24 +905,47 @@ def test_evict_skips_when_below_minimum_savings(monkeypatch):
     assert evicted.count == 4
 
 
+def test_eviction_default_guard_is_resolved_at_call_time(monkeypatch):
+    """Policy overrides affect later calls instead of freezing at definition."""
+    monkeypatch.setattr(eviction, "TOOL_RESULT_EVICTION_KEEP_RECENT", 2)
+    msgs = _turn_with_big_results(6)
+    monkeypatch.setattr(
+        eviction,
+        "TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS",
+        100_000,
+    )
+    assert not compact.evict_old_tool_results(msgs)
+
+    monkeypatch.setattr(
+        eviction,
+        "TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS",
+        1,
+    )
+    assert compact.evict_old_tool_results(msgs).count == 4
+
+
 # ─── L5: thrashing guard ─────────────────────────────────────────────────────
 def test_thrash_guard_raises(monkeypatch):
     """When compaction can't get under budget, llm_response must raise after
     MAX_COMPACT_ATTEMPTS instead of looping forever."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 1)   # everything over
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: False)      # reduction impossible
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 1)
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: False,
+    )
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
 
     msgs = [user("x" * 100)]
     st = compact.ContextState()               # the conversation's persistent state
     with pytest.raises(RuntimeError, match="thrashing"):
-        for _ in range(compact.MAX_COMPACT_ATTEMPTS + 1):
+        for _ in range(manager.MAX_COMPACT_ATTEMPTS + 1):
             llm.llm_response(msgs, stream=False, ctx=st)
 
 
 def test_no_thrash_when_under_budget(monkeypatch):
     """Under budget → no compaction, counter stays 0, no raise."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     monkeypatch.setattr(llm.client.messages, "create", fake_create)
     msgs = [user("hi")]
     st = compact.ContextState()
@@ -827,7 +963,7 @@ class _Fake413(llm.APIStatusError):
 
 def test_reactive_compact_on_413(monkeypatch):
     """A 413 forces one compaction and retries the send once."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)  # no pre-compact
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     calls = {"send": 0, "compact": 0, "recovery": None}
 
     def flaky_send(params, stream):
@@ -843,7 +979,7 @@ def test_reactive_compact_on_413(monkeypatch):
         calls["recovery"] = kwargs.get("recovery")
         return True
 
-    monkeypatch.setattr(compact, "compact", fake_compact)
+    monkeypatch.setattr(manager, "compact", fake_compact)
 
     resp = llm.llm_response([user("hi")], stream=False)
     assert resp is not None
@@ -859,11 +995,28 @@ class _Fake400(llm.APIStatusError):
         self.message = message
 
 
+def test_context_rejection_classification_is_protocol_only():
+    assert (
+        llm._classify_context_rejection(_Fake413())
+        is compact.RecoveryKind.BYTES
+    )
+    assert (
+        llm._classify_context_rejection(
+            _Fake400("prompt is too long: context window exceeded")
+        )
+        is compact.RecoveryKind.TOKENS
+    )
+    assert (
+        llm._classify_context_rejection(_Fake400("tool name is too long"))
+        is None
+    )
+
+
 def test_reactive_compact_on_400_prompt_too_long(monkeypatch):
     """Token overflow (input alone > context window) is a 400 'prompt is too
     long', NOT a 413 (413 is the 32MB byte limit). The reactive path must catch
     it and compact."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)  # no pre-compact
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     calls = {"send": 0, "compact": 0, "recovery": None}
 
     def flaky_send(params, stream):
@@ -879,7 +1032,7 @@ def test_reactive_compact_on_400_prompt_too_long(monkeypatch):
         calls["recovery"] = kwargs.get("recovery")
         return True
 
-    monkeypatch.setattr(compact, "compact", fake_compact)
+    monkeypatch.setattr(manager, "compact", fake_compact)
 
     resp = llm.llm_response([user("hi")], stream=False)
     assert resp is not None
@@ -893,7 +1046,7 @@ def test_reactive_400_detects_prompt_too_long_in_error_body(monkeypatch):
             self.status_code = 400
             self.body = {"error": {"message": "prompt is too long"}}
 
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     sends = {"n": 0}
 
     def send(params, stream):
@@ -903,14 +1056,18 @@ def test_reactive_400_detects_prompt_too_long_in_error_body(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(llm, "_send_request", send)
-    monkeypatch.setattr(compact, "compact", lambda *args, **kwargs: True)
+    monkeypatch.setattr(manager, "compact", lambda *args, **kwargs: True)
     assert llm.llm_response([user("hi")], stream=False) is not None
     assert sends["n"] == 2
 
 
 def test_reactive_413_summary_does_not_resend_oversized_history(monkeypatch):
     """The recovery summary sends only a bounded prefix, not the rejected body."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model, **kwargs: 10_000_000)
+    monkeypatch.setattr(
+        budget,
+        "effective_budget",
+        lambda model, **kwargs: 10_000_000,
+    )
     fixed_summary_bytes = summary._summary_request_footprint(
         [],
         focus=None,
@@ -925,11 +1082,15 @@ def test_reactive_413_summary_does_not_resend_oversized_history(monkeypatch):
         summary_budget,
     )
     monkeypatch.setattr(
-        compact,
+        eviction,
         "evict_old_tool_results",
         lambda messages, **kwargs: 0,
     )
-    monkeypatch.setattr(compact, "recovery_needed", lambda *args: False)
+    monkeypatch.setattr(
+        summary,
+        "recovery_needed",
+        lambda *args, **kwargs: False,
+    )
     summary_request_sizes = []
     original_size = {"value": 0}
 
@@ -969,10 +1130,20 @@ def test_reactive_413_summary_does_not_resend_oversized_history(monkeypatch):
 
 
 def test_reactive_repeats_bounded_compaction_before_live_retry(monkeypatch):
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
-    monkeypatch.setattr(summary, "_SUMMARY_REQUEST_BYTE_BUDGET", 180)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
+    fixed_live_bytes = summary.live_request_footprint(
+        [user("")],
+        model=llm.MODEL,
+        runtime=llm.summary_runtime(),
+    )[1]
+    live_budget = fixed_live_bytes + 300
     monkeypatch.setattr(
-        compact,
+        summary,
+        "_SUMMARY_REQUEST_BYTE_BUDGET",
+        live_budget,
+    )
+    monkeypatch.setattr(
+        eviction,
         "evict_old_tool_results",
         lambda messages, **kwargs: 0,
     )
@@ -984,14 +1155,14 @@ def test_reactive_repeats_bounded_compaction_before_live_retry(monkeypatch):
         ctx.rebase(messages)
         return True
 
-    monkeypatch.setattr(compact, "compact", shrink)
+    monkeypatch.setattr(manager, "compact", shrink)
     sends = {"n": 0}
 
     def send(params, stream):
         sends["n"] += 1
         if sends["n"] == 1:
             raise _Fake413()
-        assert budget._serialized_size(params["messages"]) <= 300
+        assert budget._serialized_size(params) <= live_budget
         return FakeResponse()
 
     monkeypatch.setattr(llm, "_send_request", send)
@@ -1000,16 +1171,78 @@ def test_reactive_repeats_bounded_compaction_before_live_retry(monkeypatch):
     assert sends["n"] == 2
 
 
+def test_recovery_guard_counts_irreducible_tool_schema_bytes(monkeypatch):
+    """Do not retry a 413 while a giant unchanged tools prefix is still unsafe."""
+    normal_bytes = summary.live_request_footprint(
+        [user("tiny")],
+        model=llm.MODEL,
+        runtime=llm.summary_runtime(),
+    )[1]
+    monkeypatch.setattr(
+        summary,
+        "_SUMMARY_REQUEST_BYTE_BUDGET",
+        normal_bytes + 500,
+    )
+    monkeypatch.setattr(
+        eviction,
+        "evict_old_tool_results",
+        lambda messages, **kwargs: 0,
+    )
+    compact_calls = {"n": 0}
+
+    def shrink_once(ctx, messages, **kwargs):
+        compact_calls["n"] += 1
+        if compact_calls["n"] > 1:
+            return False
+        messages[:] = [user("small")]
+        return True
+
+    monkeypatch.setattr(manager, "compact", shrink_once)
+    sends = {"n": 0}
+    rejection = _Fake413()
+
+    def reject(params, stream):
+        sends["n"] += 1
+        raise rejection
+
+    monkeypatch.setattr(llm, "_send_request", reject)
+    huge_tools = [
+        {
+            "name": "huge",
+            "description": "S" * 20_000,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+
+    with pytest.raises(llm.APIStatusError) as caught:
+        llm.llm_response(
+            [user("old"), {"role": "assistant", "content": "answer"}],
+            stream=False,
+            tools=huge_tools,
+        )
+
+    assert caught.value is rejection
+    assert compact_calls["n"] == 2
+    assert sends["n"] == 1
+
+
 def test_reactive_skips_generic_400(monkeypatch):
-    """A 400 that is NOT token overflow (e.g. a validation error) must propagate,
-    not trigger a destructive compaction."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    """An unrelated "too long" validation error must not destroy context."""
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     compacted = {"n": 0}
     monkeypatch.setattr(
         llm, "_send_request",
-        lambda p, s: (_ for _ in ()).throw(_Fake400("thinking blocks cannot be modified")),
+        lambda params, stream: (_ for _ in ()).throw(
+            _Fake400("tool name is too long")
+        ),
     )
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: compacted.update(n=compacted["n"] + 1) or True)
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: compacted.update(
+            n=compacted["n"] + 1
+        ) or True,
+    )
     with pytest.raises(llm.APIStatusError):
         llm.llm_response([user("hi")], stream=False)
     assert compacted["n"] == 0   # never compacted for a non-overflow 400
@@ -1017,11 +1250,21 @@ def test_reactive_skips_generic_400(monkeypatch):
 
 def test_reactive_compact_gives_up_when_uncompactable(monkeypatch):
     """If compaction can't reduce (returns False), the 413 propagates."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
-    monkeypatch.setattr(llm, "_send_request", lambda params, stream: (_ for _ in ()).throw(_Fake413()))
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: False)
-    with pytest.raises(llm.APIStatusError):
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
+    rejection = _Fake413()
+    monkeypatch.setattr(
+        llm,
+        "_send_request",
+        lambda params, stream: (_ for _ in ()).throw(rejection),
+    )
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: False,
+    )
+    with pytest.raises(llm.APIStatusError) as caught:
         llm.llm_response([user("hi")], stream=False)
+    assert caught.value is rejection
 
 
 def test_non_413_status_error_propagates(monkeypatch):
@@ -1030,10 +1273,16 @@ def test_non_413_status_error_propagates(monkeypatch):
         def __init__(self):
             self.status_code = 500
 
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: (_ for _ in ()).throw(_Fake500()))
     compacted = {"n": 0}
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: compacted.update(n=compacted["n"] + 1) or True)
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: compacted.update(
+            n=compacted["n"] + 1
+        ) or True,
+    )
     with pytest.raises(llm.APIStatusError):
         llm.llm_response([user("hi")], stream=False)
 
@@ -1048,13 +1297,23 @@ class _Fake429(llm.APIStatusError):
 @pytest.mark.parametrize("estimated_tokens", [500, 200_000])
 def test_429_reraises_without_compaction(monkeypatch, estimated_tokens):
     """429 has several causes; large and small requests both preserve history."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)  # no pre-compact
-    monkeypatch.setattr(compact, "estimate_tokens", lambda m: estimated_tokens)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: (_ for _ in ()).throw(_Fake429()))
     compacted = {"n": 0}
-    monkeypatch.setattr(compact, "compact", lambda c, m, **kw: compacted.update(n=compacted["n"] + 1) or True)
+    monkeypatch.setattr(
+        manager,
+        "compact",
+        lambda state, messages, **kwargs: compacted.update(
+            n=compacted["n"] + 1
+        ) or True,
+    )
+    msgs = [user("hi")]
+    state = compact.ContextState(
+        last_input_tokens=estimated_tokens,
+        last_message_tokens=compact.estimate_tokens(msgs),
+    )
     with pytest.raises(llm.APIStatusError):
-        llm.llm_response([user("hi")], stream=False)
+        llm.llm_response(msgs, stream=False, ctx=state)
     assert compacted["n"] == 0
 
 
@@ -1108,8 +1367,11 @@ def test_thinking_param_by_model():
     from minicc.llm import _thinking_param
 
     assert _thinking_param("claude-sonnet-4-6") == {"type": "adaptive"}
+    assert _thinking_param("claude-sonnet-5") == {"type": "adaptive"}
     assert _thinking_param("claude-opus-4-8") == {"type": "adaptive"}
+    assert _thinking_param("claude-opus-5") == {"type": "adaptive"}
     assert _thinking_param("claude-fable-5") == {"type": "adaptive"}
+    assert _thinking_param("claude-mythos-5") == {"type": "adaptive"}
     assert _thinking_param("claude-haiku-4-5") is None  # pre-adaptive: omit entirely
 
 
@@ -1170,7 +1432,7 @@ def test_nested_call_does_not_poison_parent_trigger(monkeypatch):
     )
 
     # the parent's own turn updates only the parent's state
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     llm.llm_response([user("parent turn")], stream=False, ctx=parent)
     assert parent.last_input_tokens == 10          # FakeUsage.input_tokens
     assert parent.last_message_tokens == compact.estimate_tokens(
@@ -1189,6 +1451,48 @@ def test_context_size_adds_new_message_growth_to_real_usage():
         100 + compact.estimate_tokens(grown) - baseline_estimate
     )
     assert state.context_size(grown) > 100
+
+
+def test_context_size_tracks_prefix_changes_with_full_request_estimates():
+    messages = [user("same history")]
+    message_tokens = compact.estimate_tokens(messages)
+    old_request_tokens = message_tokens + 500
+    new_request_tokens = message_tokens + 5_000
+    state = compact.ContextState()
+    state.record_input(
+        1_000,
+        message_tokens,
+        old_request_tokens,
+    )
+
+    assert state.context_size(
+        messages,
+        request_tokens=new_request_tokens,
+    ) == 1_000 + new_request_tokens - old_request_tokens
+
+
+def test_context_size_discards_real_baseline_after_model_switch():
+    messages = [user("same history")]
+    message_tokens = compact.estimate_tokens(messages)
+    request_tokens = message_tokens + 5_000
+    state = compact.ContextState()
+    state.record_input(
+        1_000,
+        message_tokens,
+        request_tokens,
+        model="claude-sonnet-4-6",
+    )
+
+    assert state.context_size(
+        messages,
+        request_tokens=request_tokens,
+        model="claude-sonnet-4-6",
+    ) == 1_000
+    assert state.context_size(
+        messages,
+        request_tokens=request_tokens,
+        model="claude-sonnet-5",
+    ) == request_tokens
 
 
 # ─── L4: worth is decided after the summary, not by a magic floor ────────────
@@ -1292,16 +1596,76 @@ def test_compact_rebases_context_size_after_shrink(monkeypatch):
     assert ctx.context_size(msgs) < before
 
 
+def test_compaction_persistence_failure_leaves_live_state_untouched(monkeypatch):
+    monkeypatch.setattr(summary, "_summarize", lambda *args, **kwargs: "SUMMARY")
+    monkeypatch.setattr(
+        manager.sessions,
+        "log_compaction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("read only")
+        ),
+    )
+    msgs = single_turn(4)
+    before = list(msgs)
+    ctx = compact.ContextState()
+
+    with pytest.raises(OSError, match="read only"):
+        compact.compact(
+            ctx,
+            msgs,
+            session_id="s1",
+            runtime=llm.summary_runtime(),
+        )
+
+    assert msgs == before
+    assert ctx.compactions == 0
+    assert ctx.last_message_tokens is None
+    assert ctx.last_request_tokens is None
+    assert ctx.last_model is None
+
+
+def test_postcompact_stop_keeps_rebased_compacted_state(monkeypatch):
+    monkeypatch.setattr(summary, "_summarize", lambda *args, **kwargs: "SUMMARY")
+
+    def hook(event, **kwargs):
+        if event == "PostCompact":
+            return manager.hooks.Decision(
+                stop=True,
+                stop_reason="halt after compact",
+            )
+        return manager.hooks.Decision()
+
+    monkeypatch.setattr(manager.hooks, "run", hook)
+    msgs = single_turn(4)
+    ctx = compact.ContextState()
+
+    with pytest.raises(manager.hooks.HookStop, match="halt after compact"):
+        compact.compact(
+            ctx,
+            msgs,
+            runtime=llm.summary_runtime(),
+        )
+
+    assert ctx.compactions == 1
+    assert ctx.last_message_tokens == compact.estimate_tokens(msgs)
+    assert ctx.last_request_tokens is not None
+    assert ctx.last_model == llm.MODEL
+    assert ctx.context_size(
+        msgs,
+        request_tokens=ctx.last_request_tokens,
+    ) == ctx.last_input_tokens
+
+
 def test_standing_precompact_veto_does_not_thrash(monkeypatch):
     """Audit P2: a PreCompact hook that vetoes every turn must NOT count toward
     the thrash guard — a veto is the user's choice (proceed uncompacted), not a
     failed compaction. So >MAX_COMPACT_ATTEMPTS vetoed turns must not raise."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 1)   # always over budget
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 1)
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: FakeResponse())
-    monkeypatch.setattr(compact, "compact", lambda *a, **k: None)        # vetoed every turn
+    monkeypatch.setattr(manager, "compact", lambda *a, **k: None)
 
     ctx = compact.ContextState()
-    for _ in range(compact.MAX_COMPACT_ATTEMPTS + 3):   # well past the limit
+    for _ in range(manager.MAX_COMPACT_ATTEMPTS + 3):
         llm.llm_response([user("x" * 100)], stream=False, ctx=ctx)
     assert ctx.compact_attempts == 0                    # never counted a veto
 
@@ -1310,13 +1674,13 @@ def test_failed_compaction_still_thrashes(monkeypatch):
     """Complement: a compaction that ran but couldn't reduce (returns False, not
     None) DOES count — so a genuinely un-compactable history still trips the
     guard after MAX_COMPACT_ATTEMPTS."""
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 1)
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 1)
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: FakeResponse())
-    monkeypatch.setattr(compact, "compact", lambda *a, **k: False)       # attempted, no reduction
+    monkeypatch.setattr(manager, "compact", lambda *a, **k: False)
 
     ctx = compact.ContextState()
     with pytest.raises(RuntimeError, match="thrashing"):
-        for _ in range(compact.MAX_COMPACT_ATTEMPTS + 1):
+        for _ in range(manager.MAX_COMPACT_ATTEMPTS + 1):
             llm.llm_response([user("x" * 100)], stream=False, ctx=ctx)
 
 

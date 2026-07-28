@@ -258,7 +258,7 @@ def _cmd_context(messages, ctx):
         )
     )
     ux.say(
-        "(last API total + estimated message delta; cold/reset reads are history-only)",
+        "(last API total + estimated full-request delta; cold reads include system/tools)",
         style=ux.S_INFO,
     )
 

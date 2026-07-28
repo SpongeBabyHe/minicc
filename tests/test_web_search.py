@@ -86,8 +86,9 @@ def test_llm_response_counts_web_searches(monkeypatch):
         stop_reason = "end_turn"
 
     monkeypatch.setattr(llm, "_send_request", lambda params, stream: _Resp())
-    from minicc import context_management as compact
-    monkeypatch.setattr(compact, "effective_budget", lambda model: 10_000_000)
+    from minicc.context_management import budget
+
+    monkeypatch.setattr(budget, "effective_budget", lambda model: 10_000_000)
     before = llm.get_usage()["web_searches"]
     llm.llm_response([{"role": "user", "content": "hi"}], stream=False)
     assert llm.get_usage()["web_searches"] == before + 3

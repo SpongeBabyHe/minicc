@@ -1,4 +1,10 @@
-"""Local tool-result eviction: plan first, then persist and apply atomically."""
+"""Savings-guarded local eviction of old, re-fetchable tool results.
+
+Planning is pure and every target is revalidated before mutation.  Persistent
+sessions spill original outputs and append a replay delta before changing the
+working set.  A failed apply leaves messages untouched, although spill files
+created before a later transcript failure may remain as harmless orphans.
+"""
 
 import re
 from copy import deepcopy
@@ -40,7 +46,7 @@ COMPACTABLE_TOOL_NAMES = frozenset(
 
 @dataclass(frozen=True)
 class ToolResultEdit:
-    """One planned or applied tool-result content replacement."""
+    """Immutable snapshot of one planned or applied content replacement."""
 
     message_index: int
     block_index: int
@@ -52,7 +58,7 @@ class ToolResultEdit:
 
 @dataclass(frozen=True)
 class EvictionPlan:
-    """A cache-breaking edit plan, computed before any message mutation."""
+    """Pure cache-breaking edit plan computed before persistence or mutation."""
 
     edits: tuple[ToolResultEdit, ...] = ()
     estimated_tokens_saved: int = 0
@@ -70,7 +76,7 @@ class EvictionPlan:
 
 @dataclass(frozen=True)
 class EvictionResult:
-    """Applied edits plus telemetry needed by the caller and transcript."""
+    """Successfully applied edits and cache-impact telemetry."""
 
     edits: tuple[ToolResultEdit, ...] = ()
     estimated_tokens_saved: int = 0
@@ -96,6 +102,7 @@ class EvictionResult:
 
 
 def _block_attr(block, name: str):
+    """Read one content-block field from either dict or SDK object form."""
     if isinstance(block, dict):
         return block.get(name)
     return getattr(block, name, None)
@@ -122,6 +129,7 @@ def _planned_replacement(
     tool_use_id: str,
     content,
 ) -> str:
+    """Return the marker shape used to estimate one candidate's net savings."""
     if not session_id:
         return EVICTED_MARKER
     output_path = sessions.tool_result_output_path(
@@ -134,11 +142,16 @@ def _planned_replacement(
 
 def plan_tool_result_eviction(
     messages,
-    min_savings_tokens: int = TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS,
+    min_savings_tokens: int | None = None,
     keep_recent: int | None = None,
     session_id: str | None = None,
 ) -> EvictionPlan:
-    """Plan eligible old-result edits without mutating messages or writing files."""
+    """Build a mutation-free eviction plan for eligible old results.
+
+    Results from stateful or non-re-fetchable tools are excluded.  The newest
+    ``keep_recent`` eligible results remain intact, and the aggregate *net*
+    saving must meet ``min_savings_tokens``.
+    """
     tool_names: dict[str, str] = {}
     for message in messages:
         content = message.get("content")
@@ -189,7 +202,11 @@ def plan_tool_result_eviction(
 
     edits = []
     net_bytes_saved = 0
-    minimum_savings = max(0, min_savings_tokens)
+    minimum_savings = (
+        TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS
+        if min_savings_tokens is None
+        else max(0, min_savings_tokens)
+    )
     for (
         message_index,
         block_index,
@@ -242,11 +259,13 @@ def apply_tool_result_eviction(
     session_id: str | None = None,
     allow_lossy_fallback: bool = False,
 ) -> EvictionResult:
-    """Apply one fresh plan transactionally.
+    """Validate, persist, and apply one fresh plan without partial mutation.
 
     Main-session outputs are spilled and the replay delta is logged before any
     message is changed. Normal eviction aborts if persistence fails; structural
     400/413 recovery may explicitly allow the lossy CC marker as a fallback.
+    Spill files can outlive an aborted transcript write, but the working set
+    remains unchanged.
     """
     if not plan:
         return EvictionResult()
@@ -335,12 +354,12 @@ def apply_tool_result_eviction(
 
 def evict_old_tool_results(
     messages,
-    min_savings_tokens: int = TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS,
+    min_savings_tokens: int | None = None,
     keep_recent: int | None = None,
     session_id: str | None = None,
     allow_lossy_fallback: bool = False,
 ) -> EvictionResult:
-    """Clear eligible old results when aggregate savings justify a cache edit."""
+    """Plan and apply one guarded batch of old tool-result replacements."""
     plan = plan_tool_result_eviction(
         messages,
         min_savings_tokens=min_savings_tokens,

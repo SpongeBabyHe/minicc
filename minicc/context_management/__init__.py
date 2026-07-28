@@ -5,7 +5,9 @@ from .budget import (
     MAX_OUTPUT_TOKENS,
     ContextState,
     effective_budget,
+    estimate_request_input_tokens,
     estimate_tokens,
+    resolve_max_output_tokens,
 )
 from .eviction import (
     COMPACTABLE_TOOL_NAMES,
@@ -23,9 +25,12 @@ from .eviction import (
 from .manager import (
     MAX_COMPACT_ATTEMPTS,
     MAX_RECOVERY_COMPACTIONS,
+    RecoveryKind,
     compact,
     context_usage,
+    prepare_for_request,
     recap,
+    recover_rejected_context,
 )
 from .summary import SummaryRuntime, recovery_needed
 
@@ -37,6 +42,7 @@ __all__ = [
     "MAX_COMPACT_ATTEMPTS",
     "MAX_OUTPUT_TOKENS",
     "MAX_RECOVERY_COMPACTIONS",
+    "RecoveryKind",
     "TOOL_RESULT_EVICTION_KEEP_RECENT",
     "TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS",
     "TOOL_RESULT_EVICTION_TRIGGER_TOKENS",
@@ -49,9 +55,13 @@ __all__ = [
     "compact",
     "context_usage",
     "effective_budget",
+    "estimate_request_input_tokens",
     "estimate_tokens",
     "evict_old_tool_results",
     "plan_tool_result_eviction",
+    "prepare_for_request",
     "recap",
+    "recover_rejected_context",
     "recovery_needed",
+    "resolve_max_output_tokens",
 ]
