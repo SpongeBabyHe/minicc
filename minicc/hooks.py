@@ -33,17 +33,21 @@ I/O contract:
   prompt, trigger, custom_instructions, compact_summary, source).
 - Output: exit 0 → parse JSON stdout for decision control; plain stdout becomes
   context for SessionStart/UserPromptSubmit and is ignored for other events.
-  Exit 2 → block, stderr is the reason fed to the model; any other non-zero →
-  non-blocking, stderr's first line shown to the user.
+  Exit 2 is event-specific: blockable events stop with stderr as feedback;
+  SessionStart/SessionEnd/PostCompact continue and show stderr to the user.
+  Any other non-zero is non-blocking and surfaces stderr's first line.
 - JSON stdout honored: continue, stopReason, systemMessage, decision ("block"),
   reason, hookSpecificOutput.{permissionDecision (allow|deny|ask),
   permissionDecisionReason, additionalContext, updatedInput, updatedToolOutput}.
+  Output strings above 10,000 characters are spilled under
+  .minicc/hook_outputs/ and replaced by a bounded preview plus path.
 
 The module is mechanism-only: `run` returns a normalized Decision; each CALL SITE
 interprets `block` per its event. `continue:false` is universal and takes precedence
 over event-specific decisions.
 """
 
+import hashlib
 import json
 import re
 import subprocess
@@ -53,6 +57,17 @@ from pathlib import Path
 from minicc import config, sessions, ux
 
 _TIMEOUT_DEFAULT = 60  # seconds; a hook entry's "timeout" (seconds) overrides
+_OUTPUT_CHAR_LIMIT = 10_000
+_EXIT_2_USER_ONLY_EVENTS = frozenset(
+    {
+        "Notification",
+        "PostCompact",
+        "SessionEnd",
+        "SessionStart",
+        "Setup",
+        "SubagentStart",
+    }
+)
 
 # Merged config is read once and cached — settings don't change mid-session (minicc
 # has no config watcher, unlike CC's ConfigChange event; YAGNI). reset() reloads it,
@@ -67,6 +82,7 @@ def reset() -> None:
 
 
 def _load() -> tuple[dict, bool]:
+    """Return cached merged hook settings, loading them on first use."""
     global _CACHE
     if _CACHE is None:
         _CACHE = config.load_hooks()
@@ -159,6 +175,7 @@ def _match(matcher, value: str) -> bool:
 
 
 def _common(event: str, session_id: str | None) -> dict:
+    """Build the fields present in every command-hook stdin payload."""
     tp = sessions.path(session_id)
     return {
         "session_id": session_id or "",
@@ -167,6 +184,45 @@ def _common(event: str, session_id: str | None) -> dict:
         "permission_mode": "default",
         "hook_event_name": event,
     }
+
+
+def _bounded_output(
+    value,
+    *,
+    event: str,
+    session_id: str | None,
+) -> str:
+    """Cap one hook-output string and spill its complete value when oversized."""
+    text = str(value)
+    if len(text) <= _OUTPUT_CHAR_LIMIT:
+        return text
+
+    safe_event = (
+        re.sub(r"[^A-Za-z0-9_.-]+", "_", event)[:48]
+        or "hook"
+    )
+    safe_session = (
+        re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id or "")[:48]
+        or "no-session"
+    )
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    try:
+        output_dir = config.ensure_project_dir("hook_outputs") / safe_session
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{safe_event}-{digest}.txt"
+        output_path.write_text(text, encoding="utf-8")
+        suffix = (
+            f"\n...[+{len(text):,} total chars; hook output capped at "
+            f"{_OUTPUT_CHAR_LIMIT:,}]\n"
+            f"Full hook output saved to: {output_path}"
+        )
+    except OSError:
+        suffix = (
+            f"\n...[+{len(text):,} total chars; hook output capped at "
+            f"{_OUTPUT_CHAR_LIMIT:,}; full output could not be saved]"
+        )
+    preview_chars = max(0, _OUTPUT_CHAR_LIMIT - len(suffix))
+    return text[:preview_chars] + suffix
 
 
 def run(
@@ -198,6 +254,7 @@ def run(
 def _run_one(
     entry: dict, stdin_obj: dict, decision: Decision, event: str
 ) -> None:
+    """Execute one configured command hook and merge its normalized outcome."""
     cmd = entry.get("command")
     if not cmd:
         return
@@ -219,22 +276,49 @@ def _run_one(
     except OSError as e:
         decision.system_messages.append(f"hook failed to run: {e}")
         return
-    _apply(proc, decision, event)
+    _apply(
+        proc,
+        decision,
+        event,
+        session_id=stdin_obj.get("session_id") or None,
+    )
 
 
-def _apply(proc, decision: Decision, event: str) -> None:
+def _apply(
+    proc,
+    decision: Decision,
+    event: str,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Merge one command result using the event-specific exit-code contract."""
     code = proc.returncode
     if code == 2:
-        # blocking error: stderr is the reason fed back to the model
+        stderr = _bounded_output(
+            proc.stderr.strip(),
+            event=event,
+            session_id=session_id,
+        )
+        if event in _EXIT_2_USER_ONLY_EVENTS:
+            if stderr:
+                decision.system_messages.append(stderr)
+            return
+        # Blocking event: stderr is the reason fed back to the model.
         decision.block = True
-        if proc.stderr.strip():
-            decision.reason = proc.stderr.strip()
+        if stderr:
+            decision.reason = stderr
         return
     if code != 0:
         # non-blocking error: first stderr line surfaced to the user, action continues
         line = next((ln for ln in proc.stderr.splitlines() if ln.strip()), "")
         if line:
-            decision.system_messages.append(line.strip())
+            decision.system_messages.append(
+                _bounded_output(
+                    line.strip(),
+                    event=event,
+                    session_id=session_id,
+                )
+            )
         return
     # exit 0: JSON is the decision-control channel. Two lifecycle/prompt events
     # define plain stdout as context instead.
@@ -245,39 +329,90 @@ def _apply(proc, decision: Decision, event: str) -> None:
         data = json.loads(out)
     except json.JSONDecodeError:
         if event in ("SessionStart", "UserPromptSubmit"):
-            decision.additional_context.append(out)
+            decision.additional_context.append(
+                _bounded_output(
+                    out,
+                    event=event,
+                    session_id=session_id,
+                )
+            )
         return
     if isinstance(data, dict):
-        _apply_json(data, decision)
+        _apply_json(
+            data,
+            decision,
+            event=event,
+            session_id=session_id,
+        )
 
 
-def _apply_json(data: dict, decision: Decision) -> None:
+def _apply_json(
+    data: dict,
+    decision: Decision,
+    *,
+    event: str,
+    session_id: str | None,
+) -> None:
+    """Merge supported structured-output fields into an aggregate decision."""
     if data.get("continue") is False:
         decision.stop = True
-        decision.stop_reason = data.get("stopReason")
+        if data.get("stopReason") is not None:
+            decision.stop_reason = _bounded_output(
+                data["stopReason"],
+                event=event,
+                session_id=session_id,
+            )
     if data.get("systemMessage"):
-        decision.system_messages.append(str(data["systemMessage"]))
+        decision.system_messages.append(
+            _bounded_output(
+                data["systemMessage"],
+                event=event,
+                session_id=session_id,
+            )
+        )
     # generic block (PostToolUse / UserPromptSubmit / Stop)
     if data.get("decision") == "block":
         decision.block = True
         if data.get("reason"):
-            decision.reason = str(data["reason"])
+            decision.reason = _bounded_output(
+                data["reason"],
+                event=event,
+                session_id=session_id,
+            )
 
     hso = data.get("hookSpecificOutput")
     if not isinstance(hso, dict):
         return
     if hso.get("additionalContext"):
-        decision.additional_context.append(str(hso["additionalContext"]))
+        decision.additional_context.append(
+            _bounded_output(
+                hso["additionalContext"],
+                event=event,
+                session_id=session_id,
+            )
+        )
     if isinstance(hso.get("updatedInput"), dict):
         decision.updated_input = hso["updatedInput"]
     uo = hso.get("updatedToolOutput")
     if uo is not None:
-        decision.updated_output = uo.get("text") if isinstance(uo, dict) else str(uo)
+        updated_output = uo.get("text") if isinstance(uo, dict) else uo
+        if updated_output is not None:
+            decision.updated_output = _bounded_output(
+                updated_output,
+                event=event,
+                session_id=session_id,
+            )
     # PreToolUse permission decision (deny wins — never un-block)
     pd = hso.get("permissionDecision")
     if pd == "deny":
         decision.block = True
-        decision.reason = hso.get("permissionDecisionReason") or decision.reason
+        permission_reason = hso.get("permissionDecisionReason")
+        if permission_reason:
+            decision.reason = _bounded_output(
+                permission_reason,
+                event=event,
+                session_id=session_id,
+            )
     elif pd == "ask":
         decision.ask = True
     elif pd == "allow":

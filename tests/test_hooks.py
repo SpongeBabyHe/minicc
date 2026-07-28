@@ -7,6 +7,7 @@ by running real command hooks, so the doc'd behavior and the code can't drift.
 
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
@@ -86,6 +87,45 @@ def test_other_nonzero_is_nonblocking_user_message(monkeypatch):
     d = hooks.run("PreToolUse", match_value="bash", tool_name="bash", tool_input={})
     assert not d.block  # exit 1 must NOT block
     assert d.system_messages == ["hook warning"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["PostCompact", "SessionStart", "SessionEnd"],
+)
+def test_exit_2_is_user_only_for_nonblockable_lifecycle_events(
+    monkeypatch,
+    event,
+):
+    _use(
+        {event: [_group("echo 'lifecycle warning' >&2; exit 2")]},
+        monkeypatch=monkeypatch,
+    )
+
+    decision = hooks.run(event)
+
+    assert not decision.block
+    assert decision.reason is None
+    assert decision.system_messages == ["lifecycle warning"]
+
+
+def test_large_hook_context_is_capped_and_spilled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cmd = f"""{sys.executable} -c "print('X' * 10050)" """
+    _use(
+        {"SessionStart": [_group(cmd)]},
+        monkeypatch=monkeypatch,
+    )
+
+    decision = hooks.run("SessionStart", session_id="s1")
+
+    assert len(decision.additional_context) == 1
+    bounded = decision.additional_context[0]
+    assert len(bounded) == hooks._OUTPUT_CHAR_LIMIT
+    marker = "Full hook output saved to: "
+    assert marker in bounded
+    output_path = Path(bounded.split(marker, 1)[1])
+    assert output_path.read_text() == "X" * 10_050
 
 
 # ─── JSON stdout decision control (exit 0) ──────────────────────────────────
@@ -403,6 +443,32 @@ def test_successful_compaction_fires_compact_session_start(tmp_path, monkeypatch
     assert seen.read_text() == "compact"
     assert msgs[-1] == {"role": "user", "content": "post-compact context"}
     assert recorded == [msgs[-1]]
+
+
+def test_compact_session_context_persists_before_live_append(monkeypatch):
+    from minicc import context_management as compact
+
+    cmd = """echo '{"hookSpecificOutput":{"additionalContext":"must persist"}}'"""
+    _use(
+        {"SessionStart": [_group(cmd, matcher="compact")]},
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(summary, "_summarize", lambda *a, **k: "SUMMARY")
+    monkeypatch.setattr(manager.sessions, "log_compaction", lambda *a, **k: None)
+    monkeypatch.setattr(
+        manager.sessions,
+        "append_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    msgs = _alternating(10)
+    ctx = compact.ContextState()
+
+    with pytest.raises(OSError, match="disk full"):
+        compact.compact(ctx, msgs, session_id="s1")
+
+    assert all(message.get("content") != "must persist" for message in msgs)
+    assert ctx.compactions == 1
+    assert ctx.last_message_tokens == compact.estimate_tokens(msgs)
 
 
 def test_session_end_is_informational_only(monkeypatch):
