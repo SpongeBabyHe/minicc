@@ -37,20 +37,37 @@ losslessness and in-place compaction coexist (§4, I2).
 
 ## 3. Data model
 
-One file per session: `.minicc/sessions/<id>.jsonl`, `<id>` = startup timestamp.
-One JSON event per line, appended, never rewritten. Four event kinds:
+One file per session: `.minicc/sessions/<id>.jsonl`, where new ids are UUID4
+strings. Legacy timestamp ids remain valid. Ids are validated as one safe file
+stem before every filesystem access. One JSON event per line, appended, never
+rewritten. Five event kinds:
 
 ```
 {"t":"msg",     "ts":<iso>, "m":<message>[, "usage":{…}][, "meta":true]}
 {"t":"compact", "state":[<messages>]}   # working set after a compaction
 {"t":"rewind",  "state":[<messages>]}   # working set after a /rewind
 {"t":"context_edit", "edits":[{"tool_use_id":<id>, "content":<replacement>}]}
+{"t":"session_counter", "name":<counter>, "delta":<positive-int>}
 ```
 
 - `m` — one API-shaped message (§5).
 - `ts` / `usage` — timing + per-turn token counts (CC-parity fields); the
   substrate for offline process analysis. Never read on replay.
 - `meta:true` — a slash-command expansion record (CC's `isMeta`); transcript-only.
+- `session_counter` — consumed session-wide budgets such as WebSearch requests
+  and subagent spawns. Counters survive conversation rewind and process restart.
+
+CC 2.1.212 runaway limits are enforced from these counters:
+
+- WebSearch: 200 requests per session by default; override with
+  `CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION`.
+- Subagents: 200 spawns per session by default; override with
+  `CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION`.
+
+The WebSearch schema's per-request `max_uses` is clamped to the remaining
+session budget. Exhausted WebSearch and Agent tools are no longer advertised;
+a stale Agent call is still rejected before spawning. `/clear` creates a new
+session id and therefore resets both budgets.
 
 Replay reads only `t`, `m`, `state`, and `edits`; **unknown keys are ignored** →
 the format is forward/backward compatible.
@@ -105,16 +122,19 @@ The one structural rule that breaks in practice — a `tool_use` with no followi
   `agent_loop → llm_response → compact`.
 - **Read**: `load` (full replay — resume) · `load_upto(n)` (first n events — rewind) ·
   `event_count` (turn-start anchor) · `path` (transcript_path for hooks). `load`/
-  `load_upto` share `_replay`; a missing/corrupt file → `None`.
+  `load_upto` share `_replay`. A valid empty transcript returns `[]`; an invalid
+  id, missing transcript, corrupt transcript, or I/O failure raises a distinct
+  `SessionError` subtype, so startup never silently resumes an empty conversation.
 
 ## 8. Failure modes
 
 - **Interrupt mid-turn** — memory rolled back; transcript keeps the partial turn.
   Replay: repair fixes any orphan; a lone user message merges (API allows
   consecutive same-role). Divergence is intentional (append-only lossless record).
-- **Crash** — loses at most the in-flight line.
-- **Corrupt trailing line** — `_load` returns `None` (whole-session load fails).
-  *Debt: could tolerate a corrupt last line instead.*
+- **Crash** — loses at most the in-flight line. An undecodable final line is
+  ignored only when it has no terminating newline, which identifies an
+  interrupted append. Corruption in an earlier or newline-terminated line fails
+  loudly with its line number.
 - **Model boundary** — thinking blocks from a *different* model must drop on replay;
   minicc doesn't switch model mid-transcript, so untested. *Gap.*
 
@@ -145,15 +165,16 @@ architectural, not cosmetic:
    minicc records only the conversation and working-set edits
    (`msg`/`compact`/`rewind`/`context_edit`).
 
-Plus: session id is a startup timestamp, not CC's UUID; no `~/.claude` global store;
-local-only (never uploaded).
+Plus: no `~/.claude` global store; local-only (never uploaded).
 
 ## 10. Testing
 
 Round-trip (14-msg incl. a tool_use turn resumes, no 400) · boundary reconstruction
-(`[summary]`+tail) · append-only losslessness · dangling-repair (insert + merge paths).
+(`[summary]`+tail) · append-only losslessness · dangling-repair (insert + merge
+paths) · UUID/path containment · explicit missing/corrupt handling · interrupted
+tail recovery · durable session counters.
 
 ## 11. Open / future
 
-Session picker · corrupt-tail tolerance · secret redaction · teammate transcripts
-(teams tier — per-process session ids + dirs).
+Session picker · secret redaction · teammate transcripts (teams tier —
+per-process session ids + dirs).

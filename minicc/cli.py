@@ -432,10 +432,13 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=Non
         ux.say(msg, style=ux.S_INFO)
 
     if mode in ("conversation", "both"):
-        rewound = sessions.load_upto(
-            session_id, events) if session_id else None
-        if rewound is None:
+        if session_id is None or events is None:
             ux.say("no transcript to rewind from", style=ux.S_ERROR)
+            return
+        try:
+            rewound = sessions.load_upto(session_id, events)
+        except sessions.SessionError as error:
+            ux.say(f"could not rewind conversation: {error}", style=ux.S_ERROR)
             return
         history[:] = rewound
         sessions.log_rewind(session_id, history)  # append-only: a reset event
@@ -477,7 +480,13 @@ def _cmd_clear(history, session_id: str) -> str:
     return new_id
 
 
-def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
+def _print_startup_banner(
+    pre_approved,
+    refused,
+    session_id,
+    history,
+    resumed: bool = False,
+) -> None:
     """The framed session header: identity, persisted trust that skips prompts,
     available skills, and a resume note."""
     ux.console.rule()
@@ -500,7 +509,7 @@ def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
             "(approve per session — see PERMISSIONS.md)",
             style=ux.S_INFO,
         )
-    if history:
+    if resumed:
         ux.say(
             f"resumed session {session_id} ({len(history)} messages)", style=ux.S_INFO
         )
@@ -508,7 +517,11 @@ def _print_startup_banner(pre_approved, refused, session_id, history) -> None:
 
 
 def _init_session():
-    """Parse --continue/--resume and return (history, session_id)."""
+    """Parse startup selection and return ``(history, session_id, resumed)``.
+
+    Explicit resume failures are fatal and descriptive. A missing or corrupt
+    transcript must never be mistaken for a valid empty conversation.
+    """
     parser = argparse.ArgumentParser(prog="minicc")
     parser.add_argument(
         "--continue",
@@ -521,12 +534,18 @@ def _init_session():
     args = parser.parse_args()
 
     if args.resume:
-        return sessions.load(args.resume) or [], args.resume
+        try:
+            return sessions.load(args.resume), args.resume, True
+        except sessions.SessionError as error:
+            parser.error(str(error))
     if args.cont:
         sid = sessions.latest_id()
         if sid:
-            return sessions.load(sid) or [], sid
-    return [], sessions.new_id()
+            try:
+                return sessions.load(sid), sid, True
+            except sessions.SessionError as error:
+                parser.error(str(error))
+    return [], sessions.new_id(), False
 
 
 def _setup_history():
@@ -632,7 +651,7 @@ def _friendly_error(e: Exception) -> str:
 
 
 def _main():
-    history, session_id = _init_session()
+    history, session_id, resumed = _init_session()
     histfile = _setup_history()
     # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
     checkpoints.reset()
@@ -650,9 +669,15 @@ def _main():
     # <system-reminder> messages injected at prompt time (reminders.py, CC parity).
     llm.set_session_context(
         _session_context_with_hooks(
-            session_id, "resume" if history else "startup")
+            session_id, "resume" if resumed else "startup")
     )
-    _print_startup_banner(pre_approved, refused, session_id, history)
+    _print_startup_banner(
+        pre_approved,
+        refused,
+        session_id,
+        history,
+        resumed=resumed,
+    )
     ctx = (
         context_management.ContextState()
     )  # this conversation's trigger state (rotated on /clear)

@@ -6,6 +6,7 @@ os.environ.setdefault("MODEL_ID", "test-model")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import json
+import uuid
 
 import pytest
 from anthropic.types import TextBlock, ToolUseBlock
@@ -194,9 +195,117 @@ def test_latest_id(tmp_path, monkeypatch):
     assert sessions.latest_id() == "20260616_110000"
 
 
-def test_load_missing_returns_none(tmp_path, monkeypatch):
+def test_new_id_is_unique_uuid4():
+    first = sessions.new_id()
+    second = sessions.new_id()
+
+    assert first != second
+    assert uuid.UUID(first).version == 4
+    assert uuid.UUID(second).version == 4
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    (
+        "",
+        "../escape",
+        "../../tmp/escape",
+        "/absolute",
+        ".hidden",
+        "has space",
+    ),
+)
+def test_invalid_session_ids_are_rejected(tmp_path, monkeypatch, session_id):
     monkeypatch.chdir(tmp_path)
-    assert sessions.load("nope") is None
+
+    if session_id:
+        with pytest.raises(sessions.InvalidSessionIdError):
+            sessions.path(session_id)
+    else:
+        with pytest.raises(sessions.InvalidSessionIdError):
+            sessions.load(session_id)
+    with pytest.raises(sessions.InvalidSessionIdError):
+        sessions.append_message(
+            session_id,
+            {"role": "user", "content": "must not escape"},
+        )
+
+    assert not (tmp_path.parent / "escape.jsonl").exists()
+
+
+def test_load_missing_raises_not_found(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(sessions.SessionNotFoundError, match="was not found"):
+        sessions.load("nope")
+
+
+def test_load_valid_empty_transcript(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    transcript = tmp_path / ".minicc" / "sessions" / "empty.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_bytes(b"")
+
+    assert sessions.load("empty") == []
+
+
+def test_load_ignores_only_truncated_final_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sessions.append_message("s", {"role": "user", "content": "complete"})
+    transcript = sessions.path("s")
+    with transcript.open("ab") as file:
+        file.write(b'{"t":"msg","m":{"role":"assistant","content":"cut')
+
+    assert sessions.load("s") == [{"role": "user", "content": "complete"}]
+    assert sessions.event_count("s") == 1
+
+
+def test_load_accepts_valid_final_line_without_newline(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    transcript = tmp_path / ".minicc" / "sessions" / "s.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"t":"msg","m":{"role":"user","content":"complete"}}',
+        encoding="utf-8",
+    )
+
+    assert sessions.load("s") == [{"role": "user", "content": "complete"}]
+
+
+def test_load_rejects_corrupt_complete_final_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sessions.append_message("s", {"role": "user", "content": "complete"})
+    with sessions.path("s").open("ab") as file:
+        file.write(b'{"t":"msg","m":\n')
+
+    with pytest.raises(sessions.SessionCorruptError, match="line 2"):
+        sessions.load("s")
+
+
+def test_load_rejects_corrupt_middle_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    transcript = tmp_path / ".minicc" / "sessions" / "s.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_bytes(
+        b'{"t":"msg","m":{"role":"user","content":"first"}}\n'
+        b'not-json\n'
+        b'{"t":"msg","m":{"role":"assistant","content":"last"}}\n'
+    )
+
+    with pytest.raises(sessions.SessionCorruptError, match="line 2"):
+        sessions.load("s")
+
+
+def test_session_counters_are_durable_and_not_replayed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sessions.append_message("s", {"role": "user", "content": "hello"})
+    sessions.record_counter("s", "web_searches", 3)
+    sessions.record_counter("s", "subagent_spawns")
+
+    assert sessions.counter_totals("s") == {
+        "web_searches": 3,
+        "subagent_spawns": 1,
+    }
+    assert sessions.load("s") == [{"role": "user", "content": "hello"}]
 
 
 # ─── conversation rewind: event_count / load_upto / rewind event ─────────────
@@ -219,7 +328,8 @@ def test_load_upto_replays_partial(tmp_path, monkeypatch):
         {"role": "user", "content": "m1"},
     ]
     assert sessions.load_upto("s", 0) == []
-    assert sessions.load_upto("nope", 2) is None
+    with pytest.raises(sessions.SessionNotFoundError):
+        sessions.load_upto("nope", 2)
 
 
 def test_load_upto_works_across_a_compaction(tmp_path, monkeypatch):
