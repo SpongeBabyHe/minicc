@@ -5,6 +5,7 @@ from minicc import context_management, ux
 from minicc import checkpoints
 from minicc import sessions
 from minicc import hooks
+from minicc import session_limits
 
 # Runaway guard for the Stop hook, straight from CC's best-practices doc: "Claude
 # Code overrides the hook and ends the turn after 8 consecutive blocks."
@@ -40,6 +41,7 @@ def agent_loop(
     """
     tools = tools if tools is not None else TOOLS
     ctx = ctx if ctx is not None else context_management.ContextState()
+    limits = session_limits.SessionLimits.load(session_id)
     allowed = {t["name"] for t in tools}  # guard: model can't call un-advertised tools
     turns = 0
     stop_blocks = 0  # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
@@ -60,11 +62,12 @@ def agent_loop(
             messages,
             system,
             stream=stream,
-            tools=tools,
+            tools=limits.tools_for_request(tools),
             model=model,
             session_id=session_id,
             ctx=ctx,
         )
+        limits.record_response(response)
         assistant_msg = {"role": "assistant", "content": response.content}
         messages.append(assistant_msg)
         if response.stop_reason == "pause_turn":
@@ -133,7 +136,13 @@ def agent_loop(
                     f"{indent}→ {block.name}({ux.fmt_dict(block.input)})",
                     style=ux.S_CALL,
                 )
-                output = _run_tool(block, allowed, session_id, indent)
+                output = _run_tool(
+                    block,
+                    allowed,
+                    session_id,
+                    indent,
+                    limits=limits,
+                )
                 result = ux.truncate(output, 300)
                 prefixed = f"{indent}← " + result.replace("\n", f"\n{indent}  ")
                 ux.say(prefixed, style=ux.S_RESULT)
@@ -214,7 +223,13 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
     return False
 
 
-def _run_tool(block, allowed, session_id, indent) -> str:
+def _run_tool(
+    block,
+    allowed,
+    session_id,
+    indent,
+    limits: session_limits.SessionLimits | None = None,
+) -> str:
     """Execute one tool call, wrapping the permission gate + handler in PreToolUse and
     PostToolUse hooks. Returns the tool_result content (with any hook-injected context
     appended). PreToolUse can deny the call, rewrite its input, force a prompt, or
@@ -244,6 +259,12 @@ def _run_tool(block, allowed, session_id, indent) -> str:
         output = f"Tool {block.name} is not available to this agent."
     elif not (pre.allow or confirm(block.name, tool_input, force=pre.ask)):
         output = f"User declined to run {block.name}."
+    elif (
+        block.name == "agent"
+        and limits is not None
+        and not limits.claim_subagent()
+    ):
+        output = limits.subagent_limit_result()
     else:
         try:
             if block.name in ("write_file", "edit_file"):

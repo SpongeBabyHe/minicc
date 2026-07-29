@@ -24,7 +24,10 @@ Keys:
                    SessionEnd), CC's schema. disableAllHooks turns them off.
                    Global + project groups both fire (concatenated). See HOOKS.md.
 
-env is reserved for secrets + endpoint (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
+Process-level compatibility controls such as
+CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION and
+CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION are read by their owning modules rather
+than duplicated into settings.
 """
 
 import json

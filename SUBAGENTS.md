@@ -103,11 +103,17 @@ The user should see progress without confusing it with the main loop:
 Distinct prefix/indent so subagent work reads as "nested". Implementation: the
 subagent's `agent_loop` renders through a `ux` mode that indents + dims.
 
-### D7. Runaway guard — `maxTurns` cap ✅ (own choice, mirrors CC)
+### D7. Runaway guards — turn and session caps ✅
 
 A subagent could loop forever (read → read → ...). Cap it:
 `SUBAGENT_MAX_TURNS = 15`. When hit, the subagent stops and returns whatever it
 has, with a note. Prevents a delegated task from burning unbounded tokens.
+
+CC 2.1.212 also caps successful subagent spawns at 200 per session. minicc
+persists that count in the session transcript, removes `agent` from subsequent
+request schemas when exhausted, and rejects stale calls before the handler runs.
+`CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION` overrides the default; `/clear` resets
+the budget by rotating to a new session id.
 
 ### D8. Subagent model — a cheaper model for read-only exploration (own choice, planned)
 
