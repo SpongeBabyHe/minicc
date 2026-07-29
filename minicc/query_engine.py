@@ -245,13 +245,20 @@ def _run_tool(block, allowed, session_id, indent) -> str:
     elif not (pre.allow or confirm(block.name, tool_input, force=pre.ask)):
         output = f"User declined to run {block.name}."
     else:
-        if block.name in ("write_file", "edit_file"):
-            checkpoints.before_write(tool_input.get("path"))  # for /rewind
         try:
-            output = handler(**tool_input)
-        except Exception as e:
-            output = f"Error: tool crashed: {e!r}"
-        output = _post_tool(block, tool_input, output, session_id, indent)
+            if block.name in ("write_file", "edit_file"):
+                checkpoints.before_write(tool_input.get("path"))  # for /rewind
+        except checkpoints.CheckpointError as error:
+            output = (
+                "Error: could not create a rewind checkpoint; "
+                f"the file was not modified: {error}"
+            )
+        else:
+            try:
+                output = handler(**tool_input)
+            except Exception as e:
+                output = f"Error: tool crashed: {e!r}"
+            output = _post_tool(block, tool_input, output, session_id, indent)
 
     if pre.additional_context:
         output += "\n\n" + "\n".join(pre.additional_context)

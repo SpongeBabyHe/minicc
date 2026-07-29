@@ -428,7 +428,10 @@ def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=Non
         restored, failed = checkpoints.restore_files(turn)
         msg = f"reverted {restored} file change(s) to restore point {n}"
         if failed:
-            msg += f"  — {len(failed)} could not be restored: {', '.join(failed)}"
+            msg += (
+                f"  — {len(failed)} could not be restored; "
+                f"checkpoint retained for retry: {', '.join(failed)}"
+            )
         ux.say(msg, style=ux.S_INFO)
 
     if mode in ("conversation", "both"):
@@ -469,7 +472,7 @@ def _cmd_clear(history, session_id: str) -> str:
     new_id = sessions.new_id()
     permissions.reset()
     permissions.preload(config.allowed_tools())  # keep settings-trusted tools
-    checkpoints.reset()
+    checkpoints.activate(new_id)
     hooks.reset()  # re-read hook config (settings may have changed)
     freshness.reset()  # new session: read-before-edit starts over
     skills.reset(new_id)  # new session id; forget loaded skills
@@ -653,8 +656,7 @@ def _friendly_error(e: Exception) -> str:
 def _main():
     history, session_id, resumed = _init_session()
     histfile = _setup_history()
-    # clear stale checkpoint dirs from a prior session (no cross-restart load yet)
-    checkpoints.reset()
+    checkpoints.activate(session_id, resume=resumed)
     hooks.reset()  # load hook config from settings.json for this session
     # ${CLAUDE_SESSION_ID} + fresh already-loaded tracking
     skills.reset(session_id)
@@ -681,7 +683,7 @@ def _main():
     ctx = (
         context_management.ContextState()
     )  # this conversation's trigger state (rotated on /clear)
-    turn = 0
+    turn = checkpoints.last_turn()
     while True:
         try:
             query = _read_query()
@@ -847,6 +849,8 @@ def main():
     try:
         _main()
     except hooks.HookStop as error:
+        ux.say(str(error), style=ux.S_ERROR)
+    except checkpoints.CheckpointError as error:
         ux.say(str(error), style=ux.S_ERROR)
 
 
