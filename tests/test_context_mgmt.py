@@ -576,8 +576,8 @@ def test_stale_eviction_plan_aborts_without_partial_edit():
 def test_main_session_eviction_aborts_if_spill_fails(monkeypatch):
     msgs = _turn_with_big_results(1, size=2_000)
     monkeypatch.setattr(
-        eviction.sessions,
-        "persist_tool_result_output",
+        eviction,
+        "_persist_tool_result_output",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
     )
     logged = []
@@ -602,9 +602,9 @@ def test_main_session_eviction_aborts_if_spill_fails(monkeypatch):
 def test_main_session_eviction_aborts_if_replay_log_fails(monkeypatch):
     msgs = _turn_with_big_results(1, size=2_000)
     monkeypatch.setattr(
-        eviction.sessions,
-        "persist_tool_result_output",
-        lambda *args, **kwargs: eviction.sessions.tool_result_output_path(
+        eviction,
+        "_persist_tool_result_output",
+        lambda *args, **kwargs: eviction._tool_result_output_path(
             args[0],
             args[1],
             args[2],
@@ -630,8 +630,8 @@ def test_main_session_eviction_aborts_if_replay_log_fails(monkeypatch):
 def test_recovery_eviction_can_use_explicit_lossy_fallback(monkeypatch):
     msgs = _turn_with_big_results(1, size=2_000)
     monkeypatch.setattr(
-        eviction.sessions,
-        "persist_tool_result_output",
+        eviction,
+        "_persist_tool_result_output",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
     )
     logged = []

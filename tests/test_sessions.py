@@ -12,6 +12,7 @@ import pytest
 from anthropic.types import TextBlock, ToolUseBlock
 
 from minicc import context_management as compact, sessions
+from minicc.context_management import eviction
 
 
 def _history():
@@ -169,7 +170,7 @@ def test_context_edit_persists_output_and_replays_delta(tmp_path, monkeypatch):
     assert result.count == 1
     replacement = working[2]["content"][0]["content"]
     assert replacement.startswith("<persisted-output>\n")
-    output_path = sessions.tool_result_output_path(
+    output_path = eviction._tool_result_output_path(
         sid,
         "tool/../1",
         original,

@@ -6,11 +6,14 @@ working set.  A failed apply leaves messages untouched, although spill files
 created before a later transcript failure may remain as harmless orphans.
 """
 
+import hashlib
+import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 
-from minicc import sessions
+from minicc import config, sessions
 
 from .budget import _serialized_size, estimate_tokens
 
@@ -21,6 +24,7 @@ TOOL_RESULT_EVICTION_TRIGGER_TOKENS = 100_000
 TOOL_RESULT_EVICTION_MIN_SAVINGS_TOKENS = 20_000
 TOOL_RESULT_EVICTION_KEEP_RECENT = 5
 EVICTED_MARKER = "[Old tool result content cleared]"
+_TOOL_OUTPUTS_SUBDIR = ".minicc/tool_outputs"
 _PERSISTED_OUTPUT_RE = re.compile(
     r"\A<persisted-output>\n"
     r"Full tool result saved to: [^\n]+\n"
@@ -124,6 +128,66 @@ def _is_evicted_content(content) -> bool:
     )
 
 
+def _safe_component(value: str, fallback: str) -> str:
+    """Make an opaque id safe for use as one path component."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return safe[:48] or fallback
+
+
+def _tool_result_output_path(
+    session_id: str,
+    tool_use_id: str,
+    content,
+) -> Path:
+    """Return the deterministic spill path for one evicted tool result."""
+    safe_session = _safe_component(session_id, "session")
+    safe_tool = _safe_component(tool_use_id, "tool-result")
+    digest = hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()[:10]
+    suffix = ".txt" if isinstance(content, str) else ".json"
+    return (
+        Path.cwd()
+        / _TOOL_OUTPUTS_SUBDIR
+        / safe_session
+        / f"{safe_tool}-{digest}{suffix}"
+    )
+
+
+def _persisted_tool_result_marker(output_path: Path) -> str:
+    """Build the in-context pointer left after a tool result is spilled.
+
+    Kept beside ``_PERSISTED_OUTPUT_RE`` on purpose: that regex must match this
+    string exactly, so the format's producer and its validator share one module.
+    """
+    return (
+        "<persisted-output>\n"
+        f"Full tool result saved to: {output_path}\n"
+        "Use read_file on this path to inspect the full result.\n"
+        "</persisted-output>"
+    )
+
+
+def _persist_tool_result_output(
+    session_id: str,
+    tool_use_id: str,
+    content,
+) -> Path:
+    """Persist an evicted result outside active context and return its path."""
+    config.ensure_project_dir("tool_outputs")
+    output_path = _tool_result_output_path(session_id, tool_use_id, content)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, str):
+        serialized = content
+    else:
+        serialized = json.dumps(
+            content,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    output_path.write_text(serialized, encoding="utf-8")
+    return output_path
+
+
 def _planned_replacement(
     session_id: str | None,
     tool_use_id: str,
@@ -132,12 +196,12 @@ def _planned_replacement(
     """Return the marker shape used to estimate one candidate's net savings."""
     if not session_id:
         return EVICTED_MARKER
-    output_path = sessions.tool_result_output_path(
+    output_path = _tool_result_output_path(
         session_id,
         tool_use_id,
         content,
     )
-    return sessions.persisted_tool_result_marker(output_path)
+    return _persisted_tool_result_marker(output_path)
 
 
 def plan_tool_result_eviction(
@@ -290,12 +354,12 @@ def apply_tool_result_eviction(
         replacement = EVICTED_MARKER
         if session_id:
             try:
-                output_path = sessions.persist_tool_result_output(
+                output_path = _persist_tool_result_output(
                     session_id,
                     edit.tool_use_id,
                     edit.original_content,
                 )
-                replacement = sessions.persisted_tool_result_marker(
+                replacement = _persisted_tool_result_marker(
                     output_path
                 )
             except OSError:

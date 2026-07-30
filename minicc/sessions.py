@@ -1,33 +1,12 @@
-"""Session persistence: an append-only transcript per session in .minicc/sessions/.
+"""Session persistence: an append-only JSONL transcript per session
+(`.minicc/sessions/<id>.jsonl`), replayed into the in-memory working set on
+resume and rewind.
 
-Each session is a JSONL file (`<id>.jsonl`), written one event per line and NEVER
-rewritten — so the raw conversation survives even when the in-memory working set is
-compacted (an overwrite-on-save scheme would drop the summarized history). Five event kinds:
-
-    {"t": "msg",     "ts": <iso>, "m": <one API-shaped message>[, "usage": {...}]}
-    {"t": "compact", "state": [<messages>]}           # post-compaction working set
-    {"t": "rewind",  "state": [<messages>]}           # conversation /rewind reset
-    {"t": "context_edit", "edits": [<tool-result replacements>]}
-    {"t": "session_counter", "name": <counter>, "delta": <positive int>}
-
-`ts` (every msg) and `usage` (assistant msgs, token counts from the API response)
-mirror CC's transcript fields — they're what make post-hoc process analysis
-(timing, cost, turn economy) possible. Replay ignores unknown keys, so old
-transcripts without them stay loadable.
-
-`load` replays the log: a `msg` event appends; a `compact` or `rewind` event RESETS
-the working set to its recorded state (summary + kept tail); a `context_edit`
-event replaces selected old tool-result contents. So reconstruction yields
-exactly what the live session held — small and API-ready — no matter how long the
-raw log grew, while the original `msg` events stay on disk (lossless).
-
-Serialization: assistant messages hold SDK Block objects (TextBlock/ToolUseBlock)
-that don't JSON-serialize; `model_dump(exclude_none=True)` yields minimal, API-clean
-dicts (dropping SDK-only fields like `caller`/`citations`). Strings and existing
-dicts pass through unchanged.
+The event vocabulary, the invariants (losslessness, append-only, valid replay),
+the serialization round-trip, and the dangling-`tool_use` repair are all
+specified in SESSIONS.md — see it rather than a copy kept here.
 """
 
-import hashlib
 import json
 import re
 from datetime import datetime
@@ -37,7 +16,6 @@ from uuid import uuid4
 from minicc import config
 
 _SESSIONS_SUBDIR = ".minicc/sessions"
-_TOOL_OUTPUTS_SUBDIR = ".minicc/tool_outputs"
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _COUNTER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
@@ -83,102 +61,19 @@ def validate_id(session_id: str) -> str:
 
 
 def _path(session_id: str) -> Path:
-    """Return the JSONL transcript path for ``session_id``.
-
-    Args:
-        session_id: Session identifier (file stem).
-
-    Returns:
-        Path to ``<session_id>.jsonl`` under the sessions directory.
-    """
-    session_id = validate_id(session_id)
-    root = _dir().resolve()
-    candidate = (root / f"{session_id}.jsonl").resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as error:
-        raise InvalidSessionIdError(
-            f"session id {session_id!r} escapes the sessions directory"
-        ) from error
-    return candidate
+    """Return the JSONL transcript path for ``session_id``."""
+    # validate_id already forbids path separators and a leading dot, so a valid
+    # id cannot escape the sessions directory — no separate containment check.
+    return (_dir() / f"{validate_id(session_id)}.jsonl").resolve()
 
 
 def path(session_id: str | None) -> Path | None:
-    """Return the public transcript path for a session, or None if unset.
-
-    Hooks expose this as ``transcript_path`` in their stdin payload (CC parity).
-
-    Args:
-        session_id: Session id, or None when there is no session.
-
-    Returns:
-        Transcript path, or None when ``session_id`` is None.
-    """
+    """Return the public transcript path for a session, or None if unset."""
     return _path(session_id) if session_id else None
 
 
-def _safe_component(value: str, fallback: str) -> str:
-    """Make an opaque id safe for use as one path component."""
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
-    return safe[:48] or fallback
-
-
-def tool_result_output_path(
-    session_id: str,
-    tool_use_id: str,
-    content,
-) -> Path:
-    """Return the deterministic spill path for one evicted tool result."""
-    safe_session = _safe_component(session_id, "session")
-    safe_tool = _safe_component(tool_use_id, "tool-result")
-    digest = hashlib.sha256(tool_use_id.encode("utf-8")).hexdigest()[:10]
-    suffix = ".txt" if isinstance(content, str) else ".json"
-    return (
-        Path.cwd()
-        / _TOOL_OUTPUTS_SUBDIR
-        / safe_session
-        / f"{safe_tool}-{digest}{suffix}"
-    )
-
-
-def persisted_tool_result_marker(output_path: Path) -> str:
-    """Build the in-context pointer left after a tool result is spilled."""
-    return (
-        "<persisted-output>\n"
-        f"Full tool result saved to: {output_path}\n"
-        "Use read_file on this path to inspect the full result.\n"
-        "</persisted-output>"
-    )
-
-
-def persist_tool_result_output(
-    session_id: str,
-    tool_use_id: str,
-    content,
-) -> Path:
-    """Persist an evicted result outside active context and return its path."""
-    config.ensure_project_dir("tool_outputs")
-    output_path = tool_result_output_path(session_id, tool_use_id, content)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, str):
-        serialized = content
-    else:
-        serialized = json.dumps(
-            content,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
-    output_path.write_text(serialized, encoding="utf-8")
-    return output_path
-
-
 def new_id() -> str:
-    """Allocate a collision-resistant UUID session id.
-
-    Returns:
-        A lowercase UUID4 string. Legacy timestamp ids remain loadable.
-    """
+    """Allocate a collision-resistant UUID session id"""
     return str(uuid4())
 
 
@@ -215,14 +110,7 @@ def _serialize_message(m) -> dict:
 
 
 def _serialize_messages(messages) -> list:
-    """Serialize a list of messages for transcript storage.
-
-    Args:
-        messages: Iterable of message dicts.
-
-    Returns:
-        List of JSON-serializable message dicts (see ``_serialize_message``).
-    """
+    """Serialize a list of messages for transcript storage."""
     return [_serialize_message(m) for m in messages]
 
 
@@ -329,11 +217,11 @@ def record_counter(session_id: str, name: str, delta: int = 1) -> None:
     Counter events are append-only and intentionally survive conversation
     rewind: consumed WebSearch and subagent budgets belong to the session, not
     to the current replayed working set.
+
+    Callers are internal and pass fixed counter names with positive deltas;
+    ``counter_totals`` re-validates every counter event on read, so a malformed
+    event is caught there rather than guarded again here.
     """
-    if not isinstance(name, str) or not _COUNTER_NAME.fullmatch(name):
-        raise ValueError(f"invalid session counter name: {name!r}")
-    if not isinstance(delta, int) or isinstance(delta, bool) or delta <= 0:
-        raise ValueError("session counter delta must be a positive integer")
     _append_event(
         session_id,
         {"t": "session_counter", "name": name, "delta": delta},
@@ -370,12 +258,6 @@ def event_count(session_id: str) -> int:
 
     Checkpoints record this at turn start so a conversation rewind can replay
     back to that position.
-
-    Args:
-        session_id: Target session id.
-
-    Returns:
-        Number of non-empty JSONL lines, or 0 if the file is missing.
     """
     transcript = _path(session_id)
     if not transcript.exists():
@@ -392,7 +274,8 @@ def latest_id() -> str | None:
     d = _dir()
     if not d.exists():
         return None
-    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(d.glob("*.jsonl"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     for transcript in files:
         try:
             return validate_id(transcript.stem)
