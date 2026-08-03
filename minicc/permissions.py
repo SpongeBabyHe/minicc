@@ -320,7 +320,7 @@ def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
     explicitly asking the user to confirm this specific call.
 
     For bash, `always` persists a narrow prefix rule per subcommand (CC's "Yes,
-    don't ask again") to project settings — future matching commands skip the
+    don't ask again") to local settings — future matching commands skip the
     prompt. Offered only when the command can be safely bounded into rules."""
     if not force:
         if not _is_gated(tool_name, tool_input):
@@ -333,7 +333,7 @@ def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
     options = "[yes/no/all]"
     if save_rules:
         ux.say(
-            f"always = don't ask again for: {', '.join(save_rules)}  (saved to project settings)",
+            f"always = don't ask again for: {', '.join(save_rules)}  (saved to local settings)",
             style=ux.S_INFO,
         )
         options = "[yes/no/all/always]"

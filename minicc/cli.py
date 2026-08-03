@@ -25,6 +25,7 @@ from minicc import memory
 from minicc import hooks
 from minicc import reminders
 from minicc import skills
+from minicc import tools as tool_registry
 from minicc.tools import freshness
 from minicc.prompts.system import build_session_context
 
@@ -655,6 +656,8 @@ def _friendly_error(e: Exception) -> str:
 
 def _main():
     history, session_id, resumed = _init_session()
+    llm.configure_from_settings()
+    tool_registry.configure_from_settings()
     histfile = _setup_history()
     checkpoints.activate(session_id, resume=resumed)
     hooks.reset()  # load hook config from settings.json for this session

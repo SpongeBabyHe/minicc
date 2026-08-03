@@ -69,8 +69,10 @@ def test_append_load_round_trip(tmp_path, monkeypatch):
 
     loaded = sessions.load(sid)
     assert loaded == sessions._serialize_messages(_history())
-    # self-ignoring dir was created
-    assert (tmp_path / ".minicc" / ".gitignore").read_text() == "*\n"
+    # Runtime state stays ignored while shared settings remain trackable.
+    assert (tmp_path / ".minicc" / ".gitignore").read_text() == (
+        "*\n!.gitignore\n!settings.json\n"
+    )
 
 
 def test_meta_flag_marks_expansion_record_only(tmp_path, monkeypatch):

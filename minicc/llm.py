@@ -16,8 +16,8 @@ from minicc.prompts.system import build_system_prompt
 from minicc.tools import TOOLS
 
 load_dotenv()
-MODEL = config.resolve_model()
-CACHE_TTL = config.resolve_cache_ttl()
+MODEL = config.DEFAULT_MODEL
+CACHE_TTL = "5m"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
 SYSTEM = build_system_prompt()
 _USAGE = {
@@ -28,6 +28,13 @@ _USAGE = {
     "web_searches": 0,
 }
 _SESSION_CONTEXT = ""
+
+
+def configure_from_settings() -> None:
+    """Apply the source-filtered settings view selected by CLI startup."""
+    global MODEL, CACHE_TTL
+    MODEL = config.resolve_model()
+    CACHE_TTL = config.resolve_cache_ttl()
 
 
 def get_model() -> str:

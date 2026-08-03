@@ -1,41 +1,159 @@
-"""User/project settings: model preference + a tool allowlist.
+"""Source-aware user, project, and local settings.
 
-Two optional JSON files:
+Settings are discovered as separate :class:`SettingsSource` objects before any
+consumer-specific merge happens:
 
-    ~/.minicc/settings.json      (global)
-    <cwd>/.minicc/settings.json  (project)
+    ~/.minicc/settings.json                   (user)
+    <cwd>/.minicc/settings.json               (shared project)
+    <repo-root>/.minicc/settings.local.json   (local, machine-owned)
 
-Keys:
-  default_model  — project overrides global, then DEFAULT_MODEL. A session
-                   `/model X` overrides on top (in-process, not persisted).
-  allowed_tools  — gated tools pre-approved without a prompt; union of global +
-                   project. bash is NOT preloadable (unbounded + irreversible —
-                   approve per session). Keep trust project-scoped. See PERMISSIONS.md.
-  web_search     — false to drop the server-side web_search tool from the tool
-                   set (default true). Needed when the org disabled web search
-                   in the Console (requests including it would 400).
-  cache_ttl      — "5m" (default) or "1h" for the STABLE prefix cache layers
-                   (system+tools / project / session). 1h writes cost 2x once but
-                   survive breaks between turns; hits refresh free. The rolling
-                   conversation breakpoint stays 5m (longer TTLs must precede
-                   shorter ones — API rule). See CONTEXT_MANAGEMENT.md.
-  hooks          — event-triggered shell commands (PreToolUse / PostToolUse /
-                   UserPromptSubmit / PreCompact / PostCompact / SessionStart /
-                   SessionEnd), CC's schema. disableAllHooks turns them off.
-                   Global + project groups both fire (concatenated). See HOOKS.md.
+Low-to-high precedence is user -> project -> local. Scalar settings use the
+highest source that defines them; array settings concatenate and deduplicate in
+source order; hook groups concatenate without deduplication.
 
-Process-level compatibility controls such as
-CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION and
-CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION are read by their owning modules rather
-than duplicated into settings.
+The active-view seam exists for workspace Trust: today, before TrustManager is
+wired into startup, an unbound process reads a fresh full view on each call.
+Later startup code can bind a restricted or trusted view once and all existing
+consumers will observe the same source selection without re-reading project
+files themselves.
 """
+
+from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Any, Iterable
+
 
 # Fallback when no settings file sets a default.
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+_MINICC_GITIGNORE = "*\n!.gitignore\n!settings.json\n"
+_MISSING = object()
+
+
+class SettingsError(ValueError):
+    """A settings source exists but is not a valid JSON object."""
+
+
+class SettingsScope(str, Enum):
+    """A concrete minicc settings source, ordered separately by the snapshot."""
+
+    USER = "user"
+    PROJECT = "project"
+    LOCAL = "local"
+
+
+SettingsPath = str | tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SettingsSource:
+    """One settings file plus the metadata lost by an eager dict merge.
+
+    ``anchor`` is retained for the future permission engine: source-relative
+    paths do not necessarily resolve from the settings file's parent.
+    """
+
+    scope: SettingsScope
+    path: Path
+    anchor: Path
+    values: dict[str, Any]
+
+
+def _path_parts(path: SettingsPath) -> tuple[str, ...]:
+    return (path,) if isinstance(path, str) else path
+
+
+def _lookup(values: dict[str, Any], path: SettingsPath) -> Any:
+    current: Any = values
+    for part in _path_parts(path):
+        if not isinstance(current, dict) or part not in current:
+            return _MISSING
+        current = current[part]
+    return current
+
+
+def _scalar(
+    sources: Iterable[SettingsSource], path: SettingsPath, default: Any = None
+) -> Any:
+    for source in reversed(tuple(sources)):
+        value = _lookup(source.values, path)
+        if value is not _MISSING:
+            return value
+    return default
+
+
+def _array(sources: Iterable[SettingsSource], path: SettingsPath) -> list[Any]:
+    merged: list[Any] = []
+    for source in sources:
+        value = _lookup(source.values, path)
+        if not isinstance(value, list):
+            continue
+        for entry in value:
+            if entry not in merged:
+                merged.append(entry)
+    return merged
+
+
+@dataclass(frozen=True)
+class SettingsSnapshot:
+    """Inert settings sources discovered for one starting directory."""
+
+    start_dir: Path
+    sources: tuple[SettingsSource, ...]
+
+    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
+        """Resolve a scalar with highest-source-wins precedence."""
+        return _scalar(self.sources, path, default)
+
+    def array(self, path: SettingsPath) -> list[Any]:
+        """Concatenate and deduplicate an array across low-to-high sources."""
+        return _array(self.sources, path)
+
+    def source(self, scope: SettingsScope) -> SettingsSource | None:
+        """Return the loaded source for ``scope``, if that file exists."""
+        return next((source for source in self.sources if source.scope == scope), None)
+
+    def view(self, *, trusted: bool) -> SettingsView:
+        """Select the sources visible before or after workspace Trust."""
+        return SettingsView(snapshot=self, trusted=trusted)
+
+
+@dataclass(frozen=True)
+class SettingsView:
+    """A snapshot filtered at the workspace Trust boundary.
+
+    User settings are always visible. Project and local settings enter the
+    effective runtime only after Trust. The current CLI binds no view yet, so
+    :func:`current_settings` supplies a fresh trusted view for compatibility.
+    """
+
+    snapshot: SettingsSnapshot
+    trusted: bool
+
+    @property
+    def sources(self) -> tuple[SettingsSource, ...]:
+        if self.trusted:
+            return self.snapshot.sources
+        return tuple(
+            source
+            for source in self.snapshot.sources
+            if source.scope == SettingsScope.USER
+        )
+
+    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
+        """Resolve a scalar from the sources selected by this view."""
+        return _scalar(self.sources, path, default)
+
+    def array(self, path: SettingsPath) -> list[Any]:
+        """Merge an array from the sources selected by this view."""
+        return _array(self.sources, path)
+
+_ACTIVE_SETTINGS: SettingsView | None = None
 
 
 def _global() -> Path:
@@ -46,174 +164,218 @@ def _project() -> Path:
     return Path.cwd() / ".minicc" / "settings.json"
 
 
+def _repository_root(start: Path | None = None) -> Path | None:
+    """Nearest ancestor containing a filesystem ``.git`` entry.
+
+    The entry may be a directory or a worktree/submodule file. Its contents are
+    deliberately not followed; repository-controlled ``commondir`` data must
+    never redirect a later workspace Trust identity.
+    """
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        marker = directory / ".git"
+        if marker.exists() or marker.is_symlink():
+            return directory
+    return None
+
+
+def _local() -> Path:
+    root = _repository_root() or Path.cwd()
+    return root / ".minicc" / "settings.local.json"
+
+
 def config_roots(subdir: str):
     """The `.minicc/<subdir>/` directories to scan, in override order: project
     (cwd + every ancestor, outermost first) then personal (`~/.minicc`), so a
     later root wins a name clash. Shared by skills and agents discovery."""
     cwd = Path.cwd()
-    for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd, so closest wins
-        yield d / ".minicc" / subdir
-    yield Path.home() / ".minicc" / subdir  # personal LAST — overrides project
+    for directory in [*reversed(cwd.parents), cwd]:
+        yield directory / ".minicc" / subdir
+    yield Path.home() / ".minicc" / subdir
 
 
-def _self_ignore(minicc_dir: Path) -> None:
-    """Drop a self-ignoring .gitignore into a .minicc/ dir (once) — so nothing
-    minicc writes there can ever be git-tracked, even in a project whose own
-    .gitignore doesn't cover it."""
-    gi = minicc_dir / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n")
+def _ensure_minicc_gitignore(minicc_dir: Path) -> None:
+    """Ignore runtime/local state while keeping shared settings trackable.
+
+    The exact legacy file written by older minicc versions is migrated. A
+    user-customized `.gitignore` is left untouched.
+    """
+    gitignore = minicc_dir / ".gitignore"
+    if not gitignore.exists() or gitignore.read_text() == "*\n":
+        gitignore.write_text(_MINICC_GITIGNORE)
 
 
 def ensure_project_dir(subdir: str = "") -> Path:
-    """`.minicc/<subdir>` under cwd, created if needed and self-ignoring. The
-    shared home for minicc's on-disk state (sessions, tasks, checkpoints, bash
-    outputs, repl history). Settings writers derive from _project() instead —
-    that path is a test seam and must stay the single source of truth."""
+    """Create `.minicc/<subdir>` under cwd and maintain its ignore policy."""
     root = Path.cwd() / ".minicc"
-    d = root / subdir if subdir else root
-    d.mkdir(parents=True, exist_ok=True)
-    _self_ignore(root)
-    return d
+    directory = root / subdir if subdir else root
+    directory.mkdir(parents=True, exist_ok=True)
+    _ensure_minicc_gitignore(root)
+    return directory
 
 
-def _read(path: Path) -> dict:
+def _read(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
     try:
         data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    except json.JSONDecodeError as error:
+        raise SettingsError(f"invalid JSON in {path}: {error.msg}") from error
+    if not isinstance(data, dict):
+        raise SettingsError(f"settings source must contain a JSON object: {path}")
+    return data
 
 
-def _settings() -> tuple[dict, dict]:
-    """(global, project) settings dicts, re-read from disk each call. Each caller
-    applies its own merge rule (override / union / concatenate)."""
-    return _read(_global()), _read(_project())
+def discover_settings(start_dir: Path | None = None) -> SettingsSnapshot:
+    """Read existing sources as inert JSON, preserving low-to-high precedence."""
+    if start_dir is None:
+        start = Path.cwd().resolve()
+        project_path = _project()
+        local_path = _local()
+    else:
+        start = start_dir.resolve()
+        project_path = start / ".minicc" / "settings.json"
+        local_root = _repository_root(start) or start
+        local_path = local_root / ".minicc" / "settings.local.json"
+    paths = (
+        (SettingsScope.USER, _global(), _global().parent),
+        (SettingsScope.PROJECT, project_path, start),
+        (SettingsScope.LOCAL, local_path, start),
+    )
+    sources: list[SettingsSource] = []
+    seen: set[Path] = set()
+    for scope, path, anchor in paths:
+        canonical = path.resolve()
+        if canonical in seen or not path.exists():
+            continue
+        seen.add(canonical)
+        sources.append(
+            SettingsSource(
+                scope=scope,
+                path=path,
+                anchor=anchor,
+                values=_read(path),
+            )
+        )
+    return SettingsSnapshot(start_dir=start, sources=tuple(sources))
+
+
+def activate(view: SettingsView) -> None:
+    """Bind the process-wide settings view selected by startup Trust."""
+    global _ACTIVE_SETTINGS
+    _ACTIVE_SETTINGS = view
+
+
+def reset_active_settings() -> None:
+    """Drop a bound view; the next getter discovers a fresh full snapshot."""
+    global _ACTIVE_SETTINGS
+    _ACTIVE_SETTINGS = None
+
+
+def current_settings() -> SettingsView:
+    """Return the bound view, or a fresh full view until Trust startup lands."""
+    if _ACTIVE_SETTINGS is not None:
+        return _ACTIVE_SETTINGS
+    return discover_settings().view(trusted=True)
 
 
 def resolve_model() -> str:
-    """Startup model: project default_model > global default_model > DEFAULT_MODEL."""
-    g, p = _settings()
-    return p.get("default_model") or g.get("default_model") or DEFAULT_MODEL
+    """Startup model: local > project > user > :data:`DEFAULT_MODEL`."""
+    return current_settings().scalar("default_model", DEFAULT_MODEL) or DEFAULT_MODEL
+
+
+def _settings_path(scope: str) -> Path:
+    if scope in ("global", "user"):
+        return _global()
+    if scope == "project":
+        return _project()
+    if scope == "local":
+        return _local()
+    raise ValueError(f"unknown settings scope: {scope}")
+
+
+def _write(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path != _global():
+        _ensure_minicc_gitignore(path.parent)
+    path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def set_default_model(model_id: str, scope: str = "global") -> Path:
-    """Persist default_model to the global (default) or project settings file."""
-    path = _global() if scope == "global" else _project()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if scope == "project":
-        _self_ignore(path.parent)  # keep project .minicc/ self-ignoring
+    """Persist ``default_model`` to user, project, or local settings."""
+    path = _settings_path(scope)
     data = _read(path)
     data["default_model"] = model_id
-    path.write_text(json.dumps(data, indent=2))
+    _write(path, data)
     return path
 
 
 def web_search_enabled() -> bool:
-    """Whether to offer the server-side web_search tool (default True). Set
-    `"web_search": false` (project or global) to drop it — required if the org
-    disabled web search in the Console, since any request including the tool
-    would 400 there."""
-    g, p = _settings()
-    v = p.get("web_search", g.get("web_search", True))
-    return v is not False
+    """Whether to offer the server-side web_search tool (default true)."""
+    return current_settings().scalar("web_search", True) is not False
 
 
 def skill_shell_disabled() -> bool:
-    """CC's `disableSkillShellExecution` setting (same key, either file): when
-    true, !`cmd` / ```! blocks in skills are replaced with a policy notice
-    instead of running. Default false."""
-    g, p = _settings()
-    return bool(
-        g.get("disableSkillShellExecution") or p.get("disableSkillShellExecution")
-    )
+    """Resolve Claude Code's ``disableSkillShellExecution`` scalar setting."""
+    return bool(current_settings().scalar("disableSkillShellExecution", False))
 
 
 def resolve_cache_ttl() -> str:
-    """Cache TTL for the stable prefix layers: project > global > "5m".
-    Only "5m" and "1h" are valid (the API's two tiers); anything else falls back
-    to "5m" so a typo can't silently break caching."""
-    g, p = _settings()
-    ttl = p.get("cache_ttl") or g.get("cache_ttl") or "5m"
+    """Stable-prefix cache TTL: local > project > user > ``5m``."""
+    ttl = current_settings().scalar("cache_ttl", "5m") or "5m"
     return ttl if ttl in ("5m", "1h") else "5m"
 
 
-def _hooks_of(d: dict) -> dict:
-    h = d.get("hooks")
-    return h if isinstance(h, dict) else {}
-
-
 def load_hooks() -> tuple[dict, bool]:
-    """Merged hook config for this cwd: (events, disabled).
-
-    `events` maps each hook-event name (PreToolUse, PostToolUse, …) to its list of
-    matcher-groups, with global and project groups CONCATENATED (both fire, unlike
-    allowed_tools which is a set-union) — global first, then project. `disabled` is
-    true if either file sets "disableAllHooks". Shape mirrors CC's settings.json so a
-    hook written for Claude Code drops in unchanged. See HOOKS.md."""
-    g, p = _settings()
-    disabled = bool(g.get("disableAllHooks")) or bool(p.get("disableAllHooks"))
-    merged: dict = {}
-    for src in (g, p):
-        for event, groups in _hooks_of(src).items():
+    """Return source-concatenated hook events plus scalar disable state."""
+    view = current_settings()
+    merged: dict[str, list[Any]] = {}
+    for source in view.sources:
+        hooks = source.values.get("hooks")
+        if not isinstance(hooks, dict):
+            continue
+        for event, groups in hooks.items():
             if isinstance(groups, list):
                 merged.setdefault(event, []).extend(groups)
-    return merged, disabled
+    return merged, bool(view.scalar("disableAllHooks", False))
 
 
 _BASH_RULE = re.compile(r"^[Bb]ash\((.+)\)$")
 
 
-def permission_allow_rules() -> list:
-    """Bash allow-rule patterns from `permissions.allow` (global + project, in that
-    order, deduped). CC's exact schema shape — an exported `Bash(uv run *)` rule
-    drops in unchanged (tool name case-insensitive; non-bash rules ignored for
-    now). See PERMISSIONS.md."""
-    seen, rules = set(), []
-    for d in _settings():
-        perms = d.get("permissions")
-        allow = perms.get("allow", []) if isinstance(perms, dict) else []
-        for entry in allow if isinstance(allow, list) else []:
-            m = _BASH_RULE.match(str(entry).strip())
-            if m and m.group(1) not in seen:
-                seen.add(m.group(1))
-                rules.append(m.group(1))
+def permission_allow_rules() -> list[str]:
+    """Bash patterns from merged ``permissions.allow`` settings."""
+    rules: list[str] = []
+    for entry in current_settings().array(("permissions", "allow")):
+        match = _BASH_RULE.match(str(entry).strip())
+        if match and match.group(1) not in rules:
+            rules.append(match.group(1))
     return rules
 
 
 def add_allow_rule(pattern: str) -> Path:
-    """Persist one bash allow rule to PROJECT settings (the `always` answer at a
-    permission prompt). Written as lowercase `bash(<pattern>)` — minicc's tool-name
-    convention; read back case-insensitively."""
-    path = _project()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _self_ignore(path.parent)  # keep project .minicc/ self-ignoring
+    """Persist one Bash allow rule to machine-local project settings."""
+    path = _local()
     data = _read(path)
-    # tolerate hand-edited malformation (permissions: [] etc.) — a crash here
-    # would land in the middle of an approval prompt
-    perms = data.get("permissions")
-    if not isinstance(perms, dict):
-        perms = {}
-        data["permissions"] = perms
-    allow = perms.get("allow")
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        data["permissions"] = permissions
+    allow = permissions.get("allow")
     if not isinstance(allow, list):
         allow = []
-        perms["allow"] = allow
+        permissions["allow"] = allow
     rule = f"bash({pattern})"
     if rule not in allow:
         allow.append(rule)
-        path.write_text(json.dumps(data, indent=2))
+        _write(path, data)
     return path
 
 
-def _tool_list(d: dict) -> set:
-    v = d.get("allowed_tools", [])
-    return set(v) if isinstance(v, list) else set()
-
-
-def allowed_tools() -> list:
-    """Tools listed for pre-approval in settings (union of global + project).
-    permissions.preload decides what's actually applied (bash is excluded there).
-    minicc never auto-writes here — you opt in by editing settings.json. Keep
-    trust project-scoped. See PERMISSIONS.md."""
-    return sorted(_tool_list(_read(_global())) | _tool_list(_read(_project())))
+def allowed_tools() -> list[str]:
+    """Merged minicc-specific whole-tool startup grants."""
+    return sorted(
+        str(entry)
+        for entry in current_settings().array("allowed_tools")
+        if isinstance(entry, str)
+    )

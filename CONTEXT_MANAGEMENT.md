@@ -283,7 +283,7 @@ server `context_hint`; it is not a third local hard gate.
 **minicc's own** (CC silent, or the value is minicc's judgment):
 `KEEP_RECENT_MESSAGES_TARGET = 6` (a safe structural target, not an invariant);
 the exact summary wording; `MAX_COMPACT_ATTEMPTS = 3`; spilling evicted main-session
-results under `.minicc/tool_outputs/`; and the `.minicc/` self-ignoring directory
+results under `.minicc/tool_outputs/`; and the `.minicc/` runtime-ignore policy
 (`.minicc/.gitignore: "*"`, so artifacts never get tracked even if the project
 forgets to ignore them).
 

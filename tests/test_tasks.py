@@ -37,7 +37,9 @@ def test_create_assigns_sequential_ids_and_persists():
 
 def test_gitignore_written():
     tasks.create("x", "y")
-    assert (tasks._dir().parent / ".gitignore").read_text() == "*\n"
+    assert (tasks._dir().parent / ".gitignore").read_text() == (
+        "*\n!.gitignore\n!settings.json\n"
+    )
 
 
 # ─── status, owner, metadata merge ────────────────────────────────────────────

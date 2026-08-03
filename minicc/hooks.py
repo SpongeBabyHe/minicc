@@ -7,8 +7,8 @@ time, so it can enforce an invariant the model can't be trusted to (block writes
 protected path, run the linter after every edit, inject required context on each
 prompt). It's the hard-gate complement to the verify-work stance.
 
-Config lives in .minicc/settings.json (global + project, merged) under "hooks",
-using CC's exact schema so a Claude Code hook drops in unchanged:
+Config lives in user, project, and local settings under "hooks". Groups are
+concatenated in that source order, using CC's schema so a hook drops in unchanged:
 
     {
       "hooks": {

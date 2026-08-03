@@ -144,12 +144,15 @@ def test_is_gated_bash_readonly_carveout():
 
 @pytest.fixture()
 def _rules_env(tmp_path, monkeypatch):
-    """Isolated settings files + fresh rule cache; returns the project path."""
-    g, p = tmp_path / "global.json", tmp_path / "project" / "settings.json"
+    """Isolated settings files + fresh rule cache; returns the local path."""
+    g = tmp_path / "global.json"
+    p = tmp_path / "project" / "settings.json"
+    local = tmp_path / "project" / "settings.local.json"
     monkeypatch.setattr(config, "_global", lambda: g)
     monkeypatch.setattr(config, "_project", lambda: p)
+    monkeypatch.setattr(config, "_local", lambda: local)
     permissions.reset()
-    yield p
+    yield local
     permissions.reset()
 
 

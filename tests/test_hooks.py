@@ -276,29 +276,39 @@ def test_load_hooks_merges_global_and_project(tmp_path, monkeypatch):
 
     g = tmp_path / "global.json"
     p = tmp_path / "project.json"
+    local = tmp_path / "local.json"
     g.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo g")]}}))
     p.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo p")]}, "disableAllHooks": False}))
+    local.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo local")]}}))
     monkeypatch.setattr(config, "_global", lambda: g)
     monkeypatch.setattr(config, "_project", lambda: p)
+    monkeypatch.setattr(config, "_local", lambda: local)
 
     events, disabled = config.load_hooks()
     assert not disabled
-    assert len(events["PreToolUse"]) == 2  # concatenated, both fire
+    assert len(events["PreToolUse"]) == 3  # concatenated, all sources fire
 
 
-def test_load_hooks_disable_in_either_file(tmp_path, monkeypatch):
+def test_load_hooks_disable_uses_scalar_precedence(tmp_path, monkeypatch):
     import json as _json
     from minicc import config
 
     g = tmp_path / "global.json"
     p = tmp_path / "project.json"
-    g.write_text(_json.dumps({}))
-    p.write_text(_json.dumps({"disableAllHooks": True}))
+    local = tmp_path / "local.json"
+    g.write_text(_json.dumps({"disableAllHooks": True}))
+    p.write_text(_json.dumps({"disableAllHooks": False}))
+    local.write_text(_json.dumps({"disableAllHooks": True}))
     monkeypatch.setattr(config, "_global", lambda: g)
     monkeypatch.setattr(config, "_project", lambda: p)
+    monkeypatch.setattr(config, "_local", lambda: local)
 
     _events, disabled = config.load_hooks()
     assert disabled
+
+    local.write_text(_json.dumps({"disableAllHooks": False}))
+    _events, disabled = config.load_hooks()
+    assert not disabled
 
 
 # ─── wiring: PreCompact / PostCompact around manager.compact ────────────────

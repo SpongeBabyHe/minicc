@@ -39,7 +39,7 @@ friction. minicc now mirrors both mechanisms (`is_readonly_command`,
   CC's verbatim: `*` spans spaces; trailing `" *"` (alias `:*`) is a word
   boundary — `ls *` matches `ls -la` and bare `ls`, never `lsof`. The `always`
   prompt answer persists first-two-tokens + `" *"` per gated subcommand (max 5,
-  CC's cap) to project settings.
+  CC's cap) to local settings.
 - **Compound commands split on CC's operators** (`&& || ; | |& &`, newlines);
   every subcommand must independently qualify — `ls && rm x` prompts.
 - **Wrapper stripping** (CC's fixed set): `timeout/time/nice/nohup/stdbuf` +
@@ -50,8 +50,9 @@ friction. minicc now mirrors both mechanisms (`is_readonly_command`,
   can't tokenize simply *prompt as before*. A parsing gap can only produce a
   false PROMPT, never a false ALLOW.
 - Recorded divergences: allow rules only (CC adds ask/deny with deny→ask→allow
-  precedence); one project settings file (CC splits three); prefix derivation is
-  our heuristic (CC doesn't publish its dialog's).
+  precedence); source-aware user/project/local settings now exist, but workspace
+  Trust is not wired into startup yet; prefix derivation is our heuristic (CC
+  doesn't publish its dialog's).
 
 ## What layer is bash's scope at?
 
@@ -95,12 +96,12 @@ boundaries (the denylist still misses e.g. `rm -rf ~`).
   next message): …"). Never persisted; `reset()` clears it too.
 - **`'all'` at a prompt** — whole-tool, session only (in-memory; gone on
   restart / `/clear`).
-- **`allowed_tools` in `settings.json`** — whole-tool, hand-edited, persistent.
+- **`allowed_tools` in settings** — whole-tool, hand-edited, persistent.
   bash is excluded (`NO_PRELOAD`).
 - **`'always'` at a bash prompt** — a **narrow prefix rule** (`bash(uv run *)`),
-  persisted to project settings.
+  persisted to `.minicc/settings.local.json` at the repository root.
 
-The principle that governs all three:
+The principle that governs all four:
 
 > A mistake's cost = its permanence × its silence.
 

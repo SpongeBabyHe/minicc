@@ -52,10 +52,12 @@ target infrastructure minicc doesn't have.
 
 ## Configuration
 
-Hooks live in `.minicc/settings.json` — global (`~/.minicc/`) and project (`<cwd>/
-.minicc/`) are **merged**: for each event, both files' groups are concatenated and all
-fire (global first). This is CC's `settings.json` shape verbatim, so a hook written
-for Claude Code drops in unchanged — **except matchers use minicc's tool names**
+Hooks can live in user (`~/.minicc/settings.json`), shared project
+(`<cwd>/.minicc/settings.json`), and local project
+(`<repo-root>/.minicc/settings.local.json`) settings. For each event, all source
+groups are concatenated in that order and fire. This is CC's `settings.json` shape
+verbatim, so a hook written for Claude Code drops in unchanged — **except matchers
+use minicc's tool names**
 (`bash`, `write_file`, `edit_file`, `read_file`, `glob`, `grep`, `memory`,
 `web_fetch`, `task`, `todo_write`), not CC's `Bash`/`Edit`.
 
@@ -87,7 +89,7 @@ or a `|`/`,`-separated list → exact membership; anything else → an unanchore
 
 Hook config is read once per session and cached; it reloads at startup and on
 `/clear` (minicc has no config watcher — CC's `ConfigChange` is absent-infra). Edit
-`settings.json` mid-session and `/clear` to pick it up.
+a settings file mid-session and `/clear` to pick it up.
 
 ## I/O contract
 

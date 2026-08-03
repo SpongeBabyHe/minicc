@@ -16,7 +16,7 @@ versions route through the code-execution tool, which minicc doesn't have.
 
 Org-level note: if web search is disabled in the org's Console settings, ANY
 request that includes this tool 400s — set `"web_search": false` in
-.minicc/settings.json to drop it from the tool set.
+user, project, or local settings to drop it from the tool set.
 """
 
 # Cap searches per request. Official guidance: simple lookups use 1-3, research
