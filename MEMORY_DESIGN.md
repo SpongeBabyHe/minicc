@@ -70,7 +70,7 @@ a tight index; add a one-line pointer there when you create a topic file.
   fresh memory on demand via the memory tool instead).
 - **Gating** — writes (`create`/`str_replace`/`delete`) go through the permission
   prompt like `write_file`; **`view` is ungated** so the model can always read memory.
-  Command-aware gating lives in `permissions.py`.
+  Command-aware gating lives in `permissions/authorization.py`.
 - **Sub-agents** — memory is **not** in the read-only tool set, so a sub-agent's
   isolated context never reads or writes the main store.
 - **Steering** — a line in the system prompt tells the model to record durable

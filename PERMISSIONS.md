@@ -7,7 +7,7 @@ By default, minicc gates five tools before the model may run them: `bash`,
 restricts them. `write_file`/`edit_file` are gated but *bounded*: the prompt
 previews the exact path + diff. **bash is the hard case** — most of this document
 is about it; the last section covers how grants persist. Code:
-[`permissions.py`](minicc/permissions.py), [`tools/bash.py`](minicc/tools/bash.py).
+[`permissions/`](minicc/permissions/), [`tools/bash.py`](minicc/tools/bash.py).
 Primary parity references: [permissions](https://code.claude.com/docs/en/permissions),
 [hooks](https://code.claude.com/docs/en/hooks), and
 [security](https://code.claude.com/docs/en/security).
@@ -29,8 +29,8 @@ every mode", and persists `Bash(prefix *)` allow rules per project ("Yes, don't
 ask again"). The three-arm /init experiment measured the gap: 18 approval prompts
 on baseline minicc vs 0 on CC for the same exploration — and prompting on every
 `ls` suppresses exploration depth, making this a QUALITY problem, not just
-friction. minicc now mirrors both mechanisms (`is_readonly_command`,
-`_bash_allowed` in permissions.py):
+friction. minicc now mirrors both mechanisms (`is_readonly_command` and
+`command_is_allowed` in `permissions/bash.py`):
 
 - **The read-only list** (CC's, verbatim): `ls cat echo pwd head tail grep find
   wc which diff stat du` + `cd` *within the working directory* + read-only `git`

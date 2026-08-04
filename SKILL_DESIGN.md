@@ -203,7 +203,7 @@ listing) stay.
 `minicc/tools/skill.py` (the tool; CC-verbatim description),
 `minicc/reminders.py` (listing + claudeMd injection), `minicc/watch.py`
 (polling primitive), `minicc/sessions.py` (`meta` records),
-`minicc/permissions.py` (turn-scoped grants), `minicc/config.py`
+`minicc/permissions/authorization.py` (turn-scoped grants), `minicc/config.py`
 (`skill_shell_disabled`), `minicc/cli.py` (two-message expansion, `/help`,
 injection point), `tests/test_skills.py`, `tests/test_reminders.py`,
 `tests/test_sessions.py`.

@@ -28,7 +28,7 @@ The "agent" and "task" words each map to ONE concept — keep them separated:
 | `context_management/` | budgets, eviction, summary, compaction orchestration + per-conversation `ContextState` | `services/compact/` |
 | `config.py` | source-preserving settings discovery and Trust-filtered views | settings scopes |
 | `trust.py` + `workspace.py` | canonical workspace identity and persisted Trust decisions | project trust |
-| `permissions.py` | tool authorization (`deny → ask → allow`) and approval lifetimes | permissions |
+| `permissions/` | source-aware rules, Bash analysis, authorization, and approval lifetimes | permissions |
 
 **Reserved** (map to real future CC components — don't repurpose):
 `runner.py` = the process/session spawner (CC `sessionRunner`; future
