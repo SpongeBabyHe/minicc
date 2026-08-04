@@ -1,6 +1,15 @@
+"""Source-aware authorization for local tool calls.
+
+Settings rules resolve in ``deny -> ask -> allow`` order before built-in,
+session, Skill, or Hook grants. Bash receives additional command parsing so a
+compound call is silent only when every subcommand is read-only or explicitly
+allowed. This module decides whether a call may run; it does not sandbox the
+handler after approval.
+"""
+
 # Trust model for minicc:
-#   - Reads (read_file, glob, grep) are not gated. The model can see anything
-#     this process can see. Don't run minicc on machines with other people's data.
+#   - Reads (read_file, glob, grep) are free by default, but settings ask/deny
+#     rules can restrict them. The process itself still has the user's OS access.
 #   - Writes (write_file, edit_file) are gated regardless of whether they
 #     create or overwrite — the tool can't tell the difference in advance.
 #   - memory: writes (create/str_replace) are gated like write_file; `memory view`
@@ -16,14 +25,20 @@
 # Full trust model + permission-layer vs execution-layer analysis: PERMISSIONS.md
 
 
+import fnmatch
+import os
 import re
 import shlex
 import sys
-from pathlib import Path
+import urllib.parse
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import cache
+from pathlib import Path, PurePosixPath
 from minicc import config, ux
 
-# Gated tools: these require user approval before use. Single source of truth for
-# "which tools gate" — both confirm() and preload() key off it.
+# Gated tools require user approval unless policy or a scoped grant allows them.
+# Both authorize() and preload() key off this list.
 # web_fetch gates for the same reason bash does: a network request's effect is
 # unknown in advance, and under prompt injection a crafted URL is a data-
 # exfiltration channel (secrets in query params). The user sees each URL.
@@ -34,13 +49,44 @@ GATED_TOOLS = ["bash", "write_file", "edit_file", "memory", "web_fetch"]
 # model can always check memory.) Tools not listed gate every call.
 _GATED_COMMANDS = {"memory": {"create", "str_replace", "delete"}}
 
-# Gated tools that may NOT be pre-approved from config (preload). bash's effect is
-# unbounded + irreversible and the gate is its ONLY boundary, so trusting it must
-# stay a per-session decision, never a persistent settings entry. See PERMISSIONS.md.
+# Gated tools that legacy whole-tool ``allowed_tools`` may not pre-approve.
+# Persistent Bash grants must use a narrow ``permissions.allow`` command rule.
 NO_PRELOAD = {"bash"}
 
 # session-scoped allowed tools if user answers "all" to the prompt
 _ALLOWED = set()
+
+
+class PermissionEffect(str, Enum):
+    """The three CC permission-rule outcomes, in precedence order."""
+
+    DENY = "deny"
+    ASK = "ask"
+    ALLOW = "allow"
+
+
+@dataclass(frozen=True)
+class PermissionRule:
+    """One parsed settings rule with the source needed for correct resolution."""
+
+    effect: PermissionEffect
+    raw: str
+    tool_pattern: str
+    argument_pattern: str | None
+    source: config.SettingsSource
+    compiled: re.Pattern | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def anchor(self) -> Path:
+        return self.source.anchor
+
+
+@dataclass(frozen=True)
+class AuthorizationResult:
+    """Final decision for one tool call after policy and optional user review."""
+
+    allowed: bool
+    reason: str | None = None
 
 
 # ─── Read-only bash carve-out (CC parity) ────────────────────────────────────
@@ -53,8 +99,19 @@ _ALLOWED = set()
 # baseline vs 0 on CC — and prompting on every `ls` suppresses exploration.
 
 _READONLY_CMDS = {
-    "ls", "cat", "echo", "pwd", "head", "tail", "grep", "find", "wc",
-    "which", "diff", "stat", "du",
+    "ls",
+    "cat",
+    "echo",
+    "pwd",
+    "head",
+    "tail",
+    "grep",
+    "find",
+    "wc",
+    "which",
+    "diff",
+    "stat",
+    "du",
 }
 # git subcommands whose every form is read-only. Deliberately EXCLUDES branch/tag/
 # remote/stash/reflog (each has mutating forms — branch -D, stash pop, reflog expire).
@@ -63,25 +120,64 @@ _GIT_READONLY = {
     "rev-parse", "ls-files", "ls-tree", "cat-file", "check-ignore",
 }
 # process wrappers CC strips before matching (timeout 30 npm test → npm test)
-_WRAPPERS = {"timeout", "time", "nice", "nohup", "stdbuf"}
+_WRAPPERS = {
+    "timeout", "time", "nice", "nohup", "stdbuf", "command", "builtin", "noglob",
+}
 _OPERATORS = {"&&", "||", ";", "|", "|&", "&", ";;"}
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.S)
+_FIND_MUTATING_FLAGS = {
+    "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0",
+    "-fprintf", "-fprintf0", "-ok", "-okdir",
+}
+_NON_AUTOAPPROVABLE_WRAPPERS = {"flock", "ionice", "setsid", "watch"}
 # metacharacters that can smuggle a write or an exec past the whitelist:
 # redirections (git log > f), command/process substitution (cat $(rm x), <(...)),
 # backticks. Rejection only means: prompt as before.
 _UNSAFE_META = re.compile(r">|<|\$\(|`")
+_HIDDEN_EXEC_META = re.compile(r"\$\(|`|[<>]\(")
 # ...except the two ubiquitous HARMLESS redirect forms: fd duplication (2>&1) and
 # the /dev/null sink. Dogfood R2: leaving these in the unsafe set false-prompted
 # ordinary exploration AND suppressed the `always` offer. Stripped before the
 # guard; any other redirect (`> file`, `2>err.log`) still disqualifies.
-_SAFE_REDIRECTS = re.compile(r"\d*>&\d+|[&\d]*>\s*/dev/null")
+_SAFE_REDIRECTS = re.compile(
+    r"(?:\d*>&\d+|[&\d]*>\s*/dev/null)(?=$|\s|[;&|])"
+)
+
+
+def _separate_unquoted_newlines(command: str) -> str:
+    """Turn shell newlines into separators while preserving quoted newlines."""
+    chars: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in command:
+        if escaped:
+            chars.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            chars.append(char)
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            chars.append(char)
+            continue
+        # Keep a real newline before the separator so shlex ends any ``#``
+        # comment there instead of swallowing the following command.
+        chars.append("\n;\n" if char == "\n" and quote is None else char)
+    return "".join(chars)
 
 
 def _split_subcommands(command: str):
     """Split a command into subcommand token groups on CC's operators, or None if
     it can't be safely bounded (newlines, redirections, substitutions, subshells,
     or anything shlex can't tokenize → the caller just prompts, as always)."""
-    if not command or "\n" in command:
+    if not command:
         return None
+    command = _separate_unquoted_newlines(command)
     command = _SAFE_REDIRECTS.sub(" ", command)
     if _UNSAFE_META.search(command):
         return None
@@ -96,7 +192,7 @@ def _split_subcommands(command: str):
         if t in _OPERATORS:
             groups.append(cur)
             cur = []
-        elif t in ("(", ")"):
+        elif t in ("(", ")", "{", "}"):
             return None  # subshells: out of scope, prompt
         else:
             cur.append(t)
@@ -104,14 +200,136 @@ def _split_subcommands(command: str):
     return groups
 
 
-def _strip_wrappers(toks: list) -> list:
+def _split_restrictive_subcommands(command: str):
+    """Best-effort split used only by deny/ask rules on otherwise unsafe shell."""
+    if not command:
+        return None
+    try:
+        lex = shlex.shlex(
+            _separate_unquoted_newlines(command),
+            posix=True,
+            punctuation_chars=True,
+        )
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return None
+    groups, current = [], []
+    for token in toks:
+        if token in _OPERATORS:
+            groups.append(current)
+            current = []
+        elif token in ("(", ")", "{", "}"):
+            return None
+        else:
+            current.append(token)
+    groups.append(current)
+    return groups
+
+
+def _strip_wrappers(toks: list, *, restrictive: bool = False) -> list:
+    """Strip CC's exec wrappers; restrictive rules also see through safe options."""
+    original = list(toks)
     while toks and toks[0] in _WRAPPERS:
-        toks.pop(0)
-        # drop the wrapper's own flags/duration (timeout -k 5 10s CMD)
-        while toks and (toks[0].startswith("-") or re.fullmatch(r"\d+[smhd]?", toks[0])):
+        wrapper = toks.pop(0)
+        if wrapper == "timeout":
+            while toks and toks[0].startswith("-"):
+                option = toks.pop(0)
+                if option == "--":
+                    break
+                if option in (
+                    "--foreground",
+                    "--preserve-status",
+                    "--verbose",
+                    "-v",
+                ):
+                    continue
+                if option in ("--kill-after", "--signal", "-k", "-s"):
+                    if not toks:
+                        return original
+                    toks.pop(0)
+                    continue
+                if re.fullmatch(
+                    r"(?:--kill-after|--signal)=.+|-[ks].+",
+                    option,
+                ):
+                    continue
+                return original
+            if not toks or not re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", toks[0]):
+                return original
             toks.pop(0)
+        elif wrapper == "time":
+            while toks and toks[0].startswith("-"):
+                option = toks.pop(0)
+                if option == "--":
+                    break
+                if option in ("-p", "--portability"):
+                    continue
+                if restrictive and option in (
+                    "-a",
+                    "--append",
+                    "-v",
+                    "--verbose",
+                    "--quiet",
+                ):
+                    continue
+                if restrictive and option in (
+                    "-f",
+                    "--format",
+                    "-o",
+                    "--output",
+                ):
+                    if not toks:
+                        return original
+                    toks.pop(0)
+                    continue
+                if restrictive and re.fullmatch(
+                    r"(?:--format|--output)=.+|-[fo].+",
+                    option,
+                ):
+                    continue
+                return original
+        elif wrapper == "nice":
+            if len(toks) >= 2 and toks[0] in ("-n", "--adjustment"):
+                if not re.fullmatch(r"[+-]?\d+", toks[1]):
+                    return original
+                del toks[:2]
+            elif toks and re.fullmatch(r"(?:-n|--adjustment=)[+-]?\d+", toks[0]):
+                toks.pop(0)
+            elif toks and re.fullmatch(r"-\d+", toks[0]):
+                toks.pop(0)
+            elif toks and toks[0].startswith("-"):
+                return original
+        elif wrapper == "stdbuf":
+            while toks and toks[0].startswith("-"):
+                option = toks.pop(0)
+                if option in ("-i", "-o", "-e"):
+                    if not toks:
+                        return original
+                    toks.pop(0)
+                elif not re.fullmatch(r"-(?:i|o|e).+|--(?:input|output|error)=.+", option):
+                    return original
+        elif wrapper == "command":
+            if toks and toks[0] in ("-v", "-V"):
+                return original
+            if toks and toks[0] in ("-p", "--"):
+                toks.pop(0)
+        elif wrapper in ("builtin", "nohup"):
+            if toks and toks[0] == "--":
+                toks.pop(0)
+            elif toks and toks[0].startswith("-"):
+                return original
+        # noglob has no wrapper arguments.
+        if not toks:
+            return original
     # bare xargs only (xargs -n1 ... is matched as xargs itself, per CC)
     if len(toks) > 1 and toks[0] == "xargs" and not toks[1].startswith("-"):
+        toks.pop(0)
+    return toks
+
+
+def _strip_env_assignments(toks: list) -> list:
+    while toks and _ENV_ASSIGNMENT.fullmatch(toks[0]):
         toks.pop(0)
     return toks
 
@@ -140,36 +358,105 @@ def _subcommand_is_readonly(toks: list) -> bool:
         )
     if cmd == "find":
         # find is read-only EXCEPT its exec/mutate flags (CC prompts for these too)
-        banned = {"-exec", "-execdir", "-ok",
-                  "-okdir", "-delete", "-fprint", "-fls"}
-        return not banned.intersection(toks)
+        return not _FIND_MUTATING_FLAGS.intersection(toks)
     return cmd in _READONLY_CMDS
+
+
+def _mixes_cd_and_git(groups: list[list]) -> bool:
+    has_git = False
+    changes_directory = False
+    cwd = Path.cwd().resolve()
+    for group in groups:
+        tokens = _strip_wrappers(list(group))
+        if not tokens or "=" in tokens[0]:
+            continue
+        if tokens[0] == "git":
+            has_git = True
+        elif tokens[0] == "cd" and len(tokens) == 2:
+            target = Path(tokens[1]).expanduser()
+            if not target.is_absolute():
+                target = cwd / target
+            try:
+                changes_directory = changes_directory or target.resolve() != cwd
+            except OSError:
+                changes_directory = True
+    return has_git and changes_directory
 
 
 def is_readonly_command(command: str) -> bool:
     """True if every subcommand of `command` is in the read-only carve-out, so the
     call may skip the permission prompt."""
     groups = _split_subcommands(command)
-    return groups is not None and all(_subcommand_is_readonly(g) for g in groups)
+    return (
+        groups is not None
+        and not _mixes_cd_and_git(groups)
+        and all(_subcommand_is_readonly(group) for group in groups)
+    )
 
 
-# ─── Persisted allow rules (CC's permission rules, bash subset) ──────────────
-# CC: `Bash(npm test *)` in permissions.allow auto-approves matching commands;
-# "Yes, don't ask again" persists such a rule per project + command prefix. The
-# wildcard semantics are CC's, verbatim: `*` matches any sequence including
-# spaces; a trailing " *" (or its ":*" alias) enforces a word boundary — `ls *`
-# matches `ls -la` and bare `ls` but not `lsof`; `ls*` matches both. Wrappers are
-# stripped before matching, and a compound command qualifies only if EVERY
-# subcommand is read-only or rule-matched.
+# ─── Source-aware permission rules ──────────────────────────────────────────
 
-_RULES: list | None = None  # [(pattern, compiled)] — lazy; reset() reloads
+_RULE_SYNTAX = re.compile(r"^([A-Za-z_][A-Za-z0-9_*]*)(?:\((.*)\))?$", re.S)
+_PARAMETER_PATTERN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", re.S)
+_TOOL_ALIASES = {
+    "agent": "agent",
+    "bash": "bash",
+    "edit": "edit",
+    "edit_file": "edit_file",
+    "glob": "glob",
+    "grep": "grep",
+    "memory": "memory",
+    "read": "read",
+    "read_file": "read_file",
+    "skill": "skill",
+    "taskcreate": "task_create",
+    "taskget": "task_get",
+    "tasklist": "task_list",
+    "taskupdate": "task_update",
+    "webfetch": "web_fetch",
+    "web_fetch": "web_fetch",
+    "websearch": "web_search",
+    "web_search": "web_search",
+    "write": "write_file",
+    "write_file": "write_file",
+}
+_READ_TOOLS = frozenset({"read_file", "glob", "grep"})
+_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
+_READ_DENY_EDIT_TOOLS = frozenset({"edit_file"})
+_SERVER_TOOLS = frozenset({"web_search"})
+_PATH_INPUTS = {
+    "edit_file": "path",
+    "grep": "path",
+    "read_file": "path",
+    "write_file": "path",
+}
+_PRIMARY_INPUTS = {
+    "agent": "subagent_type",
+    "glob": "pattern",
+    "memory": "path",
+    "skill": "skill",
+}
+_PRIMARY_CONTENT_FIELDS = {
+    "agent": frozenset({"prompt"}),
+    "bash": frozenset({"command"}),
+    "edit_file": frozenset({"path"}),
+    "glob": frozenset({"pattern"}),
+    "grep": frozenset({"path"}),
+    "read_file": frozenset({"path"}),
+    "skill": frozenset({"skill"}),
+    "web_fetch": frozenset({"url"}),
+    "write_file": frozenset({"path"}),
+}
+
+_SETTINGS_RULES: list[PermissionRule] | None = None
+_SETTINGS_RULES_VIEW: config.SettingsView | None = None
 
 # Grants from an invoked skill's allowed-tools frontmatter. Active until the
 # next user prompt (CC scopes grants to "while the skill is active"; its
 # disallowed-tools doc pins that window: "clears when you send your next
 # message"). bash(...) entries become temporary allow rules; bare names ungate
 # that tool outright. Never persisted. See SKILL_DESIGN.md.
-_SKILL_RULES: list = []  # [(pattern, compiled)]
+_SKILL_RULES: list[tuple[str, re.Pattern]] = []
 _SKILL_TOOLS: set = set()  # lowercase tool names
 
 
@@ -186,28 +473,327 @@ def _compile_rule(pattern: str):
     return re.compile(f"^{_glob_to_re(pattern)}$")
 
 
-def _rules() -> list:
-    global _RULES
-    if _RULES is None:
-        _RULES = [(p, _compile_rule(p))
-                  for p in config.permission_allow_rules()]
-    return _RULES
+def _normalize_tool_name(name: str) -> str | None:
+    normalized = name.casefold()
+    if normalized == "*":
+        return "*"
+    if "*" in normalized:
+        return normalized
+    return _TOOL_ALIASES.get(normalized)
+
+
+def _parse_rule(
+    entry: config.SettingsEntry,
+    effect: PermissionEffect,
+) -> PermissionRule | None:
+    raw = str(entry.value).strip()
+    match = _RULE_SYNTAX.fullmatch(raw)
+    if not match:
+        return None
+    tool_pattern = _normalize_tool_name(match.group(1))
+    if tool_pattern is None:
+        return None
+    if effect == PermissionEffect.ALLOW and "*" in tool_pattern:
+        return None
+    argument_pattern = match.group(2)
+    compiled = (
+        _compile_rule(argument_pattern)
+        if tool_pattern == "bash" and argument_pattern is not None
+        else None
+    )
+    return PermissionRule(
+        effect=effect,
+        raw=raw,
+        tool_pattern=tool_pattern,
+        argument_pattern=argument_pattern,
+        source=entry.source,
+        compiled=compiled,
+    )
+
+
+def permission_rules() -> list[PermissionRule]:
+    """Compile effective rules while retaining source and path anchor.
+
+    Project ``deny`` and ``ask`` rules remain effective in a restricted
+    workspace because they only reduce authority. Project ``allow`` rules enter
+    through the active view only after Workspace Trust.
+    """
+    global _SETTINGS_RULES, _SETTINGS_RULES_VIEW
+    view = config.current_settings()
+    if _SETTINGS_RULES is None or _SETTINGS_RULES_VIEW is not view:
+        rules: list[PermissionRule] = []
+        for effect in (PermissionEffect.DENY, PermissionEffect.ASK):
+            for entry in view.snapshot.entries(("permissions", effect.value)):
+                if rule := _parse_rule(entry, effect):
+                    rules.append(rule)
+        for entry in view.entries(("permissions", PermissionEffect.ALLOW.value)):
+            if rule := _parse_rule(entry, PermissionEffect.ALLOW):
+                rules.append(rule)
+        _SETTINGS_RULES = rules
+        _SETTINGS_RULES_VIEW = view
+    return _SETTINGS_RULES
+
+
+def _tool_matches(rule: PermissionRule, tool_name: str) -> bool:
+    if rule.tool_pattern == "read":
+        covered = _READ_TOOLS
+        if rule.effect == PermissionEffect.DENY:
+            covered = covered | _READ_DENY_EDIT_TOOLS
+        return tool_name in covered
+    if rule.tool_pattern == "edit":
+        return tool_name in _EDIT_TOOLS
+    return fnmatch.fnmatchcase(tool_name, rule.tool_pattern)
+
+
+def _path_pattern(rule: PermissionRule) -> str:
+    pattern = rule.argument_pattern or ""
+    if pattern.startswith("//"):
+        return os.path.normpath("/" + pattern[2:])
+    if pattern.startswith("~/"):
+        return os.path.normpath(str(Path.home() / pattern[2:]))
+    if pattern.startswith("/"):
+        return os.path.normpath(str(rule.anchor / pattern[1:]))
+    if pattern.startswith("./"):
+        pattern = pattern[2:]
+    elif "/" not in pattern:
+        pattern = f"**/{pattern}"
+    elif (
+        rule.effect != PermissionEffect.ALLOW
+        and re.fullmatch(r"[^/]+/\*\*", pattern)
+    ):
+        pattern = f"**/{pattern}"
+    working_dir = config.current_settings().snapshot.start_dir
+    return os.path.normpath(str(working_dir / pattern))
+
+
+def _path_glob_matches(path: str, pattern: str) -> bool:
+    """Match a path glob where ``*`` stays within one directory and ``**`` recurses."""
+    path_parts = PurePosixPath(path).parts
+    pattern_parts = PurePosixPath(pattern).parts
+
+    @cache
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts)
+                and match(path_index + 1, pattern_index)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], part)
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
+
+
+def _domain_matches(host: str, pattern: str) -> bool:
+    """Match CC WebFetch domains without letting ``*`` cross a dot."""
+    host = host.casefold().rstrip(".")
+    pattern = pattern.casefold().rstrip(".")
+    if pattern == "*":
+        return bool(host)
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        return bool(suffix) and host.endswith("." + suffix)
+    host_parts = host.split(".")
+    pattern_parts = pattern.split(".")
+    return len(host_parts) == len(pattern_parts) and all(
+        fnmatch.fnmatchcase(host_part, pattern_part)
+        for host_part, pattern_part in zip(host_parts, pattern_parts)
+    )
+
+
+def _url_host(url: object) -> str:
+    try:
+        return urllib.parse.urlparse(str(url)).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _parameter_rule_matches(
+    rule: PermissionRule,
+    tool_name: str,
+    tool_input: dict,
+) -> bool | None:
+    """Match restrictive ``param:value`` syntax, or return None if not applicable."""
+    pattern = rule.argument_pattern
+    if rule.effect == PermissionEffect.ALLOW or pattern is None:
+        return None
+    parameter_match = _PARAMETER_PATTERN.fullmatch(pattern)
+    if parameter_match is None:
+        return None
+    field_name, expected = parameter_match.groups()
+    if field_name in _PRIMARY_CONTENT_FIELDS.get(tool_name, ()):
+        return None
+    if tool_name == "bash" and field_name not in {"timeout"}:
+        return None
+    value = tool_input.get(field_name)
+    if value is None or isinstance(value, (dict, list)):
+        return False
+    actual = str(value).lower() if isinstance(value, bool) else str(value)
+    return fnmatch.fnmatchcase(actual, expected)
+
+
+def _argument_matches(
+    rule: PermissionRule,
+    tool_name: str,
+    tool_input: dict,
+) -> bool:
+    pattern = rule.argument_pattern
+    if pattern is None:
+        return True
+    if tool_name == "web_fetch" and pattern.startswith("domain:"):
+        return _domain_matches(_url_host(tool_input.get("url", "")), pattern[7:])
+    if tool_name in _PATH_INPUTS:
+        raw_path = str(tool_input.get(_PATH_INPUTS[tool_name], ""))
+        target = Path(raw_path).expanduser()
+        if not target.is_absolute():
+            target = config.current_settings().snapshot.start_dir / target
+        lexical_path = os.path.abspath(str(target))
+        resolved_path = os.path.realpath(target)
+        path_pattern = _path_pattern(rule)
+        matches = {
+            _path_glob_matches(path, path_pattern)
+            for path in (lexical_path, resolved_path)
+        }
+        if rule.effect == PermissionEffect.ALLOW:
+            return matches == {True}
+        return True in matches
+    parameter_result = _parameter_rule_matches(rule, tool_name, tool_input)
+    if parameter_result is not None:
+        return parameter_result
+    field_name = _PRIMARY_INPUTS.get(tool_name)
+    if field_name is None:
+        return False
+    value = str(tool_input.get(field_name, ""))
+    if tool_name == "skill":
+        args = str(tool_input.get("args", "")).strip()
+        if args:
+            value = f"{value} {args}"
+    if tool_name in {"agent", "skill"}:
+        return fnmatch.fnmatchcase(value.casefold(), pattern.casefold())
+    return fnmatch.fnmatchcase(value, pattern)
+
+
+def _rule_matches_call(
+    rule: PermissionRule,
+    tool_name: str,
+    tool_input: dict,
+) -> bool:
+    if not _tool_matches(rule, tool_name):
+        return False
+    if (
+        rule.argument_pattern is not None
+        and rule.tool_pattern in {"glob", "grep", "write_file"}
+    ):
+        parameter_result = _parameter_rule_matches(rule, tool_name, tool_input)
+        if parameter_result is not None:
+            return parameter_result
+        return False
+    if tool_name == "bash":
+        parameter_result = _parameter_rule_matches(rule, tool_name, tool_input)
+        if parameter_result is not None:
+            return parameter_result
+    if tool_name != "bash" or rule.argument_pattern is None:
+        return _argument_matches(rule, tool_name, tool_input)
+    groups = _split_subcommands(str(tool_input.get("command", "")))
+    if groups is None:
+        if rule.effect == PermissionEffect.ALLOW:
+            return False
+        command = str(tool_input.get("command", ""))
+        if _HIDDEN_EXEC_META.search(command):
+            return True
+        groups = _split_restrictive_subcommands(command)
+        if groups is None:
+            return True
+    return any(_bash_rule_matches_group(rule, group) for group in groups)
+
+
+def _bash_rule_matches_group(rule: PermissionRule, tokens: list) -> bool:
+    if rule.argument_pattern is None:
+        return True
+    tokens = _strip_wrappers(
+        list(tokens),
+        restrictive=rule.effect != PermissionEffect.ALLOW,
+    )
+    if rule.effect != PermissionEffect.ALLOW:
+        tokens = _strip_env_assignments(tokens)
+    command = " ".join(tokens)
+    return bool(command and rule.compiled and rule.compiled.match(command))
+
+
+def _matching_rule(
+    effect: PermissionEffect,
+    tool_name: str,
+    tool_input: dict,
+) -> PermissionRule | None:
+    return next(
+        (
+            rule
+            for rule in permission_rules()
+            if rule.effect == effect and _rule_matches_call(rule, tool_name, tool_input)
+        ),
+        None,
+    )
+
+
+def _allow_pattern_matches(
+    pattern: str,
+    compiled: re.Pattern,
+    tokens: list,
+) -> bool:
+    command = " ".join(tokens)
+    if not command:
+        return False
+    if tokens[0] == "find" and _FIND_MUTATING_FLAGS.intersection(tokens):
+        return "*" not in pattern and bool(compiled.match(command))
+    if tokens[0] in _NON_AUTOAPPROVABLE_WRAPPERS and "*" in pattern:
+        return False
+    return bool(compiled.match(command))
 
 
 def _subcommand_matches_rule(toks: list) -> bool:
     toks = _strip_wrappers(list(toks))
     if not toks or "=" in toks[0]:
         return False
-    cmd = " ".join(toks)
-    return any(rx.match(cmd) for _p, rx in [*_rules(), *_SKILL_RULES])
+    setting_rules = (
+        rule
+        for rule in permission_rules()
+        if rule.effect == PermissionEffect.ALLOW
+        and rule.tool_pattern == "bash"
+        and rule.argument_pattern is not None
+    )
+    return any(
+        rule.compiled
+        and _allow_pattern_matches(rule.argument_pattern or "", rule.compiled, toks)
+        for rule in setting_rules
+    ) or any(
+        _allow_pattern_matches(pattern, regex, toks)
+        for pattern, regex in _SKILL_RULES
+    )
 
 
 def _bash_allowed(command: str) -> bool:
     """Whether a bash call skips the prompt: every subcommand is read-only
     (built-in carve-out) or matches a persisted allow rule."""
+    if any(
+        rule.effect == PermissionEffect.ALLOW
+        and rule.tool_pattern == "bash"
+        and (
+            rule.argument_pattern is None
+            or rule.argument_pattern.strip() == "*"
+        )
+        for rule in permission_rules()
+    ):
+        return True
     groups = _split_subcommands(command)
-    return groups is not None and all(
-        _subcommand_is_readonly(g) or _subcommand_matches_rule(g) for g in groups
+    return groups is not None and not _mixes_cd_and_git(groups) and all(
+        _subcommand_is_readonly(group) or _subcommand_matches_rule(group)
+        for group in groups
     )
 
 
@@ -233,22 +819,83 @@ def derive_rules(command: str) -> list:
     return rules[:5]  # CC caps rules saved per compound command at 5
 
 
-def _is_gated(tool_name: str, tool_input: dict) -> bool:
-    """Whether THIS call needs approval. A tool gates iff its name is in GATED_TOOLS;
-    a multi-command tool in _GATED_COMMANDS gates only those commands (so `memory
-    view` is free while `memory create`/`str_replace` prompt); bash skips the gate
-    for read-only commands and persisted allow rules (CC's carve-outs)."""
+def _requires_prompt_by_default(tool_name: str, tool_input: dict) -> bool:
     if tool_name not in GATED_TOOLS:
-        return False
-    if tool_name in _SKILL_TOOLS:
-        # granted by an active skill's allowed-tools (until next prompt)
-        return False
-    if tool_name == "bash" and _bash_allowed(tool_input.get("command", "")):
         return False
     gated_cmds = _GATED_COMMANDS.get(tool_name)
     if gated_cmds is not None:
         return tool_input.get("command") in gated_cmds
     return True
+
+
+def _auto_allowed(tool_name: str, tool_input: dict, hook_allow: bool = False) -> bool:
+    if hook_allow or tool_name in _ALLOWED or tool_name in _SKILL_TOOLS:
+        return True
+    if tool_name == "bash":
+        return _bash_allowed(str(tool_input.get("command", "")))
+    if _matching_rule(PermissionEffect.ALLOW, tool_name, tool_input):
+        return True
+    return not _requires_prompt_by_default(tool_name, tool_input)
+
+
+def _is_gated(tool_name: str, tool_input: dict) -> bool:
+    """Compatibility query: whether this call is not currently auto-authorized.
+
+    A policy denial also returns true: callers using this helper are asking
+    whether the call may proceed silently, not whether a prompt will definitely
+    be shown.
+    """
+    if _matching_rule(PermissionEffect.DENY, tool_name, tool_input):
+        return True
+    if _matching_rule(PermissionEffect.ASK, tool_name, tool_input):
+        return True
+    return not _auto_allowed(tool_name, tool_input)
+
+
+def _matches_all_uses(rule: PermissionRule) -> bool:
+    if rule.argument_pattern is None:
+        return True
+    if rule.tool_pattern == "bash" and rule.argument_pattern.strip() == "*":
+        return True
+    return (
+        rule.tool_pattern == "web_fetch"
+        and rule.argument_pattern.casefold().strip() == "domain:*"
+    )
+
+
+def filter_tools(tools: list[dict]) -> list[dict]:
+    """Remove tools disabled for every call before advertising them.
+
+    ``web_search`` executes inside the Messages API, so minicc cannot pause at
+    its individual invocation. Any ``deny`` or ``ask`` rule for that server tool
+    therefore fails closed by hiding it instead of bypassing scoped policy.
+    """
+    rules = permission_rules()
+    blocking = [rule for rule in rules if _matches_all_uses(rule)]
+    filtered = [
+        tool
+        for tool in tools
+        if not any(
+            _tool_matches(rule, tool["name"])
+            and (
+                rule.effect == PermissionEffect.DENY
+                or (
+                    rule.effect == PermissionEffect.ASK
+                    and tool["name"] in _SERVER_TOOLS
+                )
+            )
+            for rule in blocking
+        )
+        and not (
+            tool["name"] in _SERVER_TOOLS
+            and any(
+                rule.effect in (PermissionEffect.DENY, PermissionEffect.ASK)
+                and _tool_matches(rule, tool["name"])
+                for rule in rules
+            )
+        )
+    ]
+    return tools if len(filtered) == len(tools) else filtered
 
 
 def _format_args(tool_name: str, tool_input: dict) -> str:
@@ -314,39 +961,94 @@ def _read_answer(prompt: str) -> str:
                style=ux.S_INFO)
 
 
-def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
-    """Whether this tool call may run. `force` (a PreToolUse hook's "ask") prompts
-    even for a normally-free tool and ignores the session allowlist — the hook is
-    explicitly asking the user to confirm this specific call.
-
-    For bash, `always` persists a narrow prefix rule per subcommand (CC's "Yes,
-    don't ask again") to local settings — future matching commands skip the
-    prompt. Offered only when the command can be safely bounded into rules."""
-    if not force:
-        if not _is_gated(tool_name, tool_input):
-            return True
-        if tool_name in _ALLOWED:
-            return True
+def _prompt(
+    tool_name: str,
+    tool_input: dict,
+    *,
+    one_time_only: bool,
+    requested_by: str | None = None,
+) -> bool:
     ux.say(_format_args(tool_name, tool_input))
-    save_rules = derive_rules(tool_input.get(
-        "command", "")) if tool_name == "bash" else []
-    options = "[yes/no/all]"
-    if save_rules:
+    save_rules = (
+        derive_rules(str(tool_input.get("command", "")))
+        if (
+            tool_name == "bash"
+            and not one_time_only
+            and config.current_settings().trusted
+        )
+        else []
+    )
+    options = "[yes/no]" if one_time_only else "[yes/no/all]"
+    if save_rules and not one_time_only:
         ux.say(
             f"always = don't ask again for: {', '.join(save_rules)}  (saved to local settings)",
             style=ux.S_INFO,
         )
         options = "[yes/no/all/always]"
-    answer = _read_answer(f"Approve? {options}: ")
-    if answer == "all":
+    source = f" ({requested_by})" if requested_by else ""
+    answer = _read_answer(f"Approve{source}? {options}: ")
+    if answer == "all" and not one_time_only:
         _ALLOWED.add(tool_name)
         return True
     if answer == "always" and save_rules:
         for rule in save_rules:
             config.add_allow_rule(rule)
-            _rules().append((rule, _compile_rule(rule)))  # live for this session too
         return True
     return answer == "yes"
+
+
+def _rule_reason(rule: PermissionRule) -> str:
+    return (
+        f"Denied by {rule.source.scope.value} permission rule {rule.raw!r} "
+        f"from {str(rule.source.path)!r}."
+    )
+
+
+def _ask_source(rule: PermissionRule) -> str:
+    return (
+        f"{rule.source.scope.value} permission rule {rule.raw!r} "
+        f"from {str(rule.source.path)!r}"
+    )
+
+
+def authorize(
+    tool_name: str,
+    tool_input: dict,
+    *,
+    hook_allow: bool = False,
+    hook_ask: bool = False,
+) -> AuthorizationResult:
+    """Resolve one call with ``deny -> ask -> allow`` precedence.
+
+    Hook and Skill grants can pre-approve a call, but neither can bypass a
+    matching settings ``deny`` or ``ask`` rule. A forced prompt is deliberately
+    one-shot: session-wide and persistent choices would not override the rule on
+    the next call and would therefore be misleading.
+    """
+    denied = _matching_rule(PermissionEffect.DENY, tool_name, tool_input)
+    if denied:
+        return AuthorizationResult(False, _rule_reason(denied))
+
+    ask_rule = _matching_rule(PermissionEffect.ASK, tool_name, tool_input)
+    must_ask = hook_ask or ask_rule is not None
+    if not must_ask and _auto_allowed(tool_name, tool_input, hook_allow):
+        return AuthorizationResult(True)
+    requested_by = _ask_source(ask_rule) if ask_rule else None
+    if hook_ask and requested_by is None:
+        requested_by = "PreToolUse hook"
+    if _prompt(
+        tool_name,
+        tool_input,
+        one_time_only=must_ask,
+        requested_by=requested_by,
+    ):
+        return AuthorizationResult(True)
+    return AuthorizationResult(False, f"User declined to run {tool_name}.")
+
+
+def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
+    """Compatibility wrapper around :func:`authorize`."""
+    return authorize(tool_name, tool_input, hook_ask=force).allowed
 
 
 _SKILL_BASH_RULE = re.compile(r"(?is)^bash\((.+)\)$")
@@ -365,7 +1067,15 @@ def grant_skill_tools(entries: list):
             pat = m.group(1).strip()
             _SKILL_RULES.append((pat, _compile_rule(pat)))
         elif e:
-            _SKILL_TOOLS.add(e.lower())
+            if tool_name := _normalize_tool_name(e):
+                if tool_name == "read":
+                    _SKILL_TOOLS.update(_READ_TOOLS)
+                elif tool_name == "edit":
+                    _SKILL_TOOLS.update(_EDIT_TOOLS)
+                elif tool_name == "*":
+                    _SKILL_TOOLS.update(GATED_TOOLS)
+                else:
+                    _SKILL_TOOLS.add(tool_name)
     if entries:
         ux.say(
             "skill grants (until your next message): " + ", ".join(entries),
@@ -382,9 +1092,10 @@ def clear_skill_grants():
 def reset():
     """Clear the session-scoped allowed-tools set and drop the cached allow rules
     (re-read from settings on next use). Called by /clear."""
-    global _RULES
+    global _SETTINGS_RULES, _SETTINGS_RULES_VIEW
     _ALLOWED.clear()
-    _RULES = None
+    _SETTINGS_RULES = None
+    _SETTINGS_RULES_VIEW = None
     clear_skill_grants()
 
 

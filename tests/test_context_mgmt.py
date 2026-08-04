@@ -22,9 +22,15 @@ os.environ.setdefault("MODEL_ID", "test-model")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
+from anthropic import Anthropic
 
 from minicc import context_management as compact, llm
 from minicc.context_management import budget, eviction, manager, summary
+
+
+@pytest.fixture(autouse=True)
+def _configured_client(monkeypatch):
+    monkeypatch.setattr(llm, "client", Anthropic(api_key="test-key"))
 
 
 # ─── fakes ──────────────────────────────────────────────────────────────────

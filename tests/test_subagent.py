@@ -7,6 +7,8 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import types
 
+from anthropic import Anthropic
+
 
 def _blk(**k):
     return types.SimpleNamespace(**k)
@@ -74,6 +76,7 @@ def test_unknown_subagent_type_is_a_value_not_a_crash():
 
 def test_llm_response_uses_model_override_without_mutating_global(monkeypatch):
     from minicc import llm
+    monkeypatch.setattr(llm, "client", Anthropic(api_key="test-key"))
 
     captured = {}
 

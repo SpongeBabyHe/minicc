@@ -424,7 +424,11 @@ def test_checkpoint_failure_blocks_write_without_crashing(monkeypatch):
         raise checkpoints.CheckpointIOError("disk full")
 
     monkeypatch.setattr(checkpoints, "before_write", fail_checkpoint)
-    monkeypatch.setattr(engine, "confirm", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        engine.permissions,
+        "authorize",
+        lambda *args, **kwargs: engine.permissions.AuthorizationResult(True),
+    )
 
     output = engine._run_tool(
         Block(),

@@ -11,14 +11,13 @@ import os
 from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 
-from minicc import config, context_management, ux
+from minicc import config, context_management, permissions, ux
 from minicc.prompts.system import build_system_prompt
 from minicc.tools import TOOLS
 
-load_dotenv()
 MODEL = config.DEFAULT_MODEL
 CACHE_TTL = "5m"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
+client: Anthropic | None = None
 SYSTEM = build_system_prompt()
 _USAGE = {
     "input": 0,
@@ -31,10 +30,14 @@ _SESSION_CONTEXT = ""
 
 
 def configure_from_settings() -> None:
-    """Apply the source-filtered settings view selected by CLI startup."""
-    global MODEL, CACHE_TTL
+    """Apply the active Trust-filtered settings and initialize transport."""
+    global MODEL, CACHE_TTL, client
+    view = config.current_settings()
+    if view.trusted:
+        load_dotenv(dotenv_path=view.snapshot.start_dir / ".env")
     MODEL = config.resolve_model()
     CACHE_TTL = config.resolve_cache_ttl()
+    client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=4)
 
 
 def get_model() -> str:
@@ -172,12 +175,19 @@ def _build_request_params(
     return params
 
 
+def _messages_api():
+    """Return the configured Messages API used by live and summary requests."""
+    assert client is not None, "call configure_from_settings() before sending requests"
+    return client.messages
+
+
 def _send_request(params: dict, stream: bool):
     """Send one request and normalize streaming to a final Message object."""
+    messages_api = _messages_api()
     if not stream:
-        return client.messages.create(**params)
+        return messages_api.create(**params)
     with ux.streaming() as render:
-        with client.messages.stream(**params) as stream_response:
+        with messages_api.stream(**params) as stream_response:
             for delta in stream_response.text_stream:
                 render(delta)
             return stream_response.get_final_message()
@@ -223,14 +233,15 @@ def summary_runtime() -> context_management.SummaryRuntime:
     through the raw Messages client, avoiding recursive entry into
     :func:`llm_response`.
     """
+    messages_api = _messages_api()
     return context_management.SummaryRuntime(
         default_model=MODEL,
-        default_tools=TOOLS,
+        default_tools=permissions.filter_tools(TOOLS),
         build_system_block=_build_system_block,
         cacheable=_cacheable,
         thinking_param=_thinking_param,
         build_request_params=_build_request_params,
-        create_message=client.messages.create,
+        create_message=messages_api.create,
         record_usage=_record_usage,
     )
 
@@ -253,6 +264,9 @@ def llm_response(
     corrupt the parent conversation's token anchor.
     """
     chosen_model = model if model is not None else MODEL
+    authorized_tools = permissions.filter_tools(
+        tools if tools is not None else TOOLS
+    )
     ctx = ctx if ctx is not None else context_management.ContextState()
     runtime = summary_runtime()
     context_management.prepare_for_request(
@@ -260,7 +274,7 @@ def llm_response(
         messages,
         model=chosen_model,
         system=system,
-        tools=tools,
+        tools=authorized_tools,
         session_id=session_id,
         runtime=runtime,
     )
@@ -269,7 +283,7 @@ def llm_response(
         messages,
         model=chosen_model,
         system=system,
-        tools=tools,
+        tools=authorized_tools,
     )
     sent_message_tokens = context_management.estimate_tokens(messages)
     sent_request_tokens = (
@@ -287,7 +301,7 @@ def llm_response(
             recovery=recovery,
             model=chosen_model,
             system=system,
-            tools=tools,
+            tools=authorized_tools,
             session_id=session_id,
             runtime=runtime,
         )
@@ -297,7 +311,7 @@ def llm_response(
             messages,
             model=chosen_model,
             system=system,
-            tools=tools,
+            tools=authorized_tools,
         )
         sent_message_tokens = context_management.estimate_tokens(messages)
         sent_request_tokens = (

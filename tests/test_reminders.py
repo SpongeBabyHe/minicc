@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from minicc import memory, reminders, skills, watch
+from minicc import config, memory, reminders, skills, watch
 
 
 @pytest.fixture(autouse=True)
@@ -27,11 +27,13 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.chdir(proj)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
     monkeypatch.setattr(memory, "store_dir", lambda: home / "memories")
+    config.activate(config.discover_settings().view(trusted=True))
     reminders.reset()
     skills.reset("sess-r")
     yield proj, home
     reminders.reset()
     skills.reset()
+    config.reset_active_settings()
 
 
 def _history_with(*notes):

@@ -1,7 +1,6 @@
 from minicc.llm import llm_response
 from minicc.tools import TOOLS, TOOL_HANDLERS
-from minicc.permissions import confirm
-from minicc import context_management, ux
+from minicc import context_management, permissions, ux
 from minicc import checkpoints
 from minicc import sessions
 from minicc import hooks
@@ -39,7 +38,7 @@ def agent_loop(
                 /memory consolidate) a fresh one is created here — one per
                 conversation, so loops never share trigger state.
     """
-    tools = tools if tools is not None else TOOLS
+    tools = permissions.filter_tools(tools if tools is not None else TOOLS)
     ctx = ctx if ctx is not None else context_management.ContextState()
     limits = session_limits.SessionLimits.load(session_id)
     allowed = {t["name"] for t in tools}  # guard: model can't call un-advertised tools
@@ -233,7 +232,8 @@ def _run_tool(
     """Execute one tool call, wrapping the permission gate + handler in PreToolUse and
     PostToolUse hooks. Returns the tool_result content (with any hook-injected context
     appended). PreToolUse can deny the call, rewrite its input, force a prompt, or
-    pre-approve it; PostToolUse can feed context back or replace the output."""
+    pre-approve it subject to settings rules; PostToolUse can feed context back or
+    replace the output."""
     pre = hooks.run(
         "PreToolUse",
         session_id=session_id,
@@ -257,8 +257,15 @@ def _run_tool(
         # sub-agent reaching for bash). Saying "unknown" would be misleading and
         # invites a retry; name the real reason so the model can re-plan.
         output = f"Tool {block.name} is not available to this agent."
-    elif not (pre.allow or confirm(block.name, tool_input, force=pre.ask)):
-        output = f"User declined to run {block.name}."
+    elif not (
+        authorization := permissions.authorize(
+            block.name,
+            tool_input,
+            hook_allow=pre.allow,
+            hook_ask=pre.ask,
+        )
+    ).allowed:
+        output = authorization.reason or f"Authorization denied {block.name}."
     elif (
         block.name == "agent"
         and limits is not None

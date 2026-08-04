@@ -26,6 +26,9 @@ The "agent" and "task" words each map to ONE concept — keep them separated:
 | `cli.py` | the REPL + entry (`main`) + slash commands | `App` + `cli/` + `commands/` |
 | `llm.py` | the API client (request assembly, cache layers, streaming) | `services/api/` |
 | `context_management/` | budgets, eviction, summary, compaction orchestration + per-conversation `ContextState` | `services/compact/` |
+| `config.py` | source-preserving settings discovery and Trust-filtered views | settings scopes |
+| `trust.py` + `workspace.py` | canonical workspace identity and persisted Trust decisions | project trust |
+| `permissions.py` | tool authorization (`deny → ask → allow`) and approval lifetimes | permissions |
 
 **Reserved** (map to real future CC components — don't repurpose):
 `runner.py` = the process/session spawner (CC `sessionRunner`; future
@@ -38,7 +41,7 @@ See docs/CC_AGENTS_COORDINATOR_DESIGN.md §2b.
 
 ## Working conventions
 
-- Run tests with `python -m pytest -q` (fast; ~260 tests). Everything ships
+- Run tests with `python -m pytest -q` (fast; ~400 tests). Everything ships
   with tests; keep the suite green.
 - 1:1 claims need a cited source (official doc / live-harness observation /
   reverse-engineering) BEFORE implementing — never extrapolate one layer's

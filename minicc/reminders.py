@@ -43,7 +43,7 @@ the bare query).
 from datetime import date
 from pathlib import Path
 
-from minicc import agents, memory, skills, watch
+from minicc import agents, config, memory, skills, watch
 
 # In-context markers: distinctive first lines of each reminder kind, used to
 # detect whether a live copy is still in the history (vs compacted/rewound away).
@@ -112,7 +112,10 @@ def claude_md_files() -> list[tuple[Path, str]]:
     @path imports (CC expands them at launch, depth 4), no stripping of
     block-level HTML comments before injection.
     """
-    cwd = Path.cwd()
+    view = config.current_settings()
+    if not view.trusted:
+        return []
+    cwd = view.snapshot.start_dir
     out = []
     for d in [*reversed(cwd.parents), cwd]:  # outermost → cwd
         text = _read_claude_md(d / "CLAUDE.md")

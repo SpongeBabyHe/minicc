@@ -7,8 +7,18 @@ import os
 os.environ.setdefault("MODEL_ID", "test-model")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
+import pytest
+
 from minicc import config, sessions
 from minicc.tools import TOOLS, TOOL_HANDLERS
+from anthropic import Anthropic
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings_view():
+    config.reset_active_settings()
+    yield
+    config.reset_active_settings()
 
 
 # ─── registration: a server tool, not a client tool ──────────────────────────
@@ -34,7 +44,9 @@ def test_web_search_enabled_default_and_optout(monkeypatch, tmp_path):
     assert config.web_search_enabled() is True         # default on
     (proj / ".minicc").mkdir()
     (proj / ".minicc" / "settings.json").write_text('{"web_search": false}')
+    config.activate(config.discover_settings().view(trusted=True))
     assert config.web_search_enabled() is False        # project opt-out
+    config.reset_active_settings()
 
 
 # ─── pause_turn: resend the paused assistant message unchanged ───────────────
@@ -66,6 +78,7 @@ def test_agent_loop_continues_on_pause_turn(monkeypatch):
 # ─── usage counting ──────────────────────────────────────────────────────────
 def test_llm_response_counts_web_searches(monkeypatch):
     from minicc import llm
+    monkeypatch.setattr(llm, "client", Anthropic(api_key="test-key"))
 
     class _STU:
         web_search_requests = 3

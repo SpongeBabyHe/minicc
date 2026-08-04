@@ -90,7 +90,7 @@ def _git_snapshot() -> str:
         return ""
 
 
-def build_session_context() -> str:
+def build_session_context(*, include_git: bool = True) -> str:
     """Session context (cache prefix layer 2): environment fixed at session start,
     with the volatile bit (git status) LAST so the stable prefix above stays
     byte-identical. Captured once at startup / on /clear — mirrors CC's env +
@@ -104,9 +104,10 @@ def build_session_context() -> str:
         f"- Working directory: {Path.cwd()}",
         f"- Platform: {platform.system()} ({platform.machine()})",
     ]
-    git = _git_snapshot()
-    if git:
-        lines += ["", git]  # volatile-last
+    if include_git:
+        git = _git_snapshot()
+        if git:
+            lines += ["", git]  # volatile-last
     return "\n".join(lines)
 
 

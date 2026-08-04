@@ -1,7 +1,7 @@
 """Unit tests for config: model precedence, allowlist union, persistence.
 
-Each test gets an isolated HOME (global settings) and cwd (project settings) via
-monkeypatch, so nothing touches the real ~/.minicc.
+Each test gets isolated user-global and shared-project settings via monkeypatch,
+so nothing touches the real ~/.minicc.
 """
 
 import os
@@ -28,8 +28,8 @@ def _setup(monkeypatch, tmp_path):
     proj = tmp_path / "proj"
     home.mkdir()
     proj.mkdir()
-    monkeypatch.setenv("HOME", str(home))   # Path.home() → temp; _global() reads it live
-    monkeypatch.chdir(proj)                 # _project() → temp cwd
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(proj)
     return home, proj
 
 
@@ -38,30 +38,36 @@ def _write(path, data):
     path.write_text(json.dumps(data))
 
 
+def _activate_trusted():
+    config.activate(config.discover_settings().view(trusted=True))
+
+
 def test_default_when_no_settings(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     assert config.resolve_model() == config.DEFAULT_MODEL
 
 
-def test_global_default_persisted_and_read(monkeypatch, tmp_path):
+def test_user_default_persisted_and_read(monkeypatch, tmp_path):
     home, _ = _setup(monkeypatch, tmp_path)
-    path = config.set_default_model("claude-opus-4-8")          # default scope = global
+    path = config.set_default_model("claude-opus-4-8")
     assert path == home / ".minicc" / "settings.json"
     assert config.resolve_model() == "claude-opus-4-8"
 
 
-def test_project_overrides_global_model(monkeypatch, tmp_path):
+def test_shared_project_overrides_user_model(monkeypatch, tmp_path):
     home, proj = _setup(monkeypatch, tmp_path)
     _write(home / ".minicc" / "settings.json", {"default_model": "claude-opus-4-8"})
     _write(proj / ".minicc" / "settings.json", {"default_model": "claude-haiku-4-5-20251001"})
+    _activate_trusted()
     assert config.resolve_model() == "claude-haiku-4-5-20251001"
 
 
-def test_local_overrides_project_and_user_model(monkeypatch, tmp_path):
+def test_project_local_overrides_shared_project_and_user_model(monkeypatch, tmp_path):
     home, proj = _setup(monkeypatch, tmp_path)
     _write(home / ".minicc" / "settings.json", {"default_model": "user"})
     _write(proj / ".minicc" / "settings.json", {"default_model": "project"})
     _write(proj / ".minicc" / "settings.local.json", {"default_model": "local"})
+    _activate_trusted()
     assert config.resolve_model() == "local"
 
 
@@ -78,15 +84,77 @@ def test_discovery_preserves_source_order_and_metadata(monkeypatch, tmp_path):
 
     assert [source.scope for source in snapshot.sources] == [
         config.SettingsScope.USER,
-        config.SettingsScope.PROJECT,
-        config.SettingsScope.LOCAL,
+        config.SettingsScope.PROJECT_SHARED,
+        config.SettingsScope.PROJECT_LOCAL,
     ]
     assert [source.path for source in snapshot.sources] == [
         user_path,
         project_path,
         local_path,
     ]
+    assert [source.anchor for source in snapshot.sources] == [
+        user_path.parent,
+        proj.resolve(),
+        proj.resolve(),
+    ]
     assert snapshot.array("allowed_tools") == ["edit_file", "write_file", "memory"]
+
+
+def test_entries_preserve_duplicate_values_and_their_sources(monkeypatch, tmp_path):
+    home, proj = _setup(monkeypatch, tmp_path)
+    rule = "Bash(uv run *)"
+    _write(
+        home / ".minicc" / "settings.json",
+        {"permissions": {"allow": [rule]}},
+    )
+    _write(
+        proj / ".minicc" / "settings.json",
+        {"permissions": {"allow": [rule]}},
+    )
+
+    entries = config.discover_settings().entries(("permissions", "allow"))
+
+    assert [entry.value for entry in entries] == [rule, rule]
+    assert [entry.source.scope for entry in entries] == [
+        config.SettingsScope.USER,
+        config.SettingsScope.PROJECT_SHARED,
+    ]
+    assert entries[1].source.anchor == proj.resolve()
+
+
+def test_workspace_grants_include_only_project_capability_expansions(
+    monkeypatch,
+    tmp_path,
+):
+    home, proj = _setup(monkeypatch, tmp_path)
+    _write(
+        home / ".minicc" / "settings.json",
+        {"permissions": {"allow": ["Bash(user *)"]}},
+    )
+    _write(
+        proj / ".minicc" / "settings.json",
+        {
+            "permissions": {
+                "allow": ["Bash(project *)"],
+                "ask": ["Read(/review/**)"],
+                "deny": ["Bash(git push *)"],
+                "additionalDirectories": ["../shared"],
+            },
+            "allowed_tools": ["write_file"],
+        },
+    )
+
+    grants = config.workspace_grants(config.discover_settings())
+
+    assert [(grant.setting, grant.value) for grant in grants] == [
+        ("permissions.allow", "Bash(project *)"),
+        ("permissions.additionalDirectories", "../shared"),
+        ("allowed_tools", "write_file"),
+    ]
+    assert all(
+        grant.source.scope == config.SettingsScope.PROJECT_SHARED
+        for grant in grants
+    )
 
 
 def test_restricted_view_exposes_only_user_source(monkeypatch, tmp_path):
@@ -116,19 +184,21 @@ def test_runtime_configuration_reads_the_active_view(monkeypatch, tmp_path):
         proj / ".minicc" / "settings.json",
         {"default_model": "project", "cache_ttl": "5m", "web_search": True},
     )
-    config.activate(config.discover_settings().view(trusted=False))
+    config.activate(config.discover_settings().view(trusted=True))
     previous_model = llm.MODEL
     previous_ttl = llm.CACHE_TTL
+    previous_client = llm.client
     previous_tools = list(tool_registry.TOOLS)
     try:
         llm.configure_from_settings()
         tool_registry.configure_from_settings()
-        assert llm.MODEL == "user"
-        assert llm.CACHE_TTL == "1h"
-        assert "web_search" not in {tool["name"] for tool in tool_registry.TOOLS}
+        assert llm.MODEL == "project"
+        assert llm.CACHE_TTL == "5m"
+        assert "web_search" in {tool["name"] for tool in tool_registry.TOOLS}
     finally:
         llm.MODEL = previous_model
         llm.CACHE_TTL = previous_ttl
+        llm.client = previous_client
         tool_registry.TOOLS[:] = previous_tools
 
 
@@ -138,7 +208,7 @@ def test_malformed_settings_names_the_source(monkeypatch, tmp_path):
     path = proj / ".minicc" / "settings.json"
     path.write_text("{ not json")
     with pytest.raises(config.SettingsError, match=str(path)):
-        config.resolve_model()
+        config.discover_settings()
 
 
 def test_project_scope_self_ignores(monkeypatch, tmp_path):
@@ -185,10 +255,30 @@ def test_local_settings_live_at_nearest_repository_root(monkeypatch, tmp_path):
     monkeypatch.chdir(subdir)
 
     path = config.set_default_model("local-model", scope="local")
+    snapshot = config.discover_settings()
 
     assert path == proj / ".minicc" / "settings.local.json"
     assert json.loads(path.read_text())["default_model"] == "local-model"
+    assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).anchor == subdir.resolve()
     assert home != proj
+
+
+def test_home_git_marker_does_not_widen_local_settings_or_rule_anchor(
+    monkeypatch,
+    tmp_path,
+):
+    home = tmp_path / "home"
+    child = home / "scratch"
+    (home / ".git").mkdir(parents=True)
+    child.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(child)
+
+    path = config.set_default_model("child-model", scope="local")
+    snapshot = config.discover_settings()
+
+    assert path == child / ".minicc" / "settings.local.json"
+    assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).anchor == child.resolve()
 
 
 def test_explicit_start_dir_controls_project_and_local_discovery(monkeypatch, tmp_path):
@@ -203,7 +293,7 @@ def test_explicit_start_dir_controls_project_and_local_discovery(monkeypatch, tm
 
     assert snapshot.start_dir == other.resolve()
     assert snapshot.scalar("default_model") == "right"
-    assert snapshot.source(config.SettingsScope.PROJECT).path == (
+    assert snapshot.source(config.SettingsScope.PROJECT_SHARED).path == (
         other / ".minicc" / "settings.json"
     )
 
@@ -212,6 +302,7 @@ def test_allowed_tools_union(monkeypatch, tmp_path):
     home, proj = _setup(monkeypatch, tmp_path)
     _write(home / ".minicc" / "settings.json", {"allowed_tools": ["edit_file"]})
     _write(proj / ".minicc" / "settings.json", {"allowed_tools": ["write_file"]})
+    _activate_trusted()
     assert config.allowed_tools() == ["edit_file", "write_file"]   # sorted union
 
 
@@ -234,9 +325,11 @@ def test_resolve_cache_ttl_default_override_and_validation(monkeypatch, tmp_path
     assert config.resolve_cache_ttl() == "5m"                    # default
     (tmp_path / "home" / ".minicc").mkdir(parents=True)
     (tmp_path / "home" / ".minicc" / "settings.json").write_text('{"cache_ttl": "1h"}')
-    assert config.resolve_cache_ttl() == "1h"                    # global setting
+    assert config.resolve_cache_ttl() == "1h"                    # user setting
     (tmp_path / "proj" / ".minicc").mkdir(parents=True)
     (tmp_path / "proj" / ".minicc" / "settings.json").write_text('{"cache_ttl": "5m"}')
+    _activate_trusted()
     assert config.resolve_cache_ttl() == "5m"                    # project overrides
     (tmp_path / "proj" / ".minicc" / "settings.json").write_text('{"cache_ttl": "2h"}')
+    _activate_trusted()
     assert config.resolve_cache_ttl() == "5m"                    # invalid → fallback

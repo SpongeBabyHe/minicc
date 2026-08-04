@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from minicc import agents
+from minicc import agents, config
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +22,9 @@ def _isolated(tmp_path, monkeypatch):
     proj.mkdir(); home.mkdir()
     monkeypatch.chdir(proj)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    config.activate(config.discover_settings().view(trusted=True))
     yield proj, home
+    config.reset_active_settings()
 
 
 def _install(root: Path, name: str, text: str) -> Path:

@@ -25,6 +25,7 @@ from minicc import memory
 from minicc import hooks
 from minicc import reminders
 from minicc import skills
+from minicc import trust
 from minicc import tools as tool_registry
 from minicc.tools import freshness
 from minicc.prompts.system import build_session_context
@@ -116,7 +117,7 @@ def _fire_session_start(session_id: str, source: str) -> str:
 
 def _session_context_with_hooks(session_id: str, source: str) -> str:
     """The session-context layer (env + git) plus any SessionStart hook context."""
-    ctx = build_session_context()
+    ctx = build_session_context(include_git=config.current_settings().trusted)
     extra = _fire_session_start(session_id, source)
     if extra:
         ctx += f"\n\n# Context from SessionStart hook\n\n{extra}"
@@ -151,13 +152,17 @@ def _session_info() -> dict:
     """Pure data about this session — no presentation."""
     info = {
         "SESSION": datetime.now().isoformat(timespec="seconds"),
-        "commit": _git_sha(),
+        "commit": _git_sha() if config.current_settings().trusted else "restricted",
         "model": llm.get_model(),
         "cwd": str(Path.cwd()),
         "os": platform.system(),
     }
     if (Path.cwd() / "CLAUDE.md").exists():
-        info["CLAUDE.md"] = "found (injected as a system-reminder at first prompt)"
+        info["CLAUDE.md"] = (
+            "found (injected as a system-reminder at first prompt)"
+            if config.current_settings().trusted
+            else "found (disabled in restricted mode)"
+        )
     return info
 
 
@@ -346,7 +351,7 @@ def _cmd_model(arg: str | None):
 
     /model                 → show current (session) + default (persisted) + aliases
     /model <alias|id>      → switch for this session only (reverts on restart)
-    /model default <a|id>  → set the persistent default (global settings) + switch
+    /model default <a|id>  → set the persistent user default + switch
     """
     if not arg:
         cur = llm.get_model()
@@ -367,13 +372,13 @@ def _cmd_model(arg: str | None):
             ux.say("usage: /model default <alias|id>", style=ux.S_ERROR)
             return
         target = _MODEL_ALIASES.get(parts[1].strip(), parts[1].strip())
-        # always global for now. config.set_default_model supports scope="project"
-        # and resolve_model already reads project > global, but there's no command
+        # Always user-scoped for now. Project scopes have no command surface yet.
+        # resolve_model already reads project > user, but there's no command
         # surface (e.g. --project) to write a per-project default yet — deferred.
         config.set_default_model(target)
         llm.set_model(target)
         ux.say(
-            f"default model → {target}  (persisted globally + switched)",
+            f"default model → {target}  (persisted for this user + switched)",
             style=ux.S_INFO,
         )
         return
@@ -471,6 +476,8 @@ def _cmd_clear(history, session_id: str) -> str:
         session_id, "clear")  # old session ends (CC reason "clear")
     history.clear()
     new_id = sessions.new_id()
+    config.refresh_active_settings()
+    tool_registry.configure_from_settings()
     permissions.reset()
     permissions.preload(config.allowed_tools())  # keep settings-trusted tools
     checkpoints.activate(new_id)
@@ -520,12 +527,8 @@ def _print_startup_banner(
     ux.console.rule()
 
 
-def _init_session():
-    """Parse startup selection and return ``(history, session_id, resumed)``.
-
-    Explicit resume failures are fatal and descriptive. A missing or corrupt
-    transcript must never be mistaken for a valid empty conversation.
-    """
+def _parse_startup_args():
+    """Parse arguments without reading project-owned session state."""
     parser = argparse.ArgumentParser(prog="minicc")
     parser.add_argument(
         "--continue",
@@ -535,7 +538,27 @@ def _init_session():
     )
     parser.add_argument("--resume", metavar="ID",
                         help="resume a specific session id")
-    args = parser.parse_args()
+    return parser, parser.parse_args()
+
+
+def _init_session(parser=None, args=None, *, allow_project_state: bool = True):
+    """Load startup selection and return ``(history, session_id, resumed)``.
+
+    Explicit resume failures are fatal and descriptive. A missing or corrupt
+    transcript must never be mistaken for a valid empty conversation. Restricted
+    workspaces start fresh instead of reading repository-owned transcripts.
+    """
+    if parser is None or args is None:
+        parser, args = _parse_startup_args()
+
+    if not allow_project_state:
+        if args.resume or args.cont:
+            ux.say(
+                "session resume is disabled in restricted mode; starting a fresh "
+                "conversation",
+                style=ux.S_INFO,
+            )
+        return [], sessions.new_id(), False
 
     if args.resume:
         try:
@@ -654,8 +677,70 @@ def _friendly_error(e: Exception) -> str:
     return f"agent error: {e!r}"
 
 
+def _confirm_workspace_trust(
+    trust_identity: Path,
+    grants: list[config.WorkspaceGrant],
+) -> bool:
+    """Ask the one-time interactive Trust question for ``trust_identity``."""
+    ux.console.rule()
+    ux.say("Workspace Trust boundary:", style=ux.S_INFO)
+    ux.say(repr(str(trust_identity)))
+    ux.say(
+        "Only continue for a project you created or trust. minicc can read, "
+        "edit, and execute files here; project settings, hooks, skills, agents, "
+        ".env values, and CLAUDE.md instructions will become active.",
+        style=ux.S_INFO,
+    )
+    if grants:
+        ux.say("Project-requested grants:", style=ux.S_INFO)
+        for grant in grants:
+            value = repr(ux.truncate(grant.value, 240))
+            ux.say(
+                f"  {grant.source.scope.value}: {grant.setting} = {value}",
+                style=ux.S_INFO,
+            )
+    else:
+        ux.say("Project-requested grants: none", style=ux.S_INFO)
+    answer = input("Trust this workspace? [yes/no]: ").strip().lower()
+    return answer in ("1", "y", "yes")
+
+
+def _activate_workspace_settings() -> bool:
+    """Bind a trusted or restricted settings view for the launch directory.
+
+    A declined workspace continues with user customizations plus project
+    ``deny``/``ask`` permission rules; project capability grants and executable
+    customizations stay inactive.
+    """
+    launch_dir = Path.cwd().resolve()
+    snapshot = config.discover_settings(launch_dir)
+    config.activate(snapshot.view(trusted=False))
+    manager = trust.TrustManager()
+    identity = manager.workspace_identity(launch_dir)
+    if manager.is_trusted(identity):
+        config.activate(snapshot.view(trusted=True))
+        return True
+    grants = config.workspace_grants(snapshot)
+    if not _confirm_workspace_trust(identity, grants):
+        ux.say(
+            "continuing in restricted mode; project deny/ask rules remain "
+            "active, while project grants and customizations stay disabled",
+            style=ux.S_INFO,
+        )
+        return False
+    manager.accept(identity)
+    config.activate(snapshot.view(trusted=True))
+    return True
+
+
 def _main():
-    history, session_id, resumed = _init_session()
+    parser, args = _parse_startup_args()
+    trusted = _activate_workspace_settings()
+    history, session_id, resumed = _init_session(
+        parser,
+        args,
+        allow_project_state=trusted,
+    )
     llm.configure_from_settings()
     tool_registry.configure_from_settings()
     histfile = _setup_history()

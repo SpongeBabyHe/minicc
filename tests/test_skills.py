@@ -26,16 +26,25 @@ def _isolated(tmp_path, monkeypatch):
     proj = tmp_path / "proj"
     home = tmp_path / "home"
     proj.mkdir()
+    (proj / ".git").mkdir()
     home.mkdir()
     monkeypatch.chdir(proj)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
-    monkeypatch.setattr(config, "_global", lambda: home / ".minicc" / "settings.json")
-    monkeypatch.setattr(config, "_project", lambda: proj / ".minicc" / "settings.json")
+    monkeypatch.setattr(
+        config, "_user_settings_path", lambda: home / ".minicc" / "settings.json"
+    )
+    monkeypatch.setattr(
+        config,
+        "_shared_project_settings_path",
+        lambda: proj / ".minicc" / "settings.json",
+    )
+    config.activate(config.discover_settings().view(trusted=True))
     skills.reset("sess-123")
     permissions.reset()
     yield proj, home
     skills.reset()
     permissions.reset()
+    config.reset_active_settings()
 
 
 def _install(root: Path, name: str, text: str) -> Path:
@@ -105,6 +114,7 @@ def test_project_ancestor_walk_closest_wins(_isolated, monkeypatch):
     _install(proj, "deploy", "---\ndescription: outer\n---\nO")
     _install(sub, "deploy", "---\ndescription: inner\n---\nI")
     monkeypatch.chdir(sub)
+    config.activate(config.discover_settings().view(trusted=True))
     assert skills.lookup("deploy").description == "inner"
 
 

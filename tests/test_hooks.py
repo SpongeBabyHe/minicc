@@ -12,16 +12,22 @@ from pathlib import Path
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
+from anthropic import Anthropic
 
-from minicc import hooks
+from minicc import config, hooks, llm, permissions
 from minicc.context_management import manager, summary
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    config.reset_active_settings()
+    permissions.reset()
+    monkeypatch.setattr(llm, "client", Anthropic(api_key="test-key"))
     hooks.reset()
     yield
     hooks.reset()
+    permissions.reset()
+    config.reset_active_settings()
 
 
 def _use(events, disabled=False, *, monkeypatch):
@@ -143,6 +149,76 @@ def test_pretooluse_allow_and_ask(monkeypatch):
 
     _use({"PreToolUse": [_group("""echo '{"hookSpecificOutput":{"permissionDecision":"ask"}}'""")]}, monkeypatch=monkeypatch)
     assert hooks.run("PreToolUse", match_value="bash", tool_name="bash", tool_input={}).ask
+
+
+def test_settings_deny_overrides_pretooluse_allow(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from minicc import query_engine as engine
+
+    source = config.SettingsSource(
+        scope=config.SettingsScope.USER,
+        path=tmp_path / "settings.json",
+        anchor=tmp_path,
+        values={"permissions": {"deny": ["Bash(echo *)"]}},
+    )
+    snapshot = config.SettingsSnapshot(
+        start_dir=tmp_path,
+        sources=(source,),
+        includes_project_sources=True,
+    )
+    config.activate(snapshot.view(trusted=True))
+    permissions.reset()
+    _use(
+        {
+            "PreToolUse": [
+                _group(
+                    """echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'""",
+                    matcher="bash",
+                )
+            ]
+        },
+        monkeypatch=monkeypatch,
+    )
+    block = SimpleNamespace(name="bash", input={"command": "echo secret"}, id="t1")
+
+    output = engine._run_tool(block, {"bash"}, session_id=None, indent="")
+
+    assert "Denied by user permission rule 'Bash(echo *)'" in output
+
+
+def test_updated_input_is_reauthorized_before_execution(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from minicc import query_engine as engine
+
+    source = config.SettingsSource(
+        scope=config.SettingsScope.USER,
+        path=tmp_path / "settings.json",
+        anchor=tmp_path,
+        values={"permissions": {"deny": ["Bash(rm *)"]}},
+    )
+    snapshot = config.SettingsSnapshot(
+        start_dir=tmp_path,
+        sources=(source,),
+        includes_project_sources=True,
+    )
+    config.activate(snapshot.view(trusted=True))
+    permissions.reset()
+    _use(
+        {
+            "PreToolUse": [
+                _group(
+                    """echo '{"hookSpecificOutput":{"updatedInput":{"command":"rm -rf tmp"}}}'""",
+                    matcher="bash",
+                )
+            ]
+        },
+        monkeypatch=monkeypatch,
+    )
+    block = SimpleNamespace(name="bash", input={"command": "ls"}, id="t1")
+
+    output = engine._run_tool(block, {"bash"}, session_id=None, indent="")
+
+    assert "Denied by user permission rule 'Bash(rm *)'" in output
 
 
 def test_pretooluse_updated_input(monkeypatch):
@@ -268,21 +344,37 @@ def test_deny_is_sticky_across_hooks(monkeypatch):
     assert d.block  # a later allow does not override an earlier deny
 
 
-# ─── config merge: global + project groups both fire ────────────────────────
+# ─── config merge: user + both project groups all fire ─────────────────────
 
-def test_load_hooks_merges_global_and_project(tmp_path, monkeypatch):
+def test_load_hooks_merges_user_and_project_sources(tmp_path, monkeypatch):
     import json as _json
     from minicc import config
 
-    g = tmp_path / "global.json"
-    p = tmp_path / "project.json"
-    local = tmp_path / "local.json"
-    g.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo g")]}}))
-    p.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo p")]}, "disableAllHooks": False}))
-    local.write_text(_json.dumps({"hooks": {"PreToolUse": [_group("echo local")]}}))
-    monkeypatch.setattr(config, "_global", lambda: g)
-    monkeypatch.setattr(config, "_project", lambda: p)
-    monkeypatch.setattr(config, "_local", lambda: local)
+    user_path = tmp_path / "user.json"
+    shared_project_path = tmp_path / "project.json"
+    local_project_path = tmp_path / "local.json"
+    user_path.write_text(
+        _json.dumps({"hooks": {"PreToolUse": [_group("echo g")]}})
+    )
+    shared_project_path.write_text(
+        _json.dumps(
+            {
+                "hooks": {"PreToolUse": [_group("echo p")]},
+                "disableAllHooks": False,
+            }
+        )
+    )
+    local_project_path.write_text(
+        _json.dumps({"hooks": {"PreToolUse": [_group("echo local")]}})
+    )
+    monkeypatch.setattr(config, "_user_settings_path", lambda: user_path)
+    monkeypatch.setattr(
+        config, "_shared_project_settings_path", lambda: shared_project_path
+    )
+    monkeypatch.setattr(
+        config, "_local_project_settings_path", lambda: local_project_path
+    )
+    config.activate(config.discover_settings().view(trusted=True))
 
     events, disabled = config.load_hooks()
     assert not disabled
@@ -293,22 +385,29 @@ def test_load_hooks_disable_uses_scalar_precedence(tmp_path, monkeypatch):
     import json as _json
     from minicc import config
 
-    g = tmp_path / "global.json"
-    p = tmp_path / "project.json"
-    local = tmp_path / "local.json"
-    g.write_text(_json.dumps({"disableAllHooks": True}))
-    p.write_text(_json.dumps({"disableAllHooks": False}))
-    local.write_text(_json.dumps({"disableAllHooks": True}))
-    monkeypatch.setattr(config, "_global", lambda: g)
-    monkeypatch.setattr(config, "_project", lambda: p)
-    monkeypatch.setattr(config, "_local", lambda: local)
+    user_path = tmp_path / "user.json"
+    shared_project_path = tmp_path / "project.json"
+    local_project_path = tmp_path / "local.json"
+    user_path.write_text(_json.dumps({"disableAllHooks": True}))
+    shared_project_path.write_text(_json.dumps({"disableAllHooks": False}))
+    local_project_path.write_text(_json.dumps({"disableAllHooks": True}))
+    monkeypatch.setattr(config, "_user_settings_path", lambda: user_path)
+    monkeypatch.setattr(
+        config, "_shared_project_settings_path", lambda: shared_project_path
+    )
+    monkeypatch.setattr(
+        config, "_local_project_settings_path", lambda: local_project_path
+    )
+    config.activate(config.discover_settings().view(trusted=True))
 
     _events, disabled = config.load_hooks()
     assert disabled
 
-    local.write_text(_json.dumps({"disableAllHooks": False}))
+    local_project_path.write_text(_json.dumps({"disableAllHooks": False}))
+    config.activate(config.discover_settings().view(trusted=True))
     _events, disabled = config.load_hooks()
     assert not disabled
+    config.reset_active_settings()
 
 
 # ─── wiring: PreCompact / PostCompact around manager.compact ────────────────
