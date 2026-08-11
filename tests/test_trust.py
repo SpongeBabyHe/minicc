@@ -10,7 +10,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
 
-from minicc import cli, config, permissions
+from minicc import cli, config, permissions, workspace_activation
 from minicc.trust import TrustError, TrustManager
 from minicc.workspace import local_settings_are_repository_supplied
 
@@ -286,7 +286,7 @@ def test_cli_accepts_then_activates_project_settings(tmp_path, monkeypatch):
     home, project = _settings_environment(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
 
-    assert cli._activate_workspace_settings()
+    assert workspace_activation.activate_workspace_settings()
 
     assert config.current_settings().trusted
     assert config.resolve_model() == "project-model"
@@ -298,7 +298,7 @@ def test_cli_decline_leaves_only_user_settings_visible(tmp_path, monkeypatch):
     home, _project = _settings_environment(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert not cli._activate_workspace_settings()
+    assert not workspace_activation.activate_workspace_settings()
 
     assert not config.current_settings().trusted
     assert config.resolve_model() == "user-model"
@@ -317,7 +317,7 @@ def test_home_local_grants_apply_before_workspace_trust(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert not cli._activate_workspace_settings()
+    assert not workspace_activation.activate_workspace_settings()
     permissions.reset()
 
     view = config.current_settings()
@@ -354,15 +354,15 @@ def test_cli_trust_prompt_summarizes_gated_permissions(tmp_path, monkeypatch):
         )
     )
     shown = []
-    monkeypatch.setattr(cli.ux.console, "rule", lambda: None)
+    monkeypatch.setattr(workspace_activation.ux.console, "rule", lambda: None)
     monkeypatch.setattr(
-        cli.ux,
+        workspace_activation.ux,
         "say",
         lambda message, **_kwargs: shown.append(str(message)),
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert not cli._activate_workspace_settings()
+    assert not workspace_activation.activate_workspace_settings()
 
     preview = "\n".join(shown)
     assert "This folder pre-approves 3 tool permissions" in preview
@@ -403,14 +403,18 @@ def test_parent_trust_activates_project_config_but_not_nested_grants(
         home=home,
     ).accept(tmp_path)
     prompts = []
-    monkeypatch.setattr(cli.ux.console, "rule", lambda: None)
-    monkeypatch.setattr(cli.ux, "say", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(workspace_activation.ux.console, "rule", lambda: None)
+    monkeypatch.setattr(
+        workspace_activation.ux,
+        "say",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "builtins.input",
         lambda prompt: prompts.append(prompt) or "no",
     )
 
-    assert cli._activate_workspace_settings()
+    assert workspace_activation.activate_workspace_settings()
 
     view = config.current_settings()
     assert view.trusted
@@ -440,7 +444,7 @@ def test_parent_trust_skips_backstop_when_nested_project_has_no_grants(
         ),
     )
 
-    assert cli._activate_workspace_settings()
+    assert workspace_activation.activate_workspace_settings()
     assert config.current_settings().trusted
     assert not config.current_settings().project_grants_trusted
     assert config.current_settings().local_grants_trusted
@@ -466,7 +470,7 @@ def test_parent_trust_applies_untracked_local_grants_without_backstop(
         ),
     )
 
-    assert cli._activate_workspace_settings()
+    assert workspace_activation.activate_workspace_settings()
     permissions.reset()
 
     view = config.current_settings()
@@ -494,15 +498,15 @@ def test_parent_trust_keeps_tracked_local_grants_behind_backstop(
         home=home,
     ).accept(tmp_path)
     shown = []
-    monkeypatch.setattr(cli.ux.console, "rule", lambda: None)
+    monkeypatch.setattr(workspace_activation.ux.console, "rule", lambda: None)
     monkeypatch.setattr(
-        cli.ux,
+        workspace_activation.ux,
         "say",
         lambda message, **_kwargs: shown.append(str(message)),
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert cli._activate_workspace_settings()
+    assert workspace_activation.activate_workspace_settings()
     permissions.reset()
 
     assert not config.current_settings().local_grants_trusted
@@ -546,15 +550,15 @@ def test_cli_trust_prompt_displays_launch_directory_and_repository_identity(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(launch_dir)
     shown = []
-    monkeypatch.setattr(cli.ux.console, "rule", lambda: None)
+    monkeypatch.setattr(workspace_activation.ux.console, "rule", lambda: None)
     monkeypatch.setattr(
-        cli.ux,
+        workspace_activation.ux,
         "say",
         lambda message, **_kwargs: shown.append(str(message)),
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert not cli._activate_workspace_settings()
+    assert not workspace_activation.activate_workspace_settings()
 
     preview = "\n".join(shown)
     assert repr(str(launch_dir.resolve())) in preview
@@ -568,7 +572,7 @@ def test_cli_reports_invalid_project_settings_before_trust(tmp_path, monkeypatch
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
     with pytest.raises(config.SettingsError, match=str(project)):
-        cli._activate_workspace_settings()
+        workspace_activation.activate_workspace_settings()
 
 
 def test_main_checks_trust_before_loading_session(monkeypatch):
@@ -578,7 +582,7 @@ def test_main_checks_trust_before_loading_session(monkeypatch):
     monkeypatch.setattr(cli, "_parse_startup_args", lambda: (parser, args))
     monkeypatch.setattr(
         cli,
-        "_activate_workspace_settings",
+        "activate_workspace_settings",
         lambda: calls.append("trust") or False,
     )
     def stop_after_session(*_args, **kwargs):

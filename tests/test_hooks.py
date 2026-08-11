@@ -437,13 +437,13 @@ def test_precompact_block_stops_compaction_before_llm(monkeypatch):
 
 
 def test_manual_compact_veto_has_no_misleading_nothing_message(monkeypatch):
-    from minicc import cli, context_management as compact, ux
+    from minicc import commands, context_management as compact, ux
 
     monkeypatch.setattr(compact, "compact", lambda *args, **kwargs: None)
     said = []
     monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
 
-    cli._cmd_compact([], compact.ContextState(), session_id="s1")
+    commands.compact([], compact.ContextState(), session_id="s1")
     assert not any("nothing to compact" in message for message in said)
 
 

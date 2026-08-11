@@ -1,8 +1,15 @@
+"""Terminal entry point and top-level session/turn orchestration.
+
+The file intentionally keeps startup order, slash-command routing, prompt-time
+Hooks, transcript writes, checkpoints, and ``agent_loop`` visible as one REPL
+workflow. Command implementations and Workspace Trust activation live in their
+own modules so this file describes when work happens rather than every detail.
+"""
+
 import argparse
 import os
 import platform
 import readline  # noqa: F401 — importing enables history + line editing for input()
-import re
 import select
 import subprocess
 import sys
@@ -14,88 +21,21 @@ from anthropic import (
     APITimeoutError,
     RateLimitError,
 )
-from rich.text import Text
-from minicc import context_management, llm
+from minicc import commands, context_management, llm
 from minicc.query_engine import agent_loop
 from minicc import ux
-from minicc.llm import get_usage
 from minicc import permissions
 from minicc import sessions
 from minicc import config
 from minicc import checkpoints
-from minicc import memory
 from minicc import hooks
 from minicc import reminders
 from minicc import skills
-from minicc import trust
 from minicc import tools as tool_registry
 from minicc.tools import freshness
+from minicc.prompts.init import INIT_PROMPT
 from minicc.prompts.system import build_session_context
-from minicc.workspace import local_settings_are_repository_supplied
-
-
-# Sonnet 4.6 pricing (USD per 1M tokens). Update if you switch models.
-_PRICE_INPUT_PER_M = 3.0
-_PRICE_OUTPUT_PER_M = 15.0
-_PRICE_CACHE_WRITE_PER_M = 3.75  # 1.25x input
-_PRICE_CACHE_READ_PER_M = 0.30  # 0.1x input
-
-# /init: a canned instruction run as a normal agent turn — the model explores with
-# its own tools and writes CLAUDE.md. No special machinery; just a good prompt.
-#
-# The skeleton is CC's official /init prompt, recovered VERBATIM from a CC session
-# transcript during the three-arm /init experiment (2026-07-14) — its proven parts
-# are kept word-for-word (single-test requirement, the "requires reading multiple
-# files" inclusion bar, the banned-genericism examples, rules-file checks, the
-# anti-fabrication clause, the standard header for cross-tool interop). Three
-# additions the experiment showed the original lacks:
-#   1. verify-before-write — no arm's unverified command survived checking; the
-#      wording is Fable 5's own spontaneous phrasing from that run.
-#   2. universal-quantifier check — "all"/"only" claims were the other error class.
-#   3. batch parallel reads — turn count drove a ~4x context-traffic spread.
-# Deliberately absent (the experiment showed CC needs neither): todo/task
-# scaffolding hints.
-_INIT_PROMPT = (
-    "Please analyze this codebase and create a CLAUDE.md file, which will be given "
-    "to future AI coding agents (Claude Code, minicc) operating in this repository.\n\n"
-    "What to add:\n"
-    "1. Commands that will be commonly used, such as how to build, lint, and run "
-    "tests. Include the necessary commands to develop in this codebase, such as "
-    "how to run a single test.\n"
-    "2. High-level code architecture and structure so that future instances can be "
-    'productive more quickly. Focus on the "big picture" architecture that '
-    "requires reading multiple files to understand.\n\n"
-    "Usage notes:\n"
-    "- VERIFY each command works by actually running it (bash) before documenting "
-    "it; if it needs env vars or a .env file, say so next to the command. If you "
-    "cannot verify a command, do not present it as working.\n"
-    '- Before writing a claim containing "all", "only", "both" or '
-    '"never", check each member it quantifies over.\n'
-    "- Explore with glob/grep/read_file; batch independent file reads as parallel "
-    "tool calls in a single turn — each extra turn re-reads the whole context.\n"
-    "- If there's already a CLAUDE.md, improve it in place rather than duplicating.\n"
-    "- Do not repeat yourself and do not include obvious instructions like "
-    '"Provide helpful error messages to users", "Write unit tests for all new '
-    'utilities", "Never include sensitive information (API keys, tokens) in '
-    'code or commits".\n'
-    "- Avoid listing every component or file structure that can be easily "
-    "discovered.\n"
-    "- Don't include generic development practices.\n"
-    "- If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot "
-    "rules (in .github/copilot-instructions.md), make sure to include the "
-    "important parts.\n"
-    "- If there is a README.md, make sure to include the important parts.\n"
-    '- Do not make up information such as "Common Development Tasks", "Tips '
-    'for Development", "Support and Documentation" unless this is expressly '
-    "included in other files that you read.\n"
-    "- Be sure to prefix the file with the following text:\n\n"
-    "```\n"
-    "# CLAUDE.md\n\n"
-    "This file provides guidance to Claude Code (claude.ai/code) when working with "
-    "code in this repository.\n"
-    "```\n\n"
-    "Write the result with write_file."
-)
+from minicc.workspace_activation import activate_workspace_settings
 
 
 def _fire_session_start(session_id: str, source: str) -> str:
@@ -169,309 +109,7 @@ def _session_info() -> dict:
     return info
 
 
-def _cmd_help():
-    ux.say(
-        ux.kv_block(
-            [
-                ("/help", "Show this help"),
-                ("/clear", "Reset conversation history and tool permissions"),
-                ("/init", "Scan the project and write/refresh CLAUDE.md"),
-                ("/context", "Show context token usage vs the compaction budget"),
-                ("/cost", "Show token usage and estimated cost"),
-                (
-                    "/model [default] [id]",
-                    "Show / switch session / set persistent default model",
-                ),
-                ("/compact [focus]",
-                 "Summarize older history now (optional focus)"),
-                ("/recap", "Show a summary without changing history"),
-                (
-                    "/memory [file|on|off|consolidate]",
-                    "Browse, toggle, or tidy cross-session memory",
-                ),
-                (
-                    "/rewind [N] [mode]",
-                    "List restore points; restore code (default) | conversation | both",
-                ),
-                ("q / exit / quit", "Leave minicc"),
-            ]
-            + [  # user-invocable skills (SKILL_DESIGN.md); rescan = live view
-                (
-                    f"/{n}" + (f" {sk.hint}" if sk.hint else ""),
-                    f"skill: {sk.description[:100]}",
-                )
-                for n, sk in sorted(skills.discover().items())
-                if sk.meta.get("user-invocable") is not False
-            ]
-        )
-    )
-
-
-def _cmd_cost():
-    u = get_usage()
-    cost = (
-        u["input"] * _PRICE_INPUT_PER_M
-        + u["output"] * _PRICE_OUTPUT_PER_M
-        + u["cache_read"] * _PRICE_CACHE_READ_PER_M
-        + u["cache_creation"] * _PRICE_CACHE_WRITE_PER_M
-    ) / 1_000_000
-    cost += u.get("web_searches", 0) * 0.01  # server web_search: $10 per 1,000
-    total_in = u["input"] + u["cache_read"] + u["cache_creation"]
-    hit = (u["cache_read"] / total_in * 100) if total_in else 0
-    ux.say(
-        ux.kv_block(
-            [
-                ("uncached input", f"{u['input']:,}"),
-                ("cache read", f"{u['cache_read']:,}  ({hit:.0f}% hit rate)"),
-                ("cache write", f"{u['cache_creation']:,}"),
-                ("output", f"{u['output']:,}"),
-                ("web searches", f"{u.get('web_searches', 0):,}"),
-                ("est. cost", f"${cost:.4f}"),
-            ]
-        )
-    )
-
-
-def _cmd_context(messages, ctx):
-    """
-    Show context token usage vs the compaction budget.
-    """
-    c = context_management.context_usage(
-        ctx,
-        messages,
-        model=llm.get_model(),
-    )
-    ux.say(
-        ux.kv_block(
-            [
-                (
-                    "context tokens",
-                    f"{c['estimated_tokens']:,}  (~{c['pct_of_budget']:.0f}% of compaction budget)",
-                ),
-                (
-                    "compaction budget",
-                    f"{c['budget']:,}  (auto-compaction triggers above this)",
-                ),
-                ("messages", str(c["messages"])),
-                ("tool_results",
-                 f"{c['tool_results']} total, {c['evicted']} cleared in working set"),
-                ("eviction events", str(c["eviction_events"])),
-                ("results cleared", str(c["evicted_tool_results"])),
-                ("tokens reclaimed", f"~{c['evicted_tokens']:,}"),
-                (
-                    "last invalidated suffix",
-                    f"~{c['last_eviction_suffix_tokens']:,} tokens",
-                ),
-                ("compaction events", str(c["compaction_events"])),
-            ]
-        )
-    )
-    ux.say(
-        "(last API total + estimated full-request delta; cold reads include system/tools)",
-        style=ux.S_INFO,
-    )
-
-
-def _cmd_compact(
-    messages, ctx, focus: str | None = None, session_id: str | None = None
-):
-    """Manually compact history. Mutates `messages` in place."""
-    did = context_management.compact(
-        ctx,
-        messages,
-        focus=focus,
-        session_id=session_id,
-        trigger="manual",
-        runtime=llm.summary_runtime(),
-    )
-    if did:
-        ux.say("conversation history compacted", style=ux.S_INFO)
-    elif did is False:
-        ux.say("nothing to compact yet", style=ux.S_INFO)
-
-
-def _cmd_recap(messages):
-    """Show a summary of the conversation without changing it."""
-    summary = context_management.recap(
-        messages,
-        runtime=llm.summary_runtime(),
-    )
-    ux.say("<<< RECAP (history unchanged)", style=ux.S_ASSISTANT)
-    ux.markdown(summary)
-
-
-def _cmd_memory(arg: str | None):
-    """Browse, toggle, or consolidate auto-memory. `/memory` lists the store;
-    `/memory <file>` views one file; `/memory on|off` toggles it for this session;
-    `/memory consolidate` runs an Auto-Dream-style tidy pass (merge duplicates,
-    retire stale facts, fix dates, tighten the index)."""
-    if arg in ("on", "off"):
-        memory.set_enabled(arg == "on")
-        # no file changed, so the reminder poller wouldn't notice — force it
-        reminders.invalidate()
-        ux.say(
-            f"auto-memory {'enabled' if arg == 'on' else 'disabled'}", style=ux.S_INFO
-        )
-        return
-    if arg == "consolidate":
-        if not memory.enabled():
-            ux.say("auto-memory is off (/memory on first)", style=ux.S_ERROR)
-            return
-        ux.say(
-            "[consolidating memory — writes will ask for approval; answer 'all' to approve the batch]",
-            style=ux.S_INFO,
-        )
-        summary = memory.consolidate()
-        # the tidied MEMORY.md re-injects via the reminder poller at next prompt
-        ux.markdown(summary)
-        return
-    if arg:
-        path = arg if arg.startswith("/memories") else f"/memories/{arg}"
-        ux.say(memory.view(path))
-        return
-    ux.say(
-        ux.kv_block(
-            [
-                ("auto-memory", "on" if memory.enabled() else "off"),
-                ("store", str(memory.store_dir())),
-            ]
-        )
-    )
-    ux.say(memory.view("/memories"))
-
-
-# Short aliases for ergonomics; /model also accepts any raw model id.
-_MODEL_ALIASES = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-    "fable": "claude-fable-5",
-}
-
-
-def _cmd_model(arg: str | None):
-    """Show the model, switch it for this session, or set the persistent default.
-
-    /model                 → show current (session) + default (persisted) + aliases
-    /model <alias|id>      → switch for this session only (reverts on restart)
-    /model default <a|id>  → set the persistent user default + switch
-    """
-    if not arg:
-        cur = llm.get_model()
-        rows = [
-            ("current (session)", cur),
-            ("default (persisted)", config.resolve_model()),
-        ]
-        rows += [(alias, mid) for alias, mid in _MODEL_ALIASES.items()]
-        ux.say(ux.kv_block(rows))
-        ux.say(
-            "usage: /model <alias|id>  ·  /model default <alias|id>", style=ux.S_INFO
-        )
-        return
-
-    parts = arg.split(maxsplit=1)
-    if parts[0] == "default":
-        if len(parts) < 2:
-            ux.say("usage: /model default <alias|id>", style=ux.S_ERROR)
-            return
-        target = _MODEL_ALIASES.get(parts[1].strip(), parts[1].strip())
-        # Always user-scoped for now. Project scopes have no command surface yet.
-        # resolve_model already reads project > user, but there's no command
-        # surface (e.g. --project) to write a per-project default yet — deferred.
-        config.set_default_model(target)
-        llm.set_model(target)
-        ux.say(
-            f"default model → {target}  (persisted for this user + switched)",
-            style=ux.S_INFO,
-        )
-        return
-
-    target = _MODEL_ALIASES.get(arg.strip(), arg.strip())
-    llm.set_model(target)
-    ux.say(f"model → {target}  (this session)", style=ux.S_INFO)
-
-
-def _cmd_rewind(history, arg: str | None, session_id: str | None = None, ctx=None):
-    """List restore points, or `/rewind N [code|conversation|both]` to restore.
-    N is the position in the /rewind list (every turn is a restore point, like
-    CC's one-checkpoint-per-prompt). Modes: `code` (default) reverts files and
-    keeps the conversation; `conversation` replays the transcript back to just
-    before turn N's prompt (files kept); `both` does both."""
-    points = checkpoints.restore_points()  # [(turn, query, changed_paths)]
-    if arg is None:
-        if not points:
-            ux.say("nothing to rewind yet", style=ux.S_INFO)
-            return
-        rows = []
-        for i, (_, q, paths) in enumerate(points, 1):
-            mark = f"  [{len(paths)} file(s)]" if paths else ""
-            rows.append((f"[{i}]", ux.truncate(q, 60) + mark))
-        ux.say(ux.kv_block(rows))
-        ux.say(
-            "usage: /rewind <n> [code|conversation|both] — code (default) reverts "
-            "files, conversation replays history back to before that prompt; "
-            "bash-made changes aren't tracked.",
-            style=ux.S_INFO,
-        )
-        return
-    parts = arg.split()
-    mode = parts[1] if len(parts) > 1 else "code"
-    try:
-        n = int(parts[0])
-    except ValueError:
-        ux.say("usage: /rewind <n> [code|conversation|both]", style=ux.S_ERROR)
-        return
-    if mode not in ("code", "conversation", "both"):
-        ux.say(
-            f"unknown mode {mode!r} (code | conversation | both)", style=ux.S_ERROR)
-        return
-    if not (1 <= n <= len(points)):
-        ux.say(
-            f"no restore point [{n}]  (try /rewind to list)", style=ux.S_ERROR)
-        return
-    turn, query, _ = points[n - 1]
-    # read the conversation anchor BEFORE restore_files trims the stack
-    events = checkpoints.events_at(turn)
-
-    if mode in ("code", "both"):
-        restored, failed = checkpoints.restore_files(turn)
-        msg = f"reverted {restored} file change(s) to restore point {n}"
-        if failed:
-            msg += (
-                f"  — {len(failed)} could not be restored; "
-                f"checkpoint retained for retry: {', '.join(failed)}"
-            )
-        ux.say(msg, style=ux.S_INFO)
-
-    if mode in ("conversation", "both"):
-        if session_id is None or events is None:
-            ux.say("no transcript to rewind from", style=ux.S_ERROR)
-            return
-        try:
-            rewound = sessions.load_upto(session_id, events)
-        except sessions.SessionError as error:
-            ux.say(f"could not rewind conversation: {error}", style=ux.S_ERROR)
-            return
-        history[:] = rewound
-        sessions.log_rewind(session_id, history)  # append-only: a reset event
-        if ctx:
-            ctx.reset_size()  # forget the pre-rewind size (avoid spurious compact)
-        ux.say(
-            f"conversation rewound to before turn {turn}; its prompt was: {ux.truncate(query, 80)}",
-            style=ux.S_INFO,
-        )
-    elif mode == "code":
-        # code-only: the conversation continues, so tell the model files changed
-        notice = {
-            "role": "user",
-            "content": "[Files were rewound to an earlier checkpoint; edits made since then are undone.]",
-        }
-        history.append(notice)
-        if session_id:
-            sessions.append_message(session_id, notice)
-
-
-def _cmd_clear(history, session_id: str) -> str:
+def _clear_session(history, session_id: str) -> str:
     """Rotate to a fresh session: end the old one, reset per-session state, and
     return the new session id (the pre-clear transcript stays on disk; new turns
     record to a fresh `<id>.jsonl`). The caller resets its turn counter."""
@@ -680,317 +318,9 @@ def _friendly_error(e: Exception) -> str:
     return f"agent error: {e!r}"
 
 
-_TRUST_PREVIEW_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_TRUST_PREVIEW_VALUE_LIMIT = 60
-_TRUST_PREVIEW_HIGH_IMPACT_TOOLS = {
-    "bash",
-    "powershell",
-    "write",
-    "edit",
-    "multiedit",
-    "notebookedit",
-    "webfetch",
-    "websearch",
-    "write_file",
-    "edit_file",
-    "web_fetch",
-    "web_search",
-}
-
-
-def _workspace_trust_entries(
-    snapshot: config.SettingsSnapshot,
-    *paths: config.SettingsPath,
-    include_local: bool = True,
-) -> list[config.SettingsEntry]:
-    return [
-        entry
-        for path in paths
-        for entry in snapshot.entries(path)
-        if entry.source.scope == config.SettingsScope.PROJECT_SHARED
-        or (
-            include_local
-            and entry.source.scope == config.SettingsScope.PROJECT_LOCAL
-        )
-    ]
-
-
-def _workspace_trust_permission_entries(
-    snapshot: config.SettingsSnapshot,
-    *,
-    include_local: bool = True,
-) -> list[config.SettingsEntry]:
-    parsed = permissions.parse_rules(
-        _workspace_trust_entries(
-            snapshot,
-            ("permissions", "allow"),
-            include_local=include_local,
-        ),
-        permissions.PermissionEffect.ALLOW,
-    )
-    entries = [config.SettingsEntry(rule.raw, rule.source) for rule in parsed]
-    for entry in _workspace_trust_entries(
-        snapshot,
-        "allowed_tools",
-        include_local=include_local,
-    ):
-        if (
-            isinstance(entry.value, str)
-            and entry.value in permissions.GATED_TOOLS
-            and entry.value not in permissions.NO_PRELOAD
-        ):
-            entries.append(entry)
-    return entries
-
-
-def _workspace_trust_directory_entries(
-    snapshot: config.SettingsSnapshot,
-    *,
-    include_local: bool = True,
-) -> list[config.SettingsEntry]:
-    return [
-        entry
-        for entry in _workspace_trust_entries(
-            snapshot,
-            ("permissions", "additionalDirectories"),
-            include_local=include_local,
-        )
-        if isinstance(entry.value, str)
-    ]
-
-
-def _trust_preview_value(value: object) -> str:
-    text = Text.from_ansi(str(value)).plain
-    text = _TRUST_PREVIEW_CONTROL_CHARS.sub("", text).strip()
-    if len(text) > _TRUST_PREVIEW_VALUE_LIMIT:
-        return text[:_TRUST_PREVIEW_VALUE_LIMIT] + "…"
-    return text
-
-
-def _trust_preview_values(entries: list[config.SettingsEntry]) -> list[str]:
-    values: list[str] = []
-    for entry in entries:
-        value = _trust_preview_value(entry.value)
-        if value and value not in values:
-            values.append(value)
-    return values
-
-
-def _trust_preview_sources(entries: list[config.SettingsEntry]) -> list[str]:
-    labels = {
-        config.SettingsScope.PROJECT_SHARED: ".minicc/settings.json",
-        config.SettingsScope.PROJECT_LOCAL: ".minicc/settings.local.json",
-    }
-    sources: list[str] = []
-    for entry in entries:
-        label = labels.get(entry.source.scope, str(entry.source.path))
-        if label not in sources:
-            sources.append(label)
-    return sources
-
-
-def _permission_preview_priority(rule: str) -> int:
-    tool_name, separator, _content = rule.partition("(")
-    tool_name = tool_name.strip().casefold()
-    high_impact = (
-        tool_name in _TRUST_PREVIEW_HIGH_IMPACT_TOOLS
-        or tool_name.startswith("mcp__")
-    )
-    if high_impact:
-        return 1 if separator else 0
-    return 3 if separator else 2
-
-
-def _directory_preview_priority(directory: str) -> int:
-    if Path(directory).is_absolute() or directory.startswith("~"):
-        return 0
-    if ".." in directory:
-        return 1
-    return 2
-
-
-def _format_trust_preview(values: list[str], limit: int) -> str:
-    if len(values) > limit:
-        shown = values[:limit]
-        return f"{', '.join(shown)}, and {len(values) - limit} more"
-    if len(values) == 1:
-        return values[0]
-    if len(values) == 2:
-        return f"{values[0]} and {values[1]}"
-    return f"{', '.join(values[:-1])}, and {values[-1]}"
-
-
-def _confirm_workspace_trust(
-    workspace_dir: Path,
-    trust_identity: Path,
-    snapshot: config.SettingsSnapshot,
-    *,
-    covered_by_parent: bool = False,
-    local_grants_trusted: bool = False,
-) -> bool:
-    """Ask for exact Trust of ``workspace_dir`` and show gated fields."""
-    permission_entries = _workspace_trust_permission_entries(
-        snapshot,
-        include_local=not local_grants_trusted,
-    )
-    directory_entries = _workspace_trust_directory_entries(
-        snapshot,
-        include_local=not local_grants_trusted,
-    )
-    ux.console.rule()
-    ux.say("Accessing workspace:", style=ux.S_INFO)
-    ux.say(repr(str(workspace_dir)))
-    if trust_identity != workspace_dir:
-        ux.say("Trust applies to repository:", style=ux.S_INFO)
-        ux.say(repr(str(trust_identity)))
-    ux.say(
-        "Only continue for a project you created or trust. minicc can read, "
-        "edit, and execute files here; project settings, hooks, skills, agents, "
-        ".env values, and CLAUDE.md instructions will become active.",
-        style=ux.S_INFO,
-    )
-    if permission_entries:
-        count = len(permission_entries)
-        sources = _format_trust_preview(
-            _trust_preview_sources(permission_entries),
-            limit=2,
-        )
-        rules = sorted(
-            _trust_preview_values(permission_entries),
-            key=_permission_preview_priority,
-        )
-        ux.say(
-            f"This folder pre-approves {count} tool "
-            f"{'permission' if count == 1 else 'permissions'} in {sources}:",
-            style=ux.S_INFO,
-        )
-        ux.say(
-            "  "
-            + (
-                _format_trust_preview(rules, limit=8)
-                if rules
-                else "(rule names contain unprintable characters)"
-            ),
-            style=ux.S_INFO,
-        )
-    if directory_entries:
-        count = len(directory_entries)
-        sources = _format_trust_preview(
-            _trust_preview_sources(directory_entries),
-            limit=2,
-        )
-        directories = sorted(
-            _trust_preview_values(directory_entries),
-            key=_directory_preview_priority,
-        )
-        ux.say(
-            f"This folder adds {count} "
-            f"{'directory' if count == 1 else 'directories'} to the workspace "
-            f"in {sources}:",
-            style=ux.S_INFO,
-        )
-        ux.say(
-            "  "
-            + (
-                _format_trust_preview(directories, limit=6)
-                if directories
-                else "(directory names contain unprintable characters)"
-            ),
-            style=ux.S_INFO,
-        )
-    if permission_entries:
-        ux.say(
-            "These tool permissions will apply without asking. Only proceed "
-            "if you trust this configuration.",
-            style=ux.S_INFO,
-        )
-    if directory_entries:
-        ux.say(
-            "minicc shows additionalDirectories for Trust review, but does not "
-            "yet enforce Claude Code's filesystem boundary.",
-            style=ux.S_INFO,
-        )
-    prompt = (
-        "Trust this folder? [yes/no — no continues without these permissions]: "
-        if covered_by_parent
-        else "Trust this folder? [yes/no]: "
-    )
-    answer = input(prompt).strip().lower()
-    return answer in ("1", "y", "yes")
-
-
-def _activate_workspace_settings() -> bool:
-    """Bind the Trust-filtered settings view for the launch directory.
-
-    A fresh decline continues user-only with project ``deny``/``ask`` rules.
-    Parent-covered workspaces activate ordinary project configuration, while an
-    exact decision or local-file provenance independently controls grant fields.
-    """
-    launch_dir = Path.cwd().resolve()
-    snapshot = config.discover_settings(launch_dir)
-    local_grants_trusted = launch_dir == Path.home().resolve()
-    config.activate(
-        snapshot.view(
-            trusted=False,
-            local_grants_trusted=local_grants_trusted,
-        )
-    )
-    manager = trust.TrustManager()
-    identity = manager.workspace_identity(launch_dir)
-    if manager.is_explicitly_trusted(identity):
-        config.activate(snapshot.view(trusted=True))
-        return True
-    covered_by_parent = manager.is_trusted(identity)
-    if covered_by_parent:
-        local_grants_trusted = not local_settings_are_repository_supplied(
-            launch_dir
-        )
-        config.activate(
-            snapshot.view(
-                trusted=True,
-                project_grants_trusted=False,
-                local_grants_trusted=local_grants_trusted,
-            )
-        )
-        if not (
-            _workspace_trust_permission_entries(
-                snapshot,
-                include_local=not local_grants_trusted,
-            )
-            or _workspace_trust_directory_entries(
-                snapshot,
-                include_local=not local_grants_trusted,
-            )
-        ):
-            return True
-    if not _confirm_workspace_trust(
-        launch_dir,
-        identity,
-        snapshot,
-        covered_by_parent=covered_by_parent,
-        local_grants_trusted=local_grants_trusted,
-    ):
-        if covered_by_parent:
-            ux.say(
-                "continuing without this workspace's project allow rules or "
-                "additional directories",
-                style=ux.S_INFO,
-            )
-            return True
-        ux.say(
-            "continuing in restricted mode; project deny/ask rules remain "
-            "active, while project permissions and customizations stay disabled",
-            style=ux.S_INFO,
-        )
-        return False
-    manager.accept(identity)
-    config.activate(snapshot.view(trusted=True))
-    return True
-
-
 def _main():
     parser, args = _parse_startup_args()
-    trusted = _activate_workspace_settings()
+    trusted = activate_workspace_settings()
     history, session_id, resumed = _init_session(
         parser,
         args,
@@ -1050,7 +380,7 @@ def _main():
             ux.say("scanning the project to write CLAUDE.md ...", style=ux.S_INFO)
             expansion = (
                 "<command-message>init</command-message>\n<command-name>/init</command-name>",
-                _INIT_PROMPT,
+                INIT_PROMPT,
             )
             # fall through: run as a normal agent turn (tools + streaming + persist)
         elif query.startswith("/"):
@@ -1061,21 +391,21 @@ def _main():
             # history/arg/session_id). /clear is special — it rotates the
             # session, so it reassigns session_id/turn instead of joining here.
             builtins = {
-                "/help": _cmd_help,
-                "/cost": _cmd_cost,
-                "/context": lambda: _cmd_context(history, ctx),
-                "/model": lambda: _cmd_model(arg),
-                "/compact": lambda: _cmd_compact(
+                "/help": commands.show_help,
+                "/cost": commands.show_cost,
+                "/context": lambda: commands.show_context(history, ctx),
+                "/model": lambda: commands.select_model(arg),
+                "/compact": lambda: commands.compact(
                     history, ctx, focus=arg, session_id=session_id
                 ),
-                "/recap": lambda: _cmd_recap(history),
-                "/memory": lambda: _cmd_memory(arg),
-                "/rewind": lambda: _cmd_rewind(
-                    history, arg, session_id=session_id, ctx=ctx
+                "/recap": lambda: commands.recap(history),
+                "/memory": lambda: commands.manage_memory(arg),
+                "/rewind": lambda: commands.rewind(
+                    history, arg, session_id=session_id, context=ctx
                 ),
             }
             if cmd == "/clear":
-                session_id = _cmd_clear(history, session_id)
+                session_id = _clear_session(history, session_id)
                 ctx = context_management.ContextState()
                 turn = 0
             elif cmd in builtins:
