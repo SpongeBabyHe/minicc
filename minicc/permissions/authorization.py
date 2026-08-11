@@ -188,7 +188,7 @@ def _prompt(
         if (
             tool_name == "bash"
             and not one_time_only
-            and config.current_settings().trusted
+            and config.current_settings().local_grants_trusted
         )
         else []
     )

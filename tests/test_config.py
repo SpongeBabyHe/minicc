@@ -42,6 +42,19 @@ def _activate_trusted():
     config.activate(config.discover_settings().view(trusted=True))
 
 
+def _linked_worktree(tmp_path):
+    main = tmp_path / "main"
+    worktree = tmp_path / "worktree"
+    git_dir = main / ".git"
+    administration = git_dir / "worktrees" / "topic"
+    administration.mkdir(parents=True)
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {administration}\n")
+    (administration / "commondir").write_text("../..\n")
+    (administration / "gitdir").write_text(str(worktree / ".git") + "\n")
+    return main, worktree
+
+
 def test_default_when_no_settings(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     assert config.resolve_model() == config.DEFAULT_MODEL
@@ -92,7 +105,7 @@ def test_discovery_preserves_source_order_and_metadata(monkeypatch, tmp_path):
         project_path,
         local_path,
     ]
-    assert [source.anchor for source in snapshot.sources] == [
+    assert [source.permission_anchor for source in snapshot.sources] == [
         user_path.parent,
         proj.resolve(),
         proj.resolve(),
@@ -119,42 +132,7 @@ def test_entries_preserve_duplicate_values_and_their_sources(monkeypatch, tmp_pa
         config.SettingsScope.USER,
         config.SettingsScope.PROJECT_SHARED,
     ]
-    assert entries[1].source.anchor == proj.resolve()
-
-
-def test_workspace_grants_include_only_project_capability_expansions(
-    monkeypatch,
-    tmp_path,
-):
-    home, proj = _setup(monkeypatch, tmp_path)
-    _write(
-        home / ".minicc" / "settings.json",
-        {"permissions": {"allow": ["Bash(user *)"]}},
-    )
-    _write(
-        proj / ".minicc" / "settings.json",
-        {
-            "permissions": {
-                "allow": ["Bash(project *)"],
-                "ask": ["Read(/review/**)"],
-                "deny": ["Bash(git push *)"],
-                "additionalDirectories": ["../shared"],
-            },
-            "allowed_tools": ["write_file"],
-        },
-    )
-
-    grants = config.workspace_grants(config.discover_settings())
-
-    assert [(grant.setting, grant.value) for grant in grants] == [
-        ("permissions.allow", "Bash(project *)"),
-        ("permissions.additionalDirectories", "../shared"),
-        ("allowed_tools", "write_file"),
-    ]
-    assert all(
-        grant.source.scope == config.SettingsScope.PROJECT_SHARED
-        for grant in grants
-    )
+    assert entries[1].source.permission_anchor == proj.resolve()
 
 
 def test_restricted_view_exposes_only_user_source(monkeypatch, tmp_path):
@@ -259,8 +237,69 @@ def test_local_settings_live_at_nearest_repository_root(monkeypatch, tmp_path):
 
     assert path == proj / ".minicc" / "settings.local.json"
     assert json.loads(path.read_text())["default_model"] == "local-model"
-    assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).anchor == subdir.resolve()
+    assert (
+        snapshot.source(config.SettingsScope.PROJECT_LOCAL).permission_anchor
+        == subdir.resolve()
+    )
     assert home != proj
+
+
+def test_canonical_local_settings_override_legacy_launch_copy(
+    monkeypatch,
+    tmp_path,
+):
+    _home, project = _setup(monkeypatch, tmp_path)
+    (project / ".git").mkdir()
+    launch_dir = project / "packages" / "app"
+    launch_dir.mkdir(parents=True)
+    monkeypatch.chdir(launch_dir)
+    legacy = launch_dir / ".minicc" / "settings.local.json"
+    canonical = project / ".minicc" / "settings.local.json"
+    _write(
+        legacy,
+        {
+            "default_model": "legacy-model",
+            "permissions": {"allow": ["Bash(legacy *)"]},
+        },
+    )
+    _write(
+        canonical,
+        {
+            "default_model": "canonical-model",
+            "permissions": {"allow": ["Bash(canonical *)"]},
+        },
+    )
+
+    snapshot = config.discover_settings()
+
+    assert snapshot.scalar("default_model") == "canonical-model"
+    assert snapshot.array(("permissions", "allow")) == [
+        "Bash(legacy *)",
+        "Bash(canonical *)",
+    ]
+    assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).path == canonical
+
+
+def test_linked_worktree_uses_main_local_settings_and_launch_rule_anchor(
+    monkeypatch,
+    tmp_path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    main, worktree = _linked_worktree(tmp_path)
+    launch_dir = worktree / "packages" / "app"
+    launch_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(launch_dir)
+
+    path = config.set_default_model("local-model", scope="local")
+    snapshot = config.discover_settings()
+
+    assert path == main / ".minicc" / "settings.local.json"
+    assert (
+        snapshot.source(config.SettingsScope.PROJECT_LOCAL).permission_anchor
+        == launch_dir.resolve()
+    )
 
 
 def test_home_git_marker_does_not_widen_local_settings_or_rule_anchor(
@@ -278,7 +317,10 @@ def test_home_git_marker_does_not_widen_local_settings_or_rule_anchor(
     snapshot = config.discover_settings()
 
     assert path == child / ".minicc" / "settings.local.json"
-    assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).anchor == child.resolve()
+    assert (
+        snapshot.source(config.SettingsScope.PROJECT_LOCAL).permission_anchor
+        == child.resolve()
+    )
 
 
 def test_explicit_start_dir_controls_project_and_local_discovery(monkeypatch, tmp_path):

@@ -7,14 +7,19 @@ consumer-specific merge happens:
     <cwd>/.minicc/settings.json               (shared project)
     <repo-root>/.minicc/settings.local.json   (project-local, machine-owned)
 
+For compatibility with pre-canonicalization releases, a local settings file in
+the launch directory is also read when it differs from the repository-wide
+path. The repository-wide file has scalar precedence; permission arrays from
+both remain represented.
+
 Low-to-high precedence is user -> shared project -> project local. Scalar
 settings use the highest source that defines them; array settings concatenate
 and deduplicate in source order; hook groups concatenate without deduplication.
 
-CLI startup discovers all sources as inert data, binds a restricted view, then
-switches that same snapshot to a trusted view after acceptance. All settings
-consumers therefore share one source selection instead of reading project files
-independently.
+CLI startup discovers all sources as inert data, then binds a view containing
+either user settings only, ordinary project configuration with grant fields
+still gated, or the fully trusted snapshot. All consumers therefore share one
+source selection instead of reading project files independently.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
-from minicc.workspace import workspace_root
+from minicc.workspace import local_settings_root, workspace_root
 
 
 # Fallback when no settings file sets a default.
@@ -34,6 +39,11 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 
 _MINICC_GITIGNORE = "*\n!.gitignore\n!settings.json\n"
 _MISSING = object()
+_TRUST_GATED_ARRAY_PATHS = {
+    ("permissions", "allow"),
+    ("permissions", "additionalDirectories"),
+    ("allowed_tools",),
+}
 
 
 class SettingsError(ValueError):
@@ -55,15 +65,15 @@ SettingsPath = str | tuple[str, ...]
 class SettingsSource:
     """One settings file plus the metadata lost by an eager dict merge.
 
-    ``anchor`` is the source-specific base for leading-slash permission rules:
-    user settings use ``~/.minicc``, shared settings use the launch directory,
-    and project-local settings keep the original launch directory even when the
-    file itself is stored at the repository root.
+    ``permission_anchor`` is the source-specific base for leading-slash
+    permission rules: user settings use ``~/.minicc``, shared settings use the
+    starting directory, and project-local settings keep that starting directory
+    even when the file itself is stored at the workspace root.
     """
 
     scope: SettingsScope
     path: Path
-    anchor: Path
+    permission_anchor: Path
     values: dict[str, Any]
 
 
@@ -76,12 +86,118 @@ class SettingsEntry:
 
 
 @dataclass(frozen=True)
-class WorkspaceGrant:
-    """A capability-expanding project setting shown before Workspace Trust."""
+class SettingsSnapshot:
+    """Inert settings sources discovered for one starting directory."""
 
-    setting: str
-    value: str
-    source: SettingsSource
+    start_dir: Path
+    sources: tuple[SettingsSource, ...]
+    includes_project_sources: bool
+
+    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
+        """Resolve a scalar with highest-source-wins precedence."""
+        return _scalar(self.sources, path, default)
+
+    def array(self, path: SettingsPath) -> list[Any]:
+        """Concatenate and deduplicate an array across low-to-high sources."""
+        return _array(self.sources, path)
+
+    def entries(self, path: SettingsPath) -> list[SettingsEntry]:
+        """Return every array entry without discarding source provenance."""
+        return _entries(self.sources, path)
+
+    def source(self, scope: SettingsScope) -> SettingsSource | None:
+        """Return the highest-precedence loaded source for ``scope``, if any."""
+        return next(
+            (
+                source
+                for source in reversed(self.sources)
+                if source.scope == scope
+            ),
+            None,
+        )
+
+    def view(
+        self,
+        *,
+        trusted: bool,
+        project_grants_trusted: bool | None = None,
+        local_grants_trusted: bool | None = None,
+    ) -> SettingsView:
+        """Select generic project sources and separately gated grant fields."""
+        if project_grants_trusted is None:
+            project_grants_trusted = trusted
+        if local_grants_trusted is None:
+            local_grants_trusted = trusted
+        return SettingsView(
+            snapshot=self,
+            trusted=trusted,
+            project_grants_trusted=project_grants_trusted,
+            local_grants_trusted=local_grants_trusted,
+        )
+
+
+@dataclass(frozen=True)
+class SettingsView:
+    """A snapshot filtered at the workspace Trust boundary.
+
+    ``trusted`` enables ordinary project configuration after the generic
+    workspace check. ``project_grants_trusted`` and ``local_grants_trusted``
+    independently control capability-expanding fields from the shared and local
+    project sources. Shared grants require exact Trust; local grants may also be
+    admitted after Git establishes that the repository did not supply the file,
+    or before generic Trust when the launch directory is the user's HOME.
+
+    Authorization still inspects restrictive project rules in the inert
+    snapshot because ``deny`` and ``ask`` do not expand capability.
+    """
+
+    snapshot: SettingsSnapshot
+    trusted: bool
+    project_grants_trusted: bool
+    local_grants_trusted: bool
+
+    @property
+    def sources(self) -> tuple[SettingsSource, ...]:
+        if self.trusted:
+            return self.snapshot.sources
+        return tuple(
+            source
+            for source in self.snapshot.sources
+            if source.scope == SettingsScope.USER
+        )
+
+    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
+        """Resolve a scalar from the sources selected by this view."""
+        return _scalar(self.sources, path, default)
+
+    def array(self, path: SettingsPath) -> list[Any]:
+        """Merge an array from the sources selected by this view."""
+        if _path_parts(path) in _TRUST_GATED_ARRAY_PATHS:
+            merged: list[Any] = []
+            for entry in self.entries(path):
+                if entry.value not in merged:
+                    merged.append(entry.value)
+            return merged
+        return _array(self.sources, path)
+
+    def entries(self, path: SettingsPath) -> list[SettingsEntry]:
+        """Return source-preserving entries visible through this Trust view."""
+        if _path_parts(path) not in _TRUST_GATED_ARRAY_PATHS:
+            return _entries(self.sources, path)
+        return [
+            entry
+            for entry in _entries(self.snapshot.sources, path)
+            if entry.source.scope == SettingsScope.USER
+            or (
+                entry.source.scope == SettingsScope.PROJECT_SHARED
+                and self.trusted
+                and self.project_grants_trusted
+            )
+            or (
+                entry.source.scope == SettingsScope.PROJECT_LOCAL
+                and self.local_grants_trusted
+            )
+        ]
 
 
 def _path_parts(path: SettingsPath) -> tuple[str, ...]:
@@ -130,73 +246,6 @@ def _entries(
     return entries
 
 
-@dataclass(frozen=True)
-class SettingsSnapshot:
-    """Inert settings sources discovered for one starting directory."""
-
-    start_dir: Path
-    sources: tuple[SettingsSource, ...]
-    includes_project_sources: bool
-
-    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
-        """Resolve a scalar with highest-source-wins precedence."""
-        return _scalar(self.sources, path, default)
-
-    def array(self, path: SettingsPath) -> list[Any]:
-        """Concatenate and deduplicate an array across low-to-high sources."""
-        return _array(self.sources, path)
-
-    def entries(self, path: SettingsPath) -> list[SettingsEntry]:
-        """Return every array entry without discarding source provenance."""
-        return _entries(self.sources, path)
-
-    def source(self, scope: SettingsScope) -> SettingsSource | None:
-        """Return the loaded source for ``scope``, if that file exists."""
-        return next((source for source in self.sources if source.scope == scope), None)
-
-    def view(self, *, trusted: bool) -> SettingsView:
-        """Select the sources visible before or after workspace Trust."""
-        return SettingsView(snapshot=self, trusted=trusted)
-
-
-@dataclass(frozen=True)
-class SettingsView:
-    """A snapshot filtered at the workspace Trust boundary.
-
-    User settings are always visible. Capability-expanding shared-project and
-    project-local settings enter the effective runtime only after Trust;
-    authorization may still inspect restrictive project rules in the inert
-    snapshot.
-    """
-
-    snapshot: SettingsSnapshot
-    trusted: bool
-
-    @property
-    def sources(self) -> tuple[SettingsSource, ...]:
-        if self.trusted:
-            return self.snapshot.sources
-        return tuple(
-            source
-            for source in self.snapshot.sources
-            if source.scope == SettingsScope.USER
-        )
-
-    def scalar(self, path: SettingsPath, default: Any = None) -> Any:
-        """Resolve a scalar from the sources selected by this view."""
-        return _scalar(self.sources, path, default)
-
-    def array(self, path: SettingsPath) -> list[Any]:
-        """Merge an array from the sources selected by this view."""
-        return _array(self.sources, path)
-
-    def entries(self, path: SettingsPath) -> list[SettingsEntry]:
-        """Return source-preserving entries visible through this Trust view."""
-        return _entries(self.sources, path)
-
-_ACTIVE_SETTINGS: SettingsView | None = None
-
-
 def _user_settings_path() -> Path:
     return Path.home() / ".minicc" / "settings.json"
 
@@ -206,46 +255,7 @@ def _shared_project_settings_path() -> Path:
 
 
 def _local_project_settings_path() -> Path:
-    return workspace_root() / ".minicc" / "settings.local.json"
-
-
-def config_roots(subdir: str):
-    """Trusted project roots, bounded by the workspace, then the personal root."""
-    view = current_settings()
-    project_roots: list[Path] = []
-    if view.trusted:
-        start_dir = view.snapshot.start_dir
-        boundary = workspace_root(start_dir)
-        current = start_dir
-        while True:
-            project_roots.append(current / ".minicc" / subdir)
-            if current == boundary:
-                break
-            current = current.parent
-        yield from reversed(project_roots)
-    personal_root = Path.home() / ".minicc" / subdir
-    if personal_root not in project_roots:
-        yield personal_root
-
-
-def _ensure_minicc_gitignore(minicc_dir: Path) -> None:
-    """Ignore runtime/local state while keeping shared settings trackable.
-
-    The exact legacy file written by older minicc versions is migrated. A
-    user-customized `.gitignore` is left untouched.
-    """
-    gitignore = minicc_dir / ".gitignore"
-    if not gitignore.exists() or gitignore.read_text() == "*\n":
-        gitignore.write_text(_MINICC_GITIGNORE)
-
-
-def ensure_project_dir(subdir: str = "") -> Path:
-    """Create `.minicc/<subdir>` under cwd and maintain its ignore policy."""
-    root = Path.cwd() / ".minicc"
-    directory = root / subdir if subdir else root
-    directory.mkdir(parents=True, exist_ok=True)
-    _ensure_minicc_gitignore(root)
-    return directory
+    return local_settings_root() / ".minicc" / "settings.local.json"
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -267,7 +277,7 @@ def discover_settings(
 ) -> SettingsSnapshot:
     """Read user settings and, when allowed, both project settings sources."""
     start = (start_dir or Path.cwd()).resolve()
-    project_anchor = workspace_root(start)
+    local_settings_dir = local_settings_root(start)
     user_path = _user_settings_path()
     paths = [(SettingsScope.USER, user_path, user_path.parent)]
     if include_project_sources:
@@ -276,24 +286,24 @@ def discover_settings(
             local_project_path = _local_project_settings_path()
         else:
             shared_project_path = start / ".minicc" / "settings.json"
-            local_project_path = project_anchor / ".minicc" / "settings.local.json"
+            local_project_path = local_settings_dir / ".minicc" / "settings.local.json"
+        paths.append(
+            (
+                SettingsScope.PROJECT_SHARED,
+                shared_project_path,
+                start,
+            )
+        )
+        legacy_local_path = start / ".minicc" / "settings.local.json"
         paths.extend(
             (
-                (
-                    SettingsScope.PROJECT_SHARED,
-                    shared_project_path,
-                    start,
-                ),
-                (
-                    SettingsScope.PROJECT_LOCAL,
-                    local_project_path,
-                    start,
-                ),
+                (SettingsScope.PROJECT_LOCAL, legacy_local_path, start),
+                (SettingsScope.PROJECT_LOCAL, local_project_path, start),
             )
         )
     sources: list[SettingsSource] = []
     seen: set[Path] = set()
-    for scope, path, anchor in paths:
+    for scope, path, permission_anchor in paths:
         canonical = path.resolve()
         if canonical in seen or not path.exists():
             continue
@@ -302,7 +312,7 @@ def discover_settings(
             SettingsSource(
                 scope=scope,
                 path=path,
-                anchor=anchor,
+                permission_anchor=permission_anchor,
                 values=_read(path),
             )
         )
@@ -311,6 +321,9 @@ def discover_settings(
         sources=tuple(sources),
         includes_project_sources=include_project_sources,
     )
+
+
+_ACTIVE_SETTINGS: SettingsView | None = None
 
 
 def activate(view: SettingsView) -> None:
@@ -335,7 +348,11 @@ def refresh_active_settings() -> SettingsView:
         previous.snapshot.start_dir,
         include_project_sources=previous.snapshot.includes_project_sources,
     )
-    _ACTIVE_SETTINGS = snapshot.view(trusted=previous.trusted)
+    _ACTIVE_SETTINGS = snapshot.view(
+        trusted=previous.trusted,
+        project_grants_trusted=previous.project_grants_trusted,
+        local_grants_trusted=previous.local_grants_trusted,
+    )
     return _ACTIVE_SETTINGS
 
 
@@ -346,59 +363,28 @@ def current_settings() -> SettingsView:
     return discover_settings(include_project_sources=False).view(trusted=False)
 
 
-def workspace_grants(snapshot: SettingsSnapshot) -> list[WorkspaceGrant]:
-    """Capability-expanding project values that require Workspace Trust.
-
-    Restrictive ``permissions.deny`` and ``permissions.ask`` entries are omitted:
-    they reduce authority and remain effective in a restricted continuation.
-    """
-    grants: list[WorkspaceGrant] = []
-    paths = (
-        (("permissions", "allow"), "permissions.allow"),
-        (
-            ("permissions", "additionalDirectories"),
-            "permissions.additionalDirectories",
-        ),
-        ("allowed_tools", "allowed_tools"),
-    )
-    for path, label in paths:
-        for entry in snapshot.entries(path):
-            if entry.source.scope != SettingsScope.USER:
-                grants.append(WorkspaceGrant(label, str(entry.value), entry.source))
-    return grants
+def config_roots(subdir: str):
+    """Trusted project roots, bounded by the workspace, then the personal root."""
+    view = current_settings()
+    project_roots: list[Path] = []
+    if view.trusted:
+        start_dir = view.snapshot.start_dir
+        boundary = workspace_root(start_dir)
+        current = start_dir
+        while True:
+            project_roots.append(current / ".minicc" / subdir)
+            if current == boundary:
+                break
+            current = current.parent
+        yield from reversed(project_roots)
+    personal_root = Path.home() / ".minicc" / subdir
+    if personal_root not in project_roots:
+        yield personal_root
 
 
 def resolve_model() -> str:
     """Startup model: project-local > shared-project > user > default."""
     return current_settings().scalar("default_model", DEFAULT_MODEL) or DEFAULT_MODEL
-
-
-def _settings_path(scope: str) -> Path:
-    if scope == "user":
-        return _user_settings_path()
-    if scope == "project":
-        return _shared_project_settings_path()
-    if scope == "local":
-        return _local_project_settings_path()
-    raise ValueError(f"unknown settings scope: {scope}")
-
-
-def _write(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path != _user_settings_path():
-        _ensure_minicc_gitignore(path.parent)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    if _ACTIVE_SETTINGS is not None:
-        refresh_active_settings()
-
-
-def set_default_model(model_id: str, scope: str = "user") -> Path:
-    """Persist the model to user, shared-project, or project-local settings."""
-    path = _settings_path(scope)
-    data = _read(path)
-    data["default_model"] = model_id
-    _write(path, data)
-    return path
 
 
 def web_search_enabled() -> bool:
@@ -444,6 +430,63 @@ def permission_allow_rules() -> list[str]:
     return rules
 
 
+def allowed_tools() -> list[str]:
+    """Merged minicc-specific whole-tool startup grants."""
+    return sorted(
+        str(entry)
+        for entry in current_settings().array("allowed_tools")
+        if isinstance(entry, str)
+    )
+
+
+def _settings_path(scope: str) -> Path:
+    if scope == "user":
+        return _user_settings_path()
+    if scope == "project":
+        return _shared_project_settings_path()
+    if scope == "local":
+        return _local_project_settings_path()
+    raise ValueError(f"unknown settings scope: {scope}")
+
+
+def _ensure_minicc_gitignore(minicc_dir: Path) -> None:
+    """Ignore runtime/local state while keeping shared settings trackable.
+
+    The exact legacy file written by older minicc versions is migrated. A
+    user-customized `.gitignore` is left untouched.
+    """
+    gitignore = minicc_dir / ".gitignore"
+    if not gitignore.exists() or gitignore.read_text() == "*\n":
+        gitignore.write_text(_MINICC_GITIGNORE)
+
+
+def ensure_project_dir(subdir: str = "") -> Path:
+    """Create `.minicc/<subdir>` under cwd and maintain its ignore policy."""
+    root = Path.cwd() / ".minicc"
+    directory = root / subdir if subdir else root
+    directory.mkdir(parents=True, exist_ok=True)
+    _ensure_minicc_gitignore(root)
+    return directory
+
+
+def _write(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path != _user_settings_path():
+        _ensure_minicc_gitignore(path.parent)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    if _ACTIVE_SETTINGS is not None:
+        refresh_active_settings()
+
+
+def set_default_model(model_id: str, scope: str = "user") -> Path:
+    """Persist the model to user, shared-project, or project-local settings."""
+    path = _settings_path(scope)
+    data = _read(path)
+    data["default_model"] = model_id
+    _write(path, data)
+    return path
+
+
 def add_allow_rule(pattern: str) -> Path:
     """Persist one Bash allow rule to machine-local project settings."""
     path = _local_project_settings_path()
@@ -461,12 +504,3 @@ def add_allow_rule(pattern: str) -> Path:
         allow.append(rule)
         _write(path, data)
     return path
-
-
-def allowed_tools() -> list[str]:
-    """Merged minicc-specific whole-tool startup grants."""
-    return sorted(
-        str(entry)
-        for entry in current_settings().array("allowed_tools")
-        if isinstance(entry, str)
-    )

@@ -23,7 +23,7 @@ class PermissionEffect(str, Enum):
 
 @dataclass(frozen=True)
 class PermissionRule:
-    """One parsed settings rule and the source that anchors its path patterns."""
+    """One parsed settings rule and its source-specific path interpretation."""
 
     effect: PermissionEffect
     raw: str
@@ -33,9 +33,9 @@ class PermissionRule:
     compiled: re.Pattern | None = field(default=None, repr=False, compare=False)
 
     @property
-    def anchor(self) -> Path:
-        """Directory against which source-relative paths are interpreted."""
-        return self.source.anchor
+    def permission_anchor(self) -> Path:
+        """Base directory for a leading-slash permission path pattern."""
+        return self.source.permission_anchor
 
 
 @dataclass(frozen=True)

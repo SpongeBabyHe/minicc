@@ -1,8 +1,9 @@
 """Workspace Trust, evaluated before project configuration runs.
 
-One Trust decision covers the nearest Git root; outside a repository, the
-canonical launch directory is the identity. Project settings, hooks, skills,
-agents, and instructions become active only after that identity is accepted.
+One Trust identity uses the canonical main checkout shared by linked worktrees;
+outside a repository, the launch directory is the identity. An accepted parent
+covers the generic workspace check for descendants, but capability-expanding
+project rules still require an exact decision for the current identity.
 
 Trust for the user's home directory is session-only, matching Claude Code's
 documented behavior.  Starting from a project below HOME is persisted normally.
@@ -14,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from minicc.workspace import workspace_root
+from minicc.workspace import workspace_identity
 
 
 class TrustError(ValueError):
@@ -30,8 +31,8 @@ class TrustManager:
         self._session_trusted: set[Path] = set()
 
     def workspace_identity(self, launch_dir: Path | None = None) -> Path:
-        """Return the Git root, or the canonical directory outside a repository."""
-        return workspace_root(launch_dir, home=self.home)
+        """Return the main checkout, or the launch directory outside Git."""
+        return workspace_identity(launch_dir, home=self.home)
 
     def _read(self) -> dict:
         if not self.store_path.exists():
@@ -42,8 +43,13 @@ class TrustManager:
             raise TrustError(
                 f"invalid JSON in workspace Trust store {self.store_path}: {error.msg}"
             ) from error
-        if not isinstance(data, dict) or not isinstance(
-            data.get("trusted_workspaces", []), list
+        trusted_workspaces = (
+            data.get("trusted_workspaces", []) if isinstance(data, dict) else None
+        )
+        if (
+            not isinstance(data, dict)
+            or not isinstance(trusted_workspaces, list)
+            or not all(isinstance(value, str) for value in trusted_workspaces)
         ):
             raise TrustError(
                 f"workspace Trust store must contain a trusted_workspaces array: "
@@ -52,7 +58,16 @@ class TrustManager:
         return data
 
     def is_trusted(self, launch_dir: Path | None = None) -> bool:
-        """Whether ``launch_dir`` was accepted this session or a previous one."""
+        """Whether ``launch_dir`` is covered by its own or an ancestor's Trust."""
+        identity = self.workspace_identity(launch_dir)
+        persisted = set(self._read().get("trusted_workspaces", []))
+        return any(
+            candidate in self._session_trusted or str(candidate) in persisted
+            for candidate in (identity, *identity.parents)
+        )
+
+    def is_explicitly_trusted(self, launch_dir: Path | None = None) -> bool:
+        """Whether the current workspace identity itself was accepted."""
         identity = self.workspace_identity(launch_dir)
         if identity in self._session_trusted:
             return True

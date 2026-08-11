@@ -1,8 +1,8 @@
 """Parse source-aware settings rules and match them against tool calls.
 
-Rule loading retains each setting's provenance so relative path patterns use
-the correct source anchor. This module owns matching only; precedence and user
-interaction belong to :mod:`minicc.permissions.authorization`.
+Rule loading retains each setting's provenance so leading-slash path patterns
+use the correct permission anchor. This module owns matching only; precedence
+and user interaction belong to :mod:`minicc.permissions.authorization`.
 """
 
 import fnmatch
@@ -113,8 +113,20 @@ def _parse_rule(
     )
 
 
+def parse_rules(
+    entries: list[config.SettingsEntry],
+    effect: PermissionEffect,
+) -> list[PermissionRule]:
+    """Parse valid settings entries without changing active permission state."""
+    parsed: list[PermissionRule] = []
+    for entry in entries:
+        if rule := _parse_rule(entry, effect):
+            parsed.append(rule)
+    return parsed
+
+
 def permission_rules() -> list[PermissionRule]:
-    """Return effective rules while retaining source and path anchor.
+    """Return effective rules while retaining source and permission anchor.
 
     Restrictive project rules remain active before Trust because they only
     remove authority. Project allow rules enter through the active settings
@@ -125,12 +137,18 @@ def permission_rules() -> list[PermissionRule]:
     if _SETTINGS_RULES is None or _SETTINGS_RULES_VIEW is not view:
         loaded: list[PermissionRule] = []
         for effect in (PermissionEffect.DENY, PermissionEffect.ASK):
-            for entry in view.snapshot.entries(("permissions", effect.value)):
-                if rule := _parse_rule(entry, effect):
-                    loaded.append(rule)
-        for entry in view.entries(("permissions", PermissionEffect.ALLOW.value)):
-            if rule := _parse_rule(entry, PermissionEffect.ALLOW):
-                loaded.append(rule)
+            loaded.extend(
+                parse_rules(
+                    view.snapshot.entries(("permissions", effect.value)),
+                    effect,
+                )
+            )
+        loaded.extend(
+            parse_rules(
+                view.entries(("permissions", PermissionEffect.ALLOW.value)),
+                PermissionEffect.ALLOW,
+            )
+        )
         _SETTINGS_RULES = loaded
         _SETTINGS_RULES_VIEW = view
     return _SETTINGS_RULES
@@ -162,7 +180,7 @@ def _path_pattern(rule: PermissionRule) -> str:
     if pattern.startswith("~/"):
         return os.path.normpath(str(Path.home() / pattern[2:]))
     if pattern.startswith("/"):
-        return os.path.normpath(str(rule.anchor / pattern[1:]))
+        return os.path.normpath(str(rule.permission_anchor / pattern[1:]))
     if pattern.startswith("./"):
         pattern = pattern[2:]
     elif "/" not in pattern:

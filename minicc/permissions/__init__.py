@@ -13,7 +13,7 @@ Approval authorizes the requested call; it does not sandbox the approved tool.
 from .models import AuthorizationResult, PermissionEffect, PermissionRule
 from .bash import is_readonly_command
 from .rules import matching_rule as _matching_rule
-from .rules import permission_rules
+from .rules import parse_rules, permission_rules
 from .authorization import (
     GATED_TOOLS,
     NO_PRELOAD,
@@ -43,6 +43,7 @@ __all__ = [
     "filter_tools",
     "grant_skill_tools",
     "is_readonly_command",
+    "parse_rules",
     "permission_rules",
     "preload",
     "reset",

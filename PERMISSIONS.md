@@ -69,22 +69,38 @@ friction. minicc now mirrors both mechanisms (`is_readonly_command` and
 ## Workspace Trust
 
 Before project-controlled capabilities become active, startup asks whether the
-workspace is trusted. The dialog previews capability-expanding project settings:
-`permissions.allow`, `permissions.additionalDirectories`, and legacy
-`allowed_tools`. Acceptance is keyed by the nearest Git root, or by the canonical
-launch directory outside a repository, and stored in `~/.minicc/trust.json`;
-starting directly from the user's home directory is trusted only for that
-process.
+workspace is trusted. Like Claude Code, the dialog separately summarizes
+pre-approved tool permissions and additional workspace directories, including
+legacy `allowed_tools`. Acceptance is keyed by the canonical main checkout,
+shared by linked worktrees, or by the canonical launch directory outside a
+repository. An accepted parent covers the generic startup check for descendants,
+but—matching Claude Code—it does not activate a nested workspace's `allow` rules
+or additional directories. Those fields require an exact Trust decision for the
+nested identity. Persistent decisions live in `~/.minicc/trust.json`; starting
+directly from the user's home directory is trusted only for that process.
+The dialog shows the launch directory and, when different, the repository
+identity the decision covers, matching Claude Code 2.1.218 and later.
 
 Declining no longer exits. minicc continues in a restricted mode: user settings
 remain active, while project hooks, skills, agents, instructions, environment
 loading, `allow` rules, and other capability-expanding settings stay disabled.
 Project `deny` and `ask` rules still apply because they can only remove authority
 or require an explicit decision. Settings entries retain their source file,
-scope, and path anchor so diagnostics and path rules do not lose provenance.
+scope, and permission anchor so diagnostics and path rules retain provenance.
 Trusted skill and agent discovery walks from the workspace root down to the
 launch directory; it never imports executable project customization from above
 the accepted workspace boundary.
+
+If a parent Trust already covers the launch directory, ordinary project
+configuration can run without another generic prompt. When the nested workspace
+contains still-gated tool permissions or additional directories, minicc shows a
+second, Claude Code-style backstop. Declining that backstop continues with the
+ordinary project configuration active but leaves those grant fields ignored.
+Project-local grant fields skip that backstop only after a post-Trust Git check
+shows that the repository did not supply the file; tracked files, symlinks, and
+indeterminate checks remain gated. When minicc starts directly in HOME, that
+user-owned configuration location's local grants are active before generic
+workspace Trust, matching Claude Code's configuration-home exception.
 
 ## What layer is bash's scope at?
 
@@ -170,8 +186,6 @@ persists per project + command prefix).
 - `web_search` runs inside the Messages API. Explicit `deny`/`ask` rules hide it
   fail-closed, but minicc cannot yet prompt or run `PreToolUse` around each server
   invocation; Claude Code supports both controls for WebSearch.
-- project-local provenance and main-checkout worktree identity are not yet
-  verified with Git after Trust; local settings therefore remain conservatively
-  Trust-gated and each worktree currently has its own identity.
 - `additionalDirectories` is previewed at Trust time, but minicc still has no
-  sandbox, so it does not create a real filesystem boundary.
+  sandbox or file-access boundary, so the dialog explicitly labels it as an
+  unenforced compatibility setting rather than claiming that access changed.

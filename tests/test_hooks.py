@@ -158,7 +158,7 @@ def test_settings_deny_overrides_pretooluse_allow(tmp_path, monkeypatch):
     source = config.SettingsSource(
         scope=config.SettingsScope.USER,
         path=tmp_path / "settings.json",
-        anchor=tmp_path,
+        permission_anchor=tmp_path,
         values={"permissions": {"deny": ["Bash(echo *)"]}},
     )
     snapshot = config.SettingsSnapshot(
@@ -193,7 +193,7 @@ def test_updated_input_is_reauthorized_before_execution(tmp_path, monkeypatch):
     source = config.SettingsSource(
         scope=config.SettingsScope.USER,
         path=tmp_path / "settings.json",
-        anchor=tmp_path,
+        permission_anchor=tmp_path,
         values={"permissions": {"deny": ["Bash(rm *)"]}},
     )
     snapshot = config.SettingsSnapshot(

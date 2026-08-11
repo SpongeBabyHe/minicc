@@ -348,6 +348,37 @@ def test_restricted_workspace_does_not_offer_project_local_always(
     assert not paths["local"].exists()
 
 
+def test_parent_covered_workspace_does_not_offer_ineffective_always(
+    tmp_path,
+    monkeypatch,
+):
+    _workspace, paths = _activate_source_rules(
+        tmp_path,
+        monkeypatch,
+        trusted=False,
+    )
+    snapshot = config.current_settings().snapshot
+    config.activate(
+        snapshot.view(
+            trusted=True,
+            project_grants_trusted=False,
+            local_grants_trusted=False,
+        )
+    )
+    permissions.reset()
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "no",
+    )
+
+    result = permissions.authorize("bash", {"command": "uv run pytest"})
+
+    assert not result.allowed
+    assert prompts and "always" not in prompts[0]
+    assert not paths["local"].exists()
+
+
 def test_rule_precedence_overrides_hook_and_skill_grants(tmp_path, monkeypatch):
     _workspace, _paths = _activate_source_rules(
         tmp_path,
@@ -421,6 +452,27 @@ def test_switching_to_trusted_view_invalidates_permission_rule_cache(
     assert _is_gated("bash", {"command": "npm run test"})
     config.activate(snapshot.view(trusted=True))
     assert not _is_gated("bash", {"command": "npm run test"})
+
+
+def test_parent_covered_view_keeps_project_allow_gated(
+    tmp_path,
+    monkeypatch,
+):
+    _workspace, _paths = _activate_source_rules(
+        tmp_path,
+        monkeypatch,
+        project={"allow": ["Bash(npm run *)"]},
+        trusted=False,
+    )
+    snapshot = config.current_settings().snapshot
+
+    config.activate(
+        snapshot.view(trusted=True, project_grants_trusted=False)
+    )
+    permissions.reset()
+
+    assert config.current_settings().trusted
+    assert _is_gated("bash", {"command": "npm run test"})
 
 
 def test_bare_deny_removes_tool_from_advertised_schema(tmp_path, monkeypatch):
@@ -641,7 +693,7 @@ def test_source_specific_path_anchors_are_preserved(tmp_path, monkeypatch):
     home_anchor = paths["user"].parent
     rules = permissions.permission_rules()
 
-    assert [rule.anchor for rule in rules] == [
+    assert [rule.permission_anchor for rule in rules] == [
         home_anchor,
         workspace.resolve(),
         workspace.resolve(),
@@ -776,7 +828,7 @@ def test_path_rules_distinguish_project_root_current_dir_and_recursive_globs(
     permissions.reset()
 
     project_rule = permissions.permission_rules()[0]
-    assert project_rule.anchor == working_dir.resolve()
+    assert project_rule.permission_anchor == working_dir.resolve()
     assert not permissions.authorize(
         "read_file",
         {"path": str(working_dir / "secrets" / "key")},
