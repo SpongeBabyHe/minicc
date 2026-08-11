@@ -27,7 +27,9 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.chdir(proj)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
     monkeypatch.setattr(memory, "store_dir", lambda: home / "memories")
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     reminders.reset()
     skills.reset("sess-r")
     yield proj, home

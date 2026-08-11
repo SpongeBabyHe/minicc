@@ -22,7 +22,9 @@ def _isolated(tmp_path, monkeypatch):
     proj.mkdir(); home.mkdir()
     monkeypatch.chdir(proj)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     yield proj, home
     config.reset_active_settings()
 

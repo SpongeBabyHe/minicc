@@ -33,7 +33,7 @@ def configure_from_settings() -> None:
     """Apply the active Trust-filtered settings and initialize transport."""
     global MODEL, CACHE_TTL, client
     view = config.current_settings()
-    if view.trusted:
+    if view.project_configuration_enabled:
         load_dotenv(dotenv_path=view.snapshot.start_dir / ".env")
     MODEL = config.resolve_model()
     CACHE_TTL = config.resolve_cache_ttl()

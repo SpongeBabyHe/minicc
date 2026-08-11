@@ -174,7 +174,9 @@ def _rules_env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "_local_project_settings_path", lambda: local_project_path
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     permissions.reset()
     yield local_project_path
     permissions.reset()
@@ -184,7 +186,9 @@ def _rules_env(tmp_path, monkeypatch):
 def _set_rules(path, rules):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"permissions": {"allow": rules}}))
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     permissions.reset()  # drop cache so the new file is read
 
 
@@ -266,7 +270,7 @@ def _activate_source_rules(
     user=None,
     project=None,
     local=None,
-    trusted=True,
+    project_configuration_enabled=True,
 ):
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
@@ -284,7 +288,11 @@ def _activate_source_rules(
             paths[name].parent.mkdir(parents=True, exist_ok=True)
             paths[name].write_text(json.dumps({"permissions": rules}))
     snapshot = config.discover_settings()
-    config.activate(snapshot.view(trusted=trusted))
+    config.activate(
+        snapshot.view(
+            project_configuration_enabled=project_configuration_enabled
+        )
+    )
     permissions.reset()
     return workspace, paths
 
@@ -302,7 +310,7 @@ def test_restricted_workspace_keeps_project_deny_and_ask_but_delays_allow(
             "ask": ["Read(/review/**)"],
             "deny": ["Bash(git push *)"],
         },
-        trusted=False,
+        project_configuration_enabled=False,
     )
 
     assert not _is_gated("bash", {"command": "uv run pytest"})
@@ -333,7 +341,7 @@ def test_restricted_workspace_does_not_offer_project_local_always(
     _workspace, paths = _activate_source_rules(
         tmp_path,
         monkeypatch,
-        trusted=False,
+        project_configuration_enabled=False,
     )
     prompts = []
     monkeypatch.setattr(
@@ -355,14 +363,14 @@ def test_parent_covered_workspace_does_not_offer_ineffective_always(
     _workspace, paths = _activate_source_rules(
         tmp_path,
         monkeypatch,
-        trusted=False,
+        project_configuration_enabled=False,
     )
     snapshot = config.current_settings().snapshot
     config.activate(
         snapshot.view(
-            trusted=True,
-            project_grants_trusted=False,
-            local_grants_trusted=False,
+            project_configuration_enabled=True,
+            shared_project_grants_enabled=False,
+            local_project_grants_enabled=False,
         )
     )
     permissions.reset()
@@ -445,12 +453,12 @@ def test_switching_to_trusted_view_invalidates_permission_rule_cache(
         tmp_path,
         monkeypatch,
         project={"allow": ["Bash(npm run *)"]},
-        trusted=False,
+        project_configuration_enabled=False,
     )
     snapshot = config.current_settings().snapshot
 
     assert _is_gated("bash", {"command": "npm run test"})
-    config.activate(snapshot.view(trusted=True))
+    config.activate(snapshot.view(project_configuration_enabled=True))
     assert not _is_gated("bash", {"command": "npm run test"})
 
 
@@ -462,16 +470,19 @@ def test_parent_covered_view_keeps_project_allow_gated(
         tmp_path,
         monkeypatch,
         project={"allow": ["Bash(npm run *)"]},
-        trusted=False,
+        project_configuration_enabled=False,
     )
     snapshot = config.current_settings().snapshot
 
     config.activate(
-        snapshot.view(trusted=True, project_grants_trusted=False)
+        snapshot.view(
+            project_configuration_enabled=True,
+            shared_project_grants_enabled=False,
+        )
     )
     permissions.reset()
 
-    assert config.current_settings().trusted
+    assert config.current_settings().project_configuration_enabled
     assert _is_gated("bash", {"command": "npm run test"})
 
 
@@ -480,7 +491,7 @@ def test_bare_deny_removes_tool_from_advertised_schema(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         project={"deny": ["Write"]},
-        trusted=False,
+        project_configuration_enabled=False,
     )
     tools = [{"name": "read_file"}, {"name": "write_file"}]
 
@@ -492,7 +503,7 @@ def test_cc_tool_groups_and_all_use_rules_filter_schemas(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         project={"deny": ["Read", "Edit", "Bash(*)", "WebSearch"]},
-        trusted=False,
+        project_configuration_enabled=False,
     )
     tools = [
         {"name": name}
@@ -824,7 +835,9 @@ def test_path_rules_distinguish_project_root_current_dir_and_recursive_globs(
             }
         )
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     permissions.reset()
 
     project_rule = permissions.permission_rules()[0]

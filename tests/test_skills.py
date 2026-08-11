@@ -38,7 +38,9 @@ def _isolated(tmp_path, monkeypatch):
         "_shared_project_settings_path",
         lambda: proj / ".minicc" / "settings.json",
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     skills.reset("sess-123")
     permissions.reset()
     yield proj, home
@@ -114,7 +116,9 @@ def test_project_ancestor_walk_closest_wins(_isolated, monkeypatch):
     _install(proj, "deploy", "---\ndescription: outer\n---\nO")
     _install(sub, "deploy", "---\ndescription: inner\n---\nI")
     monkeypatch.chdir(sub)
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     assert skills.lookup("deploy").description == "inner"
 
 

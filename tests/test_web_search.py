@@ -44,7 +44,9 @@ def test_web_search_enabled_default_and_optout(monkeypatch, tmp_path):
     assert config.web_search_enabled() is True         # default on
     (proj / ".minicc").mkdir()
     (proj / ".minicc" / "settings.json").write_text('{"web_search": false}')
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     assert config.web_search_enabled() is False        # project opt-out
     config.reset_active_settings()
 

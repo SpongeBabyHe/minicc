@@ -246,7 +246,7 @@ def _settings_environment(monkeypatch, tmp_path):
 def test_unbound_settings_are_user_only(tmp_path, monkeypatch):
     _home, _project = _settings_environment(monkeypatch, tmp_path)
 
-    assert not config.current_settings().trusted
+    assert not config.current_settings().project_configuration_enabled
     assert config.resolve_model() == "user-model"
 
 
@@ -255,7 +255,9 @@ def test_untrusted_config_roots_expose_only_personal_files(tmp_path, monkeypatch
 
     assert list(config.config_roots("skills")) == [home / ".minicc" / "skills"]
 
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     roots = list(config.config_roots("skills"))
     assert project / ".minicc" / "skills" in roots
     assert roots[-1] == home / ".minicc" / "skills"
@@ -271,7 +273,9 @@ def test_trusted_config_roots_stop_at_workspace_boundary(tmp_path, monkeypatch):
     subdir.mkdir(parents=True)
     monkeypatch.chdir(subdir)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
 
     roots = list(config.config_roots("skills"))
 
@@ -290,7 +294,7 @@ def test_cli_accepts_then_activates_project_settings(tmp_path, monkeypatch):
 
     assert workspace_activation.activate_workspace_settings()
 
-    assert config.current_settings().trusted
+    assert config.current_settings().project_configuration_enabled
     assert config.resolve_model() == "project-model"
     stored = json.loads((home / ".minicc" / "trust.json").read_text())
     assert stored["trusted_workspaces"] == [str(project.resolve())]
@@ -302,7 +306,7 @@ def test_cli_decline_leaves_only_user_settings_visible(tmp_path, monkeypatch):
 
     assert not workspace_activation.activate_workspace_settings()
 
-    assert not config.current_settings().trusted
+    assert not config.current_settings().project_configuration_enabled
     assert config.resolve_model() == "user-model"
     assert not (home / ".minicc" / "trust.json").exists()
 
@@ -323,8 +327,8 @@ def test_home_local_grants_apply_before_workspace_trust(tmp_path, monkeypatch):
     permissions.reset()
 
     view = config.current_settings()
-    assert not view.trusted
-    assert view.local_grants_trusted
+    assert not view.project_configuration_enabled
+    assert view.local_project_grants_enabled
     assert not permissions._is_gated("bash", {"command": "local test"})
 
 
@@ -419,9 +423,9 @@ def test_parent_trust_activates_project_config_but_not_nested_grants(
     assert workspace_activation.activate_workspace_settings()
 
     view = config.current_settings()
-    assert view.trusted
-    assert not view.project_grants_trusted
-    assert view.local_grants_trusted
+    assert view.project_configuration_enabled
+    assert not view.shared_project_grants_enabled
+    assert view.local_project_grants_enabled
     assert config.resolve_model() == "project-model"
     assert prompts and "continues without these permissions" in prompts[0]
     assert not TrustManager(
@@ -447,9 +451,9 @@ def test_parent_trust_skips_backstop_when_nested_project_has_no_grants(
     )
 
     assert workspace_activation.activate_workspace_settings()
-    assert config.current_settings().trusted
-    assert not config.current_settings().project_grants_trusted
-    assert config.current_settings().local_grants_trusted
+    assert config.current_settings().project_configuration_enabled
+    assert not config.current_settings().shared_project_grants_enabled
+    assert config.current_settings().local_project_grants_enabled
     assert config.resolve_model() == "project-model"
 
 
@@ -476,7 +480,7 @@ def test_parent_trust_applies_untracked_local_grants_without_backstop(
     permissions.reset()
 
     view = config.current_settings()
-    assert view.local_grants_trusted
+    assert view.local_project_grants_enabled
     assert not permissions._is_gated("bash", {"command": "local test"})
 
 
@@ -511,7 +515,7 @@ def test_parent_trust_keeps_tracked_local_grants_behind_backstop(
     assert workspace_activation.activate_workspace_settings()
     permissions.reset()
 
-    assert not config.current_settings().local_grants_trusted
+    assert not config.current_settings().local_project_grants_enabled
     assert permissions._is_gated("bash", {"command": "tracked test"})
     assert "Bash(tracked *)" in "\n".join(shown)
 
@@ -654,7 +658,9 @@ def test_llm_configuration_loads_only_the_trusted_workspace_dotenv(
     from minicc import llm
 
     _home, project = _settings_environment(monkeypatch, tmp_path)
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     loaded = []
     configured_client = object()
     monkeypatch.setattr(llm, "MODEL", llm.MODEL)

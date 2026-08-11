@@ -161,16 +161,16 @@ def _confirm_workspace_trust(
     snapshot: config.SettingsSnapshot,
     *,
     covered_by_parent: bool = False,
-    local_grants_trusted: bool = False,
+    local_project_grants_enabled: bool = False,
 ) -> bool:
     """Ask for exact Trust of ``workspace_dir`` and show gated fields."""
     permission_entries = _workspace_trust_permission_entries(
         snapshot,
-        include_local=not local_grants_trusted,
+        include_local=not local_project_grants_enabled,
     )
     directory_entries = _workspace_trust_directory_entries(
         snapshot,
-        include_local=not local_grants_trusted,
+        include_local=not local_project_grants_enabled,
     )
     ux.console.rule()
     ux.say("Accessing workspace:", style=ux.S_INFO)
@@ -263,38 +263,38 @@ def activate_workspace_settings() -> bool:
     """
     launch_dir = Path.cwd().resolve()
     snapshot = config.discover_settings(launch_dir)
-    local_grants_trusted = launch_dir == Path.home().resolve()
+    local_project_grants_enabled = launch_dir == Path.home().resolve()
     config.activate(
         snapshot.view(
-            trusted=False,
-            local_grants_trusted=local_grants_trusted,
+            project_configuration_enabled=False,
+            local_project_grants_enabled=local_project_grants_enabled,
         )
     )
     manager = trust.TrustManager()
     identity = manager.workspace_identity(launch_dir)
     if manager.is_explicitly_trusted(identity):
-        config.activate(snapshot.view(trusted=True))
+        config.activate(snapshot.view(project_configuration_enabled=True))
         return True
     covered_by_parent = manager.is_trusted(identity)
     if covered_by_parent:
-        local_grants_trusted = not local_settings_are_repository_supplied(
+        local_project_grants_enabled = not local_settings_are_repository_supplied(
             launch_dir
         )
         config.activate(
             snapshot.view(
-                trusted=True,
-                project_grants_trusted=False,
-                local_grants_trusted=local_grants_trusted,
+                project_configuration_enabled=True,
+                shared_project_grants_enabled=False,
+                local_project_grants_enabled=local_project_grants_enabled,
             )
         )
         if not (
             _workspace_trust_permission_entries(
                 snapshot,
-                include_local=not local_grants_trusted,
+                include_local=not local_project_grants_enabled,
             )
             or _workspace_trust_directory_entries(
                 snapshot,
-                include_local=not local_grants_trusted,
+                include_local=not local_project_grants_enabled,
             )
         ):
             return True
@@ -303,7 +303,7 @@ def activate_workspace_settings() -> bool:
         identity,
         snapshot,
         covered_by_parent=covered_by_parent,
-        local_grants_trusted=local_grants_trusted,
+        local_project_grants_enabled=local_project_grants_enabled,
     ):
         if covered_by_parent:
             ux.say(
@@ -319,5 +319,5 @@ def activate_workspace_settings() -> bool:
         )
         return False
     manager.accept(identity)
-    config.activate(snapshot.view(trusted=True))
+    config.activate(snapshot.view(project_configuration_enabled=True))
     return True

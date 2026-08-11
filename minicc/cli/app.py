@@ -61,7 +61,9 @@ def _fire_session_start(session_id: str, source: str) -> str:
 
 def _session_context_with_hooks(session_id: str, source: str) -> str:
     """The session-context layer (env + git) plus any SessionStart hook context."""
-    ctx = build_session_context(include_git=config.current_settings().trusted)
+    ctx = build_session_context(
+        include_git=config.current_settings().project_configuration_enabled
+    )
     extra = _fire_session_start(session_id, source)
     if extra:
         ctx += f"\n\n# Context from SessionStart hook\n\n{extra}"
@@ -96,7 +98,11 @@ def _session_info() -> dict:
     """Pure data about this session — no presentation."""
     info = {
         "SESSION": datetime.now().isoformat(timespec="seconds"),
-        "commit": _git_sha() if config.current_settings().trusted else "restricted",
+        "commit": (
+            _git_sha()
+            if config.current_settings().project_configuration_enabled
+            else "restricted"
+        ),
         "model": llm.get_model(),
         "cwd": str(Path.cwd()),
         "os": platform.system(),
@@ -104,7 +110,7 @@ def _session_info() -> dict:
     if (Path.cwd() / "CLAUDE.md").exists():
         info["CLAUDE.md"] = (
             "found (injected as a system-reminder at first prompt)"
-            if config.current_settings().trusted
+            if config.current_settings().project_configuration_enabled
             else "found (disabled in restricted mode)"
         )
     return info

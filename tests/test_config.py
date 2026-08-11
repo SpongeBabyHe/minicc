@@ -39,7 +39,9 @@ def _write(path, data):
 
 
 def _activate_trusted():
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
 
 
 def _linked_worktree(tmp_path):
@@ -141,7 +143,9 @@ def test_restricted_view_exposes_only_user_source(monkeypatch, tmp_path):
     _write(proj / ".minicc" / "settings.json", {"default_model": "project"})
     _write(proj / ".minicc" / "settings.local.json", {"default_model": "local"})
 
-    view = config.discover_settings().view(trusted=False)
+    view = config.discover_settings().view(
+        project_configuration_enabled=False
+    )
     assert [source.scope for source in view.sources] == [config.SettingsScope.USER]
     assert view.scalar("default_model") == "user"
 
@@ -162,7 +166,9 @@ def test_runtime_configuration_reads_the_active_view(monkeypatch, tmp_path):
         proj / ".minicc" / "settings.json",
         {"default_model": "project", "cache_ttl": "5m", "web_search": True},
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     previous_model = llm.MODEL
     previous_ttl = llm.CACHE_TTL
     previous_client = llm.client

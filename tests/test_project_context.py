@@ -26,7 +26,9 @@ def _fresh_settings_view():
 
 
 def _trust_workspace():
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
 
 
 def test_untrusted_workspace_does_not_load_claude_md(tmp_path, monkeypatch):

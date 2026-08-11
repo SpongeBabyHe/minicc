@@ -119,20 +119,20 @@ class SettingsSnapshot:
     def view(
         self,
         *,
-        trusted: bool,
-        project_grants_trusted: bool | None = None,
-        local_grants_trusted: bool | None = None,
+        project_configuration_enabled: bool,
+        shared_project_grants_enabled: bool | None = None,
+        local_project_grants_enabled: bool | None = None,
     ) -> SettingsView:
         """Select generic project sources and separately gated grant fields."""
-        if project_grants_trusted is None:
-            project_grants_trusted = trusted
-        if local_grants_trusted is None:
-            local_grants_trusted = trusted
+        if shared_project_grants_enabled is None:
+            shared_project_grants_enabled = project_configuration_enabled
+        if local_project_grants_enabled is None:
+            local_project_grants_enabled = project_configuration_enabled
         return SettingsView(
             snapshot=self,
-            trusted=trusted,
-            project_grants_trusted=project_grants_trusted,
-            local_grants_trusted=local_grants_trusted,
+            project_configuration_enabled=project_configuration_enabled,
+            shared_project_grants_enabled=shared_project_grants_enabled,
+            local_project_grants_enabled=local_project_grants_enabled,
         )
 
 
@@ -140,25 +140,26 @@ class SettingsSnapshot:
 class SettingsView:
     """A snapshot filtered at the workspace Trust boundary.
 
-    ``trusted`` enables ordinary project configuration after the generic
-    workspace check. ``project_grants_trusted`` and ``local_grants_trusted``
-    independently control capability-expanding fields from the shared and local
-    project sources. Shared grants require exact Trust; local grants may also be
-    admitted after Git establishes that the repository did not supply the file,
-    or before generic Trust when the launch directory is the user's HOME.
+    ``project_configuration_enabled`` exposes ordinary project configuration
+    after the generic workspace check. ``shared_project_grants_enabled`` and
+    ``local_project_grants_enabled`` independently expose capability-expanding
+    fields from the shared and local project sources. Shared grants require
+    exact Trust; local grants may also be admitted after Git establishes that
+    the repository did not supply the file, or before generic Trust when the
+    launch directory is the user's HOME.
 
     Authorization still inspects restrictive project rules in the inert
     snapshot because ``deny`` and ``ask`` do not expand capability.
     """
 
     snapshot: SettingsSnapshot
-    trusted: bool
-    project_grants_trusted: bool
-    local_grants_trusted: bool
+    project_configuration_enabled: bool
+    shared_project_grants_enabled: bool
+    local_project_grants_enabled: bool
 
     @property
     def sources(self) -> tuple[SettingsSource, ...]:
-        if self.trusted:
+        if self.project_configuration_enabled:
             return self.snapshot.sources
         return tuple(
             source
@@ -190,12 +191,12 @@ class SettingsView:
             if entry.source.scope == SettingsScope.USER
             or (
                 entry.source.scope == SettingsScope.PROJECT_SHARED
-                and self.trusted
-                and self.project_grants_trusted
+                and self.project_configuration_enabled
+                and self.shared_project_grants_enabled
             )
             or (
                 entry.source.scope == SettingsScope.PROJECT_LOCAL
-                and self.local_grants_trusted
+                and self.local_project_grants_enabled
             )
         ]
 
@@ -349,9 +350,9 @@ def refresh_active_settings() -> SettingsView:
         include_project_sources=previous.snapshot.includes_project_sources,
     )
     _ACTIVE_SETTINGS = snapshot.view(
-        trusted=previous.trusted,
-        project_grants_trusted=previous.project_grants_trusted,
-        local_grants_trusted=previous.local_grants_trusted,
+        project_configuration_enabled=previous.project_configuration_enabled,
+        shared_project_grants_enabled=previous.shared_project_grants_enabled,
+        local_project_grants_enabled=previous.local_project_grants_enabled,
     )
     return _ACTIVE_SETTINGS
 
@@ -360,14 +361,16 @@ def current_settings() -> SettingsView:
     """Return the startup-bound view, defaulting to an untrusted user-only view."""
     if _ACTIVE_SETTINGS is not None:
         return _ACTIVE_SETTINGS
-    return discover_settings(include_project_sources=False).view(trusted=False)
+    return discover_settings(include_project_sources=False).view(
+        project_configuration_enabled=False
+    )
 
 
 def config_roots(subdir: str):
     """Trusted project roots, bounded by the workspace, then the personal root."""
     view = current_settings()
     project_roots: list[Path] = []
-    if view.trusted:
+    if view.project_configuration_enabled:
         start_dir = view.snapshot.start_dir
         boundary = workspace_root(start_dir)
         current = start_dir

@@ -166,7 +166,7 @@ def test_settings_deny_overrides_pretooluse_allow(tmp_path, monkeypatch):
         sources=(source,),
         includes_project_sources=True,
     )
-    config.activate(snapshot.view(trusted=True))
+    config.activate(snapshot.view(project_configuration_enabled=True))
     permissions.reset()
     _use(
         {
@@ -201,7 +201,7 @@ def test_updated_input_is_reauthorized_before_execution(tmp_path, monkeypatch):
         sources=(source,),
         includes_project_sources=True,
     )
-    config.activate(snapshot.view(trusted=True))
+    config.activate(snapshot.view(project_configuration_enabled=True))
     permissions.reset()
     _use(
         {
@@ -374,7 +374,9 @@ def test_load_hooks_merges_user_and_project_sources(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "_local_project_settings_path", lambda: local_project_path
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
 
     events, disabled = config.load_hooks()
     assert not disabled
@@ -398,13 +400,17 @@ def test_load_hooks_disable_uses_scalar_precedence(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "_local_project_settings_path", lambda: local_project_path
     )
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
 
     _events, disabled = config.load_hooks()
     assert disabled
 
     local_project_path.write_text(_json.dumps({"disableAllHooks": False}))
-    config.activate(config.discover_settings().view(trusted=True))
+    config.activate(
+        config.discover_settings().view(project_configuration_enabled=True)
+    )
     _events, disabled = config.load_hooks()
     assert not disabled
     config.reset_active_settings()

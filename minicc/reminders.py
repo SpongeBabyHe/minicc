@@ -113,7 +113,7 @@ def claude_md_files() -> list[tuple[Path, str]]:
     block-level HTML comments before injection.
     """
     view = config.current_settings()
-    if not view.trusted:
+    if not view.project_configuration_enabled:
         return []
     cwd = view.snapshot.start_dir
     out = []
