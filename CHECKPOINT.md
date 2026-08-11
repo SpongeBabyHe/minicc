@@ -2,7 +2,7 @@
 
 `/rewind` undoes the agent's file changes back to an earlier turn. Code (built):
 `minicc/checkpoints.py`, with the write boundary in `query_engine.py` and commands
-in `cli.py`.
+in `minicc/cli/commands.py`.
 
 ## Decisions
 

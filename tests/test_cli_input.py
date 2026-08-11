@@ -10,7 +10,7 @@ import os
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
-from minicc import cli
+from minicc.cli import app as cli
 
 
 class _PipeStdin:

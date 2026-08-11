@@ -3,9 +3,9 @@
 User-configured shell commands that fire at points in the agent loop. Faithful to
 [Claude Code's hooks](https://code.claude.com/docs/en/hooks), adapted to minicc's
 surfaces and tool names. Implemented in `minicc/hooks.py`; wired in
-`minicc/query_engine.py` (tool events + the Stop gate), `minicc/cli.py` (prompt
-and session lifecycle), and `minicc/context_management/manager.py` (compaction
-events).
+`minicc/query_engine.py` (tool events + the Stop gate), `minicc/cli/app.py`
+(prompt and session lifecycle), and `minicc/context_management/manager.py`
+(compaction events).
 
 ## Why hooks exist
 

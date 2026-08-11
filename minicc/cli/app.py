@@ -21,7 +21,8 @@ from anthropic import (
     APITimeoutError,
     RateLimitError,
 )
-from minicc import commands, context_management, llm
+from minicc import context_management, llm
+from minicc.cli import commands
 from minicc.query_engine import agent_loop
 from minicc import ux
 from minicc import permissions
@@ -35,7 +36,7 @@ from minicc import tools as tool_registry
 from minicc.tools import freshness
 from minicc.prompts.init import INIT_PROMPT
 from minicc.prompts.system import build_session_context
-from minicc.workspace_activation import activate_workspace_settings
+from minicc.cli.workspace_activation import activate_workspace_settings
 
 
 def _fire_session_start(session_id: str, source: str) -> str:

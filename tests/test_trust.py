@@ -10,7 +10,9 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
 
-from minicc import cli, config, permissions, workspace_activation
+from minicc import config, permissions
+from minicc.cli import app as cli
+from minicc.cli import workspace_activation
 from minicc.trust import TrustError, TrustManager
 from minicc.workspace import local_settings_are_repository_supplied
 

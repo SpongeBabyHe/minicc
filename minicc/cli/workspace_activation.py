@@ -1,4 +1,4 @@
-"""Workspace Trust preview and source-aware settings activation.
+"""Interactive Workspace Trust preview and source-aware settings activation.
 
 This module owns the startup decision that turns an inert settings snapshot into
 the process-wide view. Trust persistence remains in :mod:`minicc.trust`, path

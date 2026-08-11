@@ -23,13 +23,13 @@ The "agent" and "task" words each map to ONE concept — keep them separated:
 | `agents.py` | sub-agent role definitions (`.minicc/agents/*.md`) | agent defs |
 | `tools/agent.py` | the sub-agent spawn tool (name `agent`) | `Agent` (was `Task`) |
 | `tasks.py` + `tools/task_*.py` | the coordination task LIST (deps, owner) | `Task*` |
-| `cli.py` | terminal entry and top-level session/turn orchestration; routes slash commands | `App` + `cli/` |
-| `commands.py` | built-in slash-command handlers except `/clear` lifecycle rotation | `commands/` |
+| `cli/app.py` | terminal entry and top-level session/turn orchestration; routes slash commands | `App` + `cli/` |
+| `cli/commands.py` | built-in slash-command handlers except `/clear` lifecycle rotation | `commands/` |
+| `cli/workspace_activation.py` | Trust preview and source-aware startup activation | project trust dialog |
 | `prompts/` | model-facing system and built-in command prompts | system prompts |
 | `llm.py` | the API client (request assembly, cache layers, streaming) | `services/api/` |
 | `context_management/` | budgets, eviction, summary, compaction orchestration + per-conversation `ContextState` | `services/compact/` |
 | `config.py` | source-preserving settings discovery and Trust-filtered views | settings scopes |
-| `workspace_activation.py` | Trust preview and source-aware startup activation | project trust dialog |
 | `trust.py` + `workspace.py` | persisted Trust decisions, workspace identity, and local-settings provenance | project trust internals |
 | `permissions/` | source-aware rules, Bash analysis, authorization, and approval lifetimes | permissions |
 

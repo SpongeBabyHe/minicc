@@ -173,7 +173,7 @@ def streaming():
 
 - `agent_loop(messages, system=None, stream=True)` passes `stream` through;
   subagents will call with `stream=False`.
-- `cli.py` drops the post-loop re-print (streaming already shows the text) and
+- `minicc/cli/app.py` drops the post-loop re-print (streaming already shows the text) and
   rolls back the turn on interrupt/error.
 - Tests pass `stream=False` for the deterministic path.
 

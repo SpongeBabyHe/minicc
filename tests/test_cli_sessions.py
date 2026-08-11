@@ -7,7 +7,8 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
 
-from minicc import cli, sessions
+from minicc import sessions
+from minicc.cli import app as cli
 
 
 def test_resume_missing_session_exits_with_error(tmp_path, monkeypatch, capsys):

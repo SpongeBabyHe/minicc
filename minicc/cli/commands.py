@@ -1,4 +1,4 @@
-"""Built-in slash-command handlers that do not own the REPL lifecycle.
+"""Built-in slash-command handlers for the terminal interface.
 
 The CLI keeps command routing and session rotation visible in its main loop.
 Handlers here perform one command's work against explicitly supplied runtime

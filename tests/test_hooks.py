@@ -437,7 +437,8 @@ def test_precompact_block_stops_compaction_before_llm(monkeypatch):
 
 
 def test_manual_compact_veto_has_no_misleading_nothing_message(monkeypatch):
-    from minicc import commands, context_management as compact, ux
+    from minicc import context_management as compact, ux
+    from minicc.cli import commands
 
     monkeypatch.setattr(compact, "compact", lambda *args, **kwargs: None)
     said = []
@@ -504,7 +505,7 @@ def test_precompact_payload_and_continue_false_precedence(tmp_path, monkeypatch)
 # ─── wiring: SessionStart / SessionEnd in the CLI ───────────────────────────
 
 def test_session_start_context_appended(monkeypatch):
-    from minicc import cli
+    from minicc.cli import app as cli
 
     cmd = """echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"branch is main"}}'"""
     _use({"SessionStart": [_group(cmd, matcher="startup")]}, monkeypatch=monkeypatch)
@@ -514,7 +515,7 @@ def test_session_start_context_appended(monkeypatch):
 
 
 def test_session_start_matcher_filters_source(monkeypatch):
-    from minicc import cli
+    from minicc.cli import app as cli
 
     cmd = """echo '{"hookSpecificOutput":{"additionalContext":"CLEARED"}}'"""
     _use({"SessionStart": [_group(cmd, matcher="clear")]}, monkeypatch=monkeypatch)
@@ -581,7 +582,7 @@ def test_compact_session_context_persists_before_live_append(monkeypatch):
 
 
 def test_session_end_is_informational_only(monkeypatch):
-    from minicc import cli
+    from minicc.cli import app as cli
 
     # exit 2 would block a blockable event; SessionEnd must ignore it (CC contract)
     _use({"SessionEnd": [_group("echo nope >&2; exit 2")]}, monkeypatch=monkeypatch)
