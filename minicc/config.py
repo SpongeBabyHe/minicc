@@ -7,11 +7,6 @@ consumer-specific merge happens:
     <cwd>/.minicc/settings.json               (shared project)
     <repo-root>/.minicc/settings.local.json   (project-local, machine-owned)
 
-For compatibility with pre-canonicalization releases, a local settings file in
-the launch directory is also read when it differs from the repository-wide
-path. The repository-wide file has scalar precedence; permission arrays from
-both remain represented.
-
 Low-to-high precedence is user -> shared project -> project local. Scalar
 settings use the highest source that defines them; array settings concatenate
 and deduplicate in source order; hook groups concatenate without deduplication.
@@ -288,17 +283,9 @@ def discover_settings(
         else:
             shared_project_path = start / ".minicc" / "settings.json"
             local_project_path = local_settings_dir / ".minicc" / "settings.local.json"
-        paths.append(
-            (
-                SettingsScope.PROJECT_SHARED,
-                shared_project_path,
-                start,
-            )
-        )
-        legacy_local_path = start / ".minicc" / "settings.local.json"
         paths.extend(
             (
-                (SettingsScope.PROJECT_LOCAL, legacy_local_path, start),
+                (SettingsScope.PROJECT_SHARED, shared_project_path, start),
                 (SettingsScope.PROJECT_LOCAL, local_project_path, start),
             )
         )

@@ -185,8 +185,4 @@ def local_settings_are_repository_supplied(
     start = (start_dir or Path.cwd()).resolve()
     if start == Path.home().resolve():
         return False
-    roots = [start]
-    canonical = local_settings_root(start)
-    if canonical != start:
-        roots.append(canonical)
-    return any(_local_settings_path_is_repository_supplied(root) for root in roots)
+    return _local_settings_path_is_repository_supplied(local_settings_root(start))

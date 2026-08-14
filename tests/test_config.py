@@ -250,7 +250,7 @@ def test_local_settings_live_at_nearest_repository_root(monkeypatch, tmp_path):
     assert home != proj
 
 
-def test_canonical_local_settings_override_legacy_launch_copy(
+def test_discovery_ignores_local_settings_outside_canonical_root(
     monkeypatch,
     tmp_path,
 ):
@@ -279,10 +279,7 @@ def test_canonical_local_settings_override_legacy_launch_copy(
     snapshot = config.discover_settings()
 
     assert snapshot.scalar("default_model") == "canonical-model"
-    assert snapshot.array(("permissions", "allow")) == [
-        "Bash(legacy *)",
-        "Bash(canonical *)",
-    ]
+    assert snapshot.array(("permissions", "allow")) == ["Bash(canonical *)"]
     assert snapshot.source(config.SettingsScope.PROJECT_LOCAL).path == canonical
 
 
