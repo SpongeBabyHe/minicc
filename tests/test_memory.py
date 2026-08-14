@@ -95,19 +95,21 @@ def test_memory_not_offered_to_subagents():
 
 # ─── gating (writes gated, view free) ────────────────────────────────────────
 def test_memory_view_is_ungated():
-    assert permissions.confirm("memory", {"command": "view", "path": "/memories"}) is True
+    assert permissions.authorize(
+        "memory", {"command": "view", "path": "/memories"}
+    ).allowed
 
 
 def test_memory_writes_are_gated(monkeypatch):
     permissions.reset()
     monkeypatch.setattr("builtins.input", lambda _: "no")
-    assert permissions.confirm(
+    assert not permissions.authorize(
         "memory", {"command": "create", "path": "/memories/x.md", "file_text": "y"}
-    ) is False
+    ).allowed
     monkeypatch.setattr("builtins.input", lambda _: "yes")
-    assert permissions.confirm(
+    assert permissions.authorize(
         "memory", {"command": "str_replace", "path": "/memories/x.md", "old_str": "a"}
-    ) is True
+    ).allowed
 
 
 def test_memory_is_preloadable_from_config():
@@ -117,9 +119,9 @@ def test_memory_is_preloadable_from_config():
     applied = permissions.preload(["memory"])
     assert "memory" in applied
     # a write now skips the prompt (no input() needed — would raise OSError if asked)
-    assert permissions.confirm(
+    assert permissions.authorize(
         "memory", {"command": "create", "path": "/memories/x.md", "file_text": "y"}
-    ) is True
+    ).allowed
     permissions.reset()
 
 
@@ -145,10 +147,12 @@ def test_delete_file_and_guards(store):
     assert "escapes" in memory.delete("/memories/../../etc")       # traversal blocked
 
 
-def test_memory_delete_is_gated(monkeypatch):
+def test_memory_delete_requires_approval(monkeypatch):
     permissions.reset()
     monkeypatch.setattr("builtins.input", lambda _: "no")
-    assert permissions.confirm("memory", {"command": "delete", "path": "/memories/x.md"}) is False
+    assert not permissions.authorize(
+        "memory", {"command": "delete", "path": "/memories/x.md"}
+    ).allowed
 
 
 def test_consolidate_runs_agent_loop_with_memory_tool_only(store, monkeypatch):

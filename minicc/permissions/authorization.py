@@ -39,6 +39,7 @@ def derive_rules(command: str) -> list[str]:
 
 
 def _requires_prompt_by_default(tool_name: str, tool_input: dict) -> bool:
+    """Return whether an otherwise ungranted call needs user approval."""
     if tool_name not in GATED_TOOLS:
         return False
     gated_commands = _GATED_COMMANDS.get(tool_name)
@@ -52,6 +53,7 @@ def _auto_allowed(
     tool_input: dict,
     hook_allow: bool = False,
 ) -> bool:
+    """Return whether a call can run silently after deny and ask checks."""
     if hook_allow or tool_name in _ALLOWED or tool_name in _SKILL_TOOLS:
         return True
     if tool_name == "bash":
@@ -65,26 +67,11 @@ def _auto_allowed(
     return not _requires_prompt_by_default(tool_name, tool_input)
 
 
-def _is_gated(tool_name: str, tool_input: dict) -> bool:
-    """Whether a call is not currently auto-authorized.
-
-    Policy denial also returns true: compatibility callers use this helper to
-    ask whether execution may proceed silently, not whether a prompt will
-    necessarily be shown.
-    """
-    if rules.matching_rule(PermissionEffect.DENY, tool_name, tool_input):
-        return True
-    if rules.matching_rule(PermissionEffect.ASK, tool_name, tool_input):
-        return True
-    return not _auto_allowed(tool_name, tool_input)
-
-
 def filter_tools(tools: list[dict]) -> list[dict]:
-    """Remove tools disabled for every call before advertising them.
+    """Hide tools that policy cannot safely advertise to the model.
 
-    ``web_search`` runs inside the Messages API, so minicc cannot pause at an
-    individual invocation. Any deny or ask rule for that server tool therefore
-    fails closed by hiding it rather than bypassing scoped policy.
+    Server-side deny or ask rules hide the tool because execution cannot pause
+    locally for per-call authorization.
     """
     permission_rules = rules.permission_rules()
     blocking = [rule for rule in permission_rules if rules.matches_all_uses(rule)]
@@ -115,6 +102,7 @@ def filter_tools(tools: list[dict]) -> list[dict]:
 
 
 def _format_args(tool_name: str, tool_input: dict) -> str:
+    """Render relevant tool arguments for the approval prompt."""
     if tool_name == "bash":
         return ux.kv_block(
             [
@@ -182,6 +170,7 @@ def _prompt(
     one_time_only: bool,
     requested_by: str | None = None,
 ) -> bool:
+    """Prompt for one call and record any session or persistent grant."""
     ux.say(_format_args(tool_name, tool_input))
     save_rules = (
         derive_rules(str(tool_input.get("command", "")))
@@ -213,6 +202,7 @@ def _prompt(
 
 
 def _rule_reason(rule: PermissionRule) -> str:
+    """Describe the settings rule that denied a tool call."""
     return (
         f"Denied by {rule.source.scope.value} permission rule {rule.raw!r} "
         f"from {str(rule.source.path)!r}."
@@ -220,6 +210,7 @@ def _rule_reason(rule: PermissionRule) -> str:
 
 
 def _ask_source(rule: PermissionRule) -> str:
+    """Describe the settings rule that requires one-time approval."""
     return (
         f"{rule.source.scope.value} permission rule {rule.raw!r} "
         f"from {str(rule.source.path)!r}"
@@ -258,11 +249,6 @@ def authorize(
     ):
         return AuthorizationResult(True)
     return AuthorizationResult(False, f"User declined to run {tool_name}.")
-
-
-def confirm(tool_name: str, tool_input: dict, force: bool = False) -> bool:
-    """Compatibility wrapper returning only :func:`authorize`'s boolean."""
-    return authorize(tool_name, tool_input, hook_ask=force).allowed
 
 
 def grant_skill_tools(entries: list) -> None:

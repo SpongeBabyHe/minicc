@@ -15,16 +15,22 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 import pytest
 
 from minicc import config, permissions
-from minicc.permissions import _is_gated, derive_rules, is_readonly_command
+from minicc.permissions import derive_rules, is_readonly_command
 
 
 @pytest.fixture(autouse=True)
-def _fresh_rules():
+def _fresh_rules(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *_args: "no")
     config.reset_active_settings()
     permissions.reset()
     yield
     permissions.reset()
     config.reset_active_settings()
+
+
+def _allowed_without_approval(tool_name: str, tool_input: dict) -> bool:
+    """Whether public authorization succeeds when the user declines prompts."""
+    return permissions.authorize(tool_name, tool_input).allowed
 
 
 # ─── plain read-only commands run free ───────────────────────────────────────
@@ -145,15 +151,15 @@ def test_cd_inside_cwd_allowed(tmp_path, monkeypatch):
     assert not is_readonly_command("cd ~ && ls")
 
 
-# ─── integration: _is_gated consults the carve-outs for bash only ────────────
+# ─── integration: authorization consults Bash carve-outs only ────────────────
 
-def test_is_gated_bash_readonly_carveout():
-    assert not _is_gated("bash", {"command": "git status"})
-    assert _is_gated("bash", {"command": "pip install requests"})
-    assert _is_gated("bash", {"command": "ls && rm x"})
+def test_authorization_uses_bash_readonly_carveout():
+    assert _allowed_without_approval("bash", {"command": "git status"})
+    assert not _allowed_without_approval("bash", {"command": "pip install requests"})
+    assert not _allowed_without_approval("bash", {"command": "ls && rm x"})
     # other gated tools unaffected
-    assert _is_gated("write_file", {"path": "x", "content": "y"})
-    assert not _is_gated("memory", {"command": "view"})
+    assert not _allowed_without_approval("write_file", {"path": "x", "content": "y"})
+    assert _allowed_without_approval("memory", {"command": "view"})
 
 
 # ─── persisted allow rules (CC's Bash(prefix *) semantics) ───────────────────
@@ -194,49 +200,49 @@ def _set_rules(path, rules):
 
 def test_rule_wildcard_word_boundary(_rules_env):
     _set_rules(_rules_env, ["bash(uv run *)"])
-    assert not _is_gated("bash", {"command": "uv run pytest tests/ -q"})
-    assert not _is_gated("bash", {"command": "uv run"})       # trailing-* matches bare prefix
-    assert _is_gated("bash", {"command": "uv runx"})           # word boundary holds
-    assert _is_gated("bash", {"command": "uv sync"})           # different subcommand
+    assert _allowed_without_approval("bash", {"command": "uv run pytest tests/ -q"})
+    assert _allowed_without_approval("bash", {"command": "uv run"})  # trailing-* matches bare prefix
+    assert not _allowed_without_approval("bash", {"command": "uv runx"})  # word boundary holds
+    assert not _allowed_without_approval("bash", {"command": "uv sync"})  # different subcommand
 
 
 def test_rule_exact_and_mid_wildcard_and_colon_alias(_rules_env):
     _set_rules(_rules_env, ["bash(npm test)", "bash(git * main)", "bash(make:*)"])
-    assert not _is_gated("bash", {"command": "npm test"})      # exact
-    assert _is_gated("bash", {"command": "npm test --watch"})  # exact ≠ prefix
-    assert not _is_gated("bash", {"command": "git checkout main"})  # mid-* spans args
-    assert not _is_gated("bash", {"command": "make build"})    # :* alias == " *"
+    assert _allowed_without_approval("bash", {"command": "npm test"})  # exact
+    assert not _allowed_without_approval("bash", {"command": "npm test --watch"})  # exact ≠ prefix
+    assert _allowed_without_approval("bash", {"command": "git checkout main"})  # mid-* spans args
+    assert _allowed_without_approval("bash", {"command": "make build"})  # :* alias == " *"
 
 
 def test_rule_accepts_cc_capitalized_export(_rules_env):
     _set_rules(_rules_env, ["Bash(uv run *)"])                 # CC-exported shape drops in
-    assert not _is_gated("bash", {"command": "uv run pytest"})
+    assert _allowed_without_approval("bash", {"command": "uv run pytest"})
 
 
 def test_bash_star_is_equivalent_to_bare_bash(_rules_env):
     _set_rules(_rules_env, ["Bash(*)"])
 
-    assert not _is_gated("bash", {"command": "echo $(date)"})
+    assert _allowed_without_approval("bash", {"command": "echo $(date)"})
 
 
 def test_rule_compound_mix_and_fail_safe(_rules_env):
     _set_rules(_rules_env, ["bash(uv run *)"])
     # read-only + rule-matched subcommands mix freely
-    assert not _is_gated("bash", {"command": "git status && uv run pytest -q"})
+    assert _allowed_without_approval("bash", {"command": "git status && uv run pytest -q"})
     # one unmatched subcommand gates the whole command
-    assert _is_gated("bash", {"command": "uv run pytest && pip install x"})
+    assert not _allowed_without_approval("bash", {"command": "uv run pytest && pip install x"})
     # unsafe metacharacters still gate even when a rule would match
-    assert _is_gated("bash", {"command": "uv run pytest > /tmp/out"})
+    assert not _allowed_without_approval("bash", {"command": "uv run pytest > /tmp/out"})
     # wrappers stripped before matching (CC rule); safe redirects exempt
-    assert not _is_gated("bash", {"command": "timeout 300 uv run pytest 2>&1"})
+    assert _allowed_without_approval("bash", {"command": "timeout 300 uv run pytest 2>&1"})
 
 
 def test_broad_find_rule_does_not_autoapprove_mutating_forms(_rules_env):
     _set_rules(_rules_env, ["Bash(find *)"])
 
-    assert not _is_gated("bash", {"command": "find . -name '*.py'"})
-    assert _is_gated("bash", {"command": "find . -delete"})
-    assert _is_gated("bash", {"command": "find . -fprint0 paths.txt"})
+    assert _allowed_without_approval("bash", {"command": "find . -name '*.py'"})
+    assert not _allowed_without_approval("bash", {"command": "find . -delete"})
+    assert not _allowed_without_approval("bash", {"command": "find . -fprint0 paths.txt"})
 
 
 def test_derive_rules_shapes(_rules_env):
@@ -252,12 +258,14 @@ def test_derive_rules_shapes(_rules_env):
 
 def test_always_persists_and_applies(_rules_env, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *a: "always")
-    assert permissions.confirm("bash", {"command": "uv run pytest tests/ -q"})
+    assert permissions.authorize(
+        "bash", {"command": "uv run pytest tests/ -q"}
+    ).allowed
     # rule live in-session without reset
-    assert not _is_gated("bash", {"command": "uv run ruff check ."})
+    assert _allowed_without_approval("bash", {"command": "uv run ruff check ."})
     # and persisted: survives a cache reset (re-read from the settings file)
     permissions.reset()
-    assert not _is_gated("bash", {"command": "uv run pytest"})
+    assert _allowed_without_approval("bash", {"command": "uv run pytest"})
     assert "bash(uv run *)" in _rules_env.read_text()
 
 
@@ -313,8 +321,8 @@ def test_restricted_workspace_keeps_project_deny_and_ask_but_delays_allow(
         project_configuration_enabled=False,
     )
 
-    assert not _is_gated("bash", {"command": "uv run pytest"})
-    assert _is_gated("bash", {"command": "npm run test"})
+    assert _allowed_without_approval("bash", {"command": "uv run pytest"})
+    assert not _allowed_without_approval("bash", {"command": "npm run test"})
     assert not permissions.authorize(
         "bash",
         {"command": "git push origin"},
@@ -457,9 +465,9 @@ def test_switching_to_trusted_view_invalidates_permission_rule_cache(
     )
     snapshot = config.current_settings().snapshot
 
-    assert _is_gated("bash", {"command": "npm run test"})
+    assert not _allowed_without_approval("bash", {"command": "npm run test"})
     config.activate(snapshot.view(project_configuration_enabled=True))
-    assert not _is_gated("bash", {"command": "npm run test"})
+    assert _allowed_without_approval("bash", {"command": "npm run test"})
 
 
 def test_parent_covered_view_keeps_project_allow_gated(
@@ -483,7 +491,7 @@ def test_parent_covered_view_keeps_project_allow_gated(
     permissions.reset()
 
     assert config.current_settings().project_configuration_enabled
-    assert _is_gated("bash", {"command": "npm run test"})
+    assert not _allowed_without_approval("bash", {"command": "npm run test"})
 
 
 def test_bare_deny_removes_tool_from_advertised_schema(tmp_path, monkeypatch):
@@ -656,8 +664,10 @@ def test_skill_edit_group_grants_both_file_editing_tools(tmp_path, monkeypatch):
 
     permissions.grant_skill_tools(["Edit"])
 
-    assert not _is_gated("edit_file", {"path": "x", "old_text": "", "new_text": "y"})
-    assert not _is_gated("write_file", {"path": "x", "content": "y"})
+    assert _allowed_without_approval(
+        "edit_file", {"path": "x", "old_text": "", "new_text": "y"}
+    )
+    assert _allowed_without_approval("write_file", {"path": "x", "content": "y"})
 
 
 def test_webfetch_domain_wildcards_do_not_cross_unintended_labels(
@@ -900,12 +910,16 @@ def test_empty_answer_reprompts_instead_of_declining(monkeypatch):
     # a buffered Enter must never decide a permission
     answers = iter(["", "", "yes"])
     monkeypatch.setattr("builtins.input", lambda *a: next(answers))
-    assert permissions.confirm("write_file", {"path": "x", "content": "y"})
+    assert permissions.authorize(
+        "write_file", {"path": "x", "content": "y"}
+    ).allowed
 
 
 def test_explicit_no_still_declines(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *a: "no")
-    assert not permissions.confirm("write_file", {"path": "x", "content": "y"})
+    assert not permissions.authorize(
+        "write_file", {"path": "x", "content": "y"}
+    ).allowed
 
 
 def test_add_allow_rule_tolerates_malformed_settings(_rules_env):

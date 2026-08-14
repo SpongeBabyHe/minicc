@@ -201,10 +201,14 @@ def test_registered_but_not_for_subagents():
     assert schema["input_schema"]["required"] == ["url", "prompt"]   # CC shape
 
 
-def test_web_fetch_is_gated(monkeypatch):
+def test_web_fetch_requires_approval(monkeypatch):
     permissions.reset()
     monkeypatch.setattr("builtins.input", lambda _: "no")
-    assert permissions.confirm("web_fetch", {"url": "https://x.test", "prompt": "q"}) is False
+    assert not permissions.authorize(
+        "web_fetch", {"url": "https://x.test", "prompt": "q"}
+    ).allowed
     monkeypatch.setattr("builtins.input", lambda _: "yes")
-    assert permissions.confirm("web_fetch", {"url": "https://x.test", "prompt": "q"}) is True
+    assert permissions.authorize(
+        "web_fetch", {"url": "https://x.test", "prompt": "q"}
+    ).allowed
     permissions.reset()

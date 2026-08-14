@@ -329,7 +329,7 @@ def test_home_local_grants_apply_before_workspace_trust(tmp_path, monkeypatch):
     view = config.current_settings()
     assert not view.project_configuration_enabled
     assert view.local_project_grants_enabled
-    assert not permissions._is_gated("bash", {"command": "local test"})
+    assert permissions.authorize("bash", {"command": "local test"}).allowed
 
 
 def test_cli_trust_prompt_summarizes_gated_permissions(tmp_path, monkeypatch):
@@ -481,7 +481,7 @@ def test_parent_trust_applies_untracked_local_grants_without_backstop(
 
     view = config.current_settings()
     assert view.local_project_grants_enabled
-    assert not permissions._is_gated("bash", {"command": "local test"})
+    assert permissions.authorize("bash", {"command": "local test"}).allowed
 
 
 def test_parent_trust_keeps_tracked_local_grants_behind_backstop(
@@ -516,7 +516,7 @@ def test_parent_trust_keeps_tracked_local_grants_behind_backstop(
     permissions.reset()
 
     assert not config.current_settings().local_project_grants_enabled
-    assert permissions._is_gated("bash", {"command": "tracked test"})
+    assert not permissions.authorize("bash", {"command": "tracked test"}).allowed
     assert "Bash(tracked *)" in "\n".join(shown)
 
 
@@ -542,6 +542,31 @@ def test_local_settings_git_provenance_distinguishes_untracked_and_tracked(
     )
 
     assert local_settings_are_repository_supplied(project)
+
+
+def test_local_settings_provenance_ignores_noncanonical_launch_copy(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    launch_dir = project / "packages" / "app"
+    home.mkdir()
+    (project / ".minicc").mkdir(parents=True)
+    launch_dir.mkdir(parents=True)
+    (project / ".minicc" / "settings.local.json").write_text("{}")
+    legacy_dir = launch_dir / ".minicc"
+    legacy_dir.mkdir()
+    (legacy_dir / "settings.local.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(
+        ["git", "add", "packages/app/.minicc/settings.local.json"],
+        cwd=project,
+        check=True,
+    )
+
+    assert not local_settings_are_repository_supplied(launch_dir)
 
 
 def test_cli_trust_prompt_displays_launch_directory_and_repository_identity(

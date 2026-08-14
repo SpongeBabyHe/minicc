@@ -286,22 +286,31 @@ def test_user_invoke_rules(_isolated):
 
 # ─── allowed-tools grants ─────────────────────────────────────────────────────
 
-def test_allowed_tools_grants_until_cleared(_isolated):
+def test_allowed_tools_grants_until_cleared(_isolated, monkeypatch):
     proj, _ = _isolated
+    monkeypatch.setattr("builtins.input", lambda *_args: "no")
     _install(
         proj,
         "commit",
         "---\nallowed-tools: bash(git add *), write_file\n---\nCommit it.",
     )
-    assert permissions._is_gated("bash", {"command": "git add -A"})
-    assert permissions._is_gated("write_file", {"path": "x", "content": "y"})
+    assert not permissions.authorize("bash", {"command": "git add -A"}).allowed
+    assert not permissions.authorize(
+        "write_file", {"path": "x", "content": "y"}
+    ).allowed
     skills.user_invoke("commit")
-    assert not permissions._is_gated("bash", {"command": "git add -A"})
-    assert not permissions._is_gated("write_file", {"path": "x", "content": "y"})
-    assert permissions._is_gated("bash", {"command": "git push"})  # not granted
+    assert permissions.authorize("bash", {"command": "git add -A"}).allowed
+    assert permissions.authorize(
+        "write_file", {"path": "x", "content": "y"}
+    ).allowed
+    assert not permissions.authorize(
+        "bash", {"command": "git push"}
+    ).allowed  # not granted
     permissions.clear_skill_grants()  # the next user prompt
-    assert permissions._is_gated("bash", {"command": "git add -A"})
-    assert permissions._is_gated("write_file", {"path": "x", "content": "y"})
+    assert not permissions.authorize("bash", {"command": "git add -A"}).allowed
+    assert not permissions.authorize(
+        "write_file", {"path": "x", "content": "y"}
+    ).allowed
 
 
 def test_grant_entries_split_and_dir_substitution(_isolated):
@@ -314,6 +323,6 @@ def test_grant_entries_split_and_dir_substitution(_isolated):
     )
     entries = skills.apply_grants(skills.lookup("lint"))
     assert entries == [f"bash({d}/scripts/lint.sh *)", "bash(git commit *)"]
-    assert not permissions._is_gated(
+    assert permissions.authorize(
         "bash", {"command": f"{d}/scripts/lint.sh --fix"}
-    )
+    ).allowed
