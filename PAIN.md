@@ -51,8 +51,8 @@ Format: `- YYYY-MM-DD: what happened`. Mark `FIXED` / `→ followup` inline.
 - 2026-07-04: web_fetch upgraded to CC's documented design same day (user asked
   "对标CC?" — the simple version wasn't): url+prompt → small-model extraction
   ("lossy by design"; 13.3K-char page → 2K answer in live test), 15-min cache,
-  cross-host-redirect notice, http→https. Divergence left: per-DOMAIN permission
-  granularity (CC prompts per new domain; minicc gates per call).
+  cross-host-redirect notice, http→https. Its permission prompt now mirrors CC's
+  per-domain lifetime: one-call approval or a project-local exact-host rule.
 - 2026-07-04: web_search decision SETTLED by official tools-reference: CC's
   WebSearch runs on Anthropic's server-side web search backend ("not
   configurable") → server-side web_search tool IS the CC-faithful choice for minicc.

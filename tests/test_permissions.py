@@ -266,7 +266,127 @@ def test_always_persists_and_applies(_rules_env, monkeypatch):
     # and persisted: survives a cache reset (re-read from the settings file)
     permissions.reset()
     assert _allowed_without_approval("bash", {"command": "uv run pytest"})
-    assert "bash(uv run *)" in _rules_env.read_text()
+    assert "Bash(uv run *)" in _rules_env.read_text()
+
+
+def test_bash_prompt_offers_scoped_persistence_not_whole_session(
+    _rules_env,
+    monkeypatch,
+):
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "no",
+    )
+
+    result = permissions.authorize("bash", {"command": "uv run pytest"})
+
+    assert not result.allowed
+    assert prompts and "[yes/always/no]" in prompts[0]
+
+
+def test_edit_session_grant_is_shared_by_edit_and_write(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "all",
+    )
+
+    assert permissions.authorize(
+        "edit_file",
+        {"path": "x", "old_text": "old", "new_text": "new"},
+    ).allowed
+    assert prompts and "[yes/all/no]" in prompts[0]
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(
+            AssertionError("shared edit grant should skip the write prompt")
+        ),
+    )
+    assert permissions.authorize(
+        "write_file",
+        {"path": "y", "content": "content"},
+    ).allowed
+
+    permissions.reset()
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    assert not permissions.authorize(
+        "write_file",
+        {"path": "z", "content": "content"},
+    ).allowed
+
+
+def test_web_fetch_always_persists_only_the_current_domain(
+    _rules_env,
+    monkeypatch,
+):
+    approval_prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: approval_prompts.append(prompt) or "always",
+    )
+    assert permissions.authorize(
+        "web_fetch",
+        {"url": "https://Example.COM.:8443/path", "prompt": "extract"},
+    ).allowed
+    assert approval_prompts and "[yes/always/no]" in approval_prompts[0]
+    assert "WebFetch(domain:example.com)" in _rules_env.read_text()
+
+    permissions.reset()
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "no",
+    )
+    assert permissions.authorize(
+        "web_fetch",
+        {"url": "https://example.com/other", "prompt": "extract"},
+    ).allowed
+    assert not prompts
+    assert not permissions.authorize(
+        "web_fetch",
+        {"url": "https://other.example/", "prompt": "extract"},
+    ).allowed
+    assert len(prompts) == 1
+
+
+@pytest.mark.parametrize("url", ["ftp://example.com/file", "https://[invalid"])
+def test_web_fetch_does_not_offer_persistence_without_a_valid_http_domain(
+    _rules_env,
+    monkeypatch,
+    url,
+):
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "no",
+    )
+
+    assert not permissions.authorize(
+        "web_fetch",
+        {"url": url, "prompt": "extract"},
+    ).allowed
+    assert prompts and "[yes/no]" in prompts[0]
+
+
+def test_memory_all_remains_a_session_only_batch_grant(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _prompt: "all")
+    assert permissions.authorize(
+        "memory",
+        {"command": "create", "path": "/memories/a", "file_text": "a"},
+    ).allowed
+
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: (_ for _ in ()).throw(
+            AssertionError("memory session grant should skip the next prompt")
+        ),
+    )
+    assert permissions.authorize(
+        "memory",
+        {"command": "delete", "path": "/memories/a"},
+    ).allowed
 
 
 # ─── source-aware deny → ask → allow policy ─────────────────────────────────
@@ -922,11 +1042,16 @@ def test_explicit_no_still_declines(monkeypatch):
     ).allowed
 
 
-def test_add_allow_rule_tolerates_malformed_settings(_rules_env):
+def test_add_local_allow_rules_tolerates_malformed_settings(_rules_env):
     import json
 
     _rules_env.parent.mkdir(parents=True, exist_ok=True)
     _rules_env.write_text(json.dumps({"permissions": []}))  # hand-edited breakage
-    config.add_allow_rule("uv run *")                       # must not crash
+    config.add_local_allow_rules(
+        ["Bash(uv run *)", "WebFetch(domain:example.com)"]
+    )
     data = json.loads(_rules_env.read_text())
-    assert data["permissions"]["allow"] == ["bash(uv run *)"]
+    assert data["permissions"]["allow"] == [
+        "Bash(uv run *)",
+        "WebFetch(domain:example.com)",
+    ]

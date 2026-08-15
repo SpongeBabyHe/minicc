@@ -46,6 +46,11 @@ friction. minicc now mirrors both mechanisms (`is_readonly_command` and
 - **Bash wildcards** retain the existing semantics: `*` spans spaces; trailing
   `" *"` (alias `:*`) is a word boundary. The `always` answer persists a narrow
   first-two-token rule to project-local settings.
+- **Interactive approval scope is tool-specific**, matching CC rather than
+  treating every gated tool alike: Bash offers one-call approval or a bounded
+  persistent command rule; Edit and Write share one session-only editing grant;
+  WebFetch offers one-call approval or a persistent rule for the exact hostname;
+  memory writes retain minicc's session-only batch grant.
 - **Path rules** retain their settings source. A single `/` anchors at that
   source: shared-project rules use that project source's directory, local rules
   use the original launch directory, and user rules use `~/.minicc`. Relative
@@ -117,8 +122,19 @@ settings deny?         → blocked, even if Hook or Skill says allow
 hook/settings ask?     → one-shot prompt [yes / no]
 matching allow/grant?  → run without prompting
 built-in free call?    → run without prompting
-else                   → prompt [yes / no / all / always when safely derivable]
+else                   → prompt with that tool's supported approval scopes
 ```
+
+The default interactive choices are therefore:
+
+- Bash: `yes / always / no`, where `always` saves bounded `Bash(...)` rules.
+- Edit or Write: `yes / all / no`, where `all` enables both editing tools until
+  the session is reset.
+- WebFetch: `yes / always / no`, where `always` saves the exact
+  `WebFetch(domain:...)` hostname rule.
+- Memory writes: `yes / all / no`, where `all` lasts for this session.
+- A settings or Hook `ask` decision always reduces the prompt to `yes / no` so
+  it cannot silently override the restrictive policy that requested review.
 
 A bare deny rule such as `Write` also removes that tool schema before the request
 is sent, so the model is not encouraged to call a capability that policy has
@@ -148,29 +164,34 @@ boundaries (the denylist still misses e.g. `rm -rf ~`).
   tool names granted when a skill is invoked, cleared at the **next user
   message** (CC's window). Printed when applied ("skill grants (until your
   next message): …"). Never persisted; `reset()` clears it too.
-- **`'all'` at a prompt** — whole-tool, session only (in-memory; gone on
-  restart / `/clear`).
+- **`'all'` at an Edit or Write prompt** — one shared file-editing grant for the
+  session, covering both tools and disappearing on restart or `/clear`.
+- **`'all'` at a memory-write prompt** — minicc's session-only batch grant for
+  memory mutations.
 - **`allowed_tools` in settings** — legacy whole-tool, hand-edited, persistent;
   project entries require Workspace Trust and bash remains excluded
   (`NO_PRELOAD`).
-- **`'always'` at a bash prompt** — a **narrow prefix rule** (`bash(uv run *)`),
+- **`'always'` at a bash prompt** — a **narrow prefix rule** (`Bash(uv run *)`),
   persisted to `.minicc/settings.local.json` at the workspace root. Restricted
   workspaces do not offer this project-local persistence choice.
+- **`'always'` at a WebFetch prompt** — an exact hostname rule such as
+  `WebFetch(domain:docs.example.com)`, persisted to the same project-local file.
 
 The principle that governs all four:
 
 > A mistake's cost = its permanence × its silence.
 
-A hasty whole-tool `'all'` must **never auto-persist** — otherwise the prompt
-meant to protect you trains you to disable it forever, which is why whole-tool
-bash trust remains strictly session-scoped.
+A broad session choice must **never auto-persist** — otherwise the prompt meant
+to protect you trains you to disable it forever. Bash therefore has no
+interactive whole-tool session grant; persistent approval requires bounded
+command rules. WebFetch follows the same principle with an exact hostname rule.
 
 **Revised 2026-07-12** (was: "the one tool never eligible for persistence is
-bash"): **rule granularity changes the arithmetic**. A persisted `bash(uv run *)`
+bash"): **rule granularity changes the arithmetic**. A persisted `Bash(uv run *)`
 is not "trust bash forever"; it's "trust this reviewed command family".
 Permanence is bounded by the prefix; silence is removed by the startup print
-("bash allow rules from settings: …") and by the rule being written only on an
-explicit `always` answer at a visible prompt. Both factors shrink — that's what
+("permission allow rules from settings: …") and by the rule being written only
+on an explicit `always` answer at a visible prompt. Both factors shrink — that's what
 makes persistence defensible. This is CC's own resolution (its "don't ask again"
 persists per project + command prefix).
 

@@ -17,7 +17,6 @@ from .rules import parse_rules, permission_rules
 from .authorization import (
     GATED_TOOLS,
     NO_PRELOAD,
-    _ALLOWED,
     authorize,
     clear_skill_grants,
     derive_rules,

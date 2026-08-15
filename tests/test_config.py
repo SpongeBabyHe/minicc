@@ -356,12 +356,29 @@ def test_allowed_tools_empty_when_unset(monkeypatch, tmp_path):
     assert config.allowed_tools() == []
 
 
+def test_permission_allow_rules_include_each_tool_type(monkeypatch, tmp_path):
+    home, proj = _setup(monkeypatch, tmp_path)
+    _write(
+        home / ".minicc" / "settings.json",
+        {"permissions": {"allow": ["Bash(uv run *)"]}},
+    )
+    _write(
+        proj / ".minicc" / "settings.json",
+        {"permissions": {"allow": ["WebFetch(domain:example.com)"]}},
+    )
+    _activate_trusted()
+
+    assert config.permission_allow_rules() == [
+        "Bash(uv run *)",
+        "WebFetch(domain:example.com)",
+    ]
+
+
 def test_preload_excludes_bash_and_non_gated():
     from minicc import permissions
     permissions.reset()
     applied = permissions.preload(["write_file", "edit_file", "read_file", "bash", "bogus"])
     assert applied == {"write_file", "edit_file"}     # bash excluded; read_file/bogus not gated
-    assert "bash" not in permissions._ALLOWED         # bash never pre-approved from config
     permissions.reset()
 
 

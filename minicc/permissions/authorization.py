@@ -7,6 +7,7 @@ UI; it decides whether a call may run but does not sandbox an approved handler.
 
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from minicc import config, ux
@@ -24,8 +25,28 @@ _GATED_COMMANDS = {"memory": {"create", "str_replace", "delete"}}
 # Persistent Bash grants must use a narrow ``permissions.allow`` rule.
 NO_PRELOAD = {"bash"}
 
-# Session-wide grants created by the interactive ``all`` answer.
-_ALLOWED: set[str] = set()
+# Legacy whole-tool grants loaded from trusted ``allowed_tools`` settings.
+_PREAPPROVED_TOOLS: set[str] = set()
+
+
+@dataclass(frozen=True)
+class _SessionGrant:
+    """One interactive capability grant that expires with the session."""
+
+    key: str
+    label: str
+
+
+# Interactive session grants are capability-scoped rather than tool-scoped.
+_SESSION_GRANTS: set[str] = set()
+_SESSION_GRANT_BY_TOOL = {
+    "edit_file": _SessionGrant("file_edits", "allow all edits during this session"),
+    "write_file": _SessionGrant("file_edits", "allow all edits during this session"),
+    "memory": _SessionGrant(
+        "memory_writes",
+        "allow all memory writes during this session",
+    ),
+}
 
 # Skill frontmatter grants live only until the next user prompt.
 _SKILL_RULES: list[tuple[str, re.Pattern]] = []
@@ -54,7 +75,13 @@ def _auto_allowed(
     hook_allow: bool = False,
 ) -> bool:
     """Return whether a call can run silently after deny and ask checks."""
-    if hook_allow or tool_name in _ALLOWED or tool_name in _SKILL_TOOLS:
+    session_grant = _SESSION_GRANT_BY_TOOL.get(tool_name)
+    if (
+        hook_allow
+        or tool_name in _PREAPPROVED_TOOLS
+        or tool_name in _SKILL_TOOLS
+        or (session_grant is not None and session_grant.key in _SESSION_GRANTS)
+    ):
         return True
     if tool_name == "bash":
         return bash.command_is_allowed(
@@ -144,8 +171,8 @@ def _format_args(tool_name: str, tool_input: dict) -> str:
     return ux.kv_block(list(tool_input.items()))
 
 
-def _read_answer(prompt: str) -> str:
-    """Read a non-empty approval answer after flushing stale TTY input."""
+def _read_answer(prompt: str, choices: tuple[str, ...]) -> str:
+    """Read one valid approval answer after flushing stale TTY input."""
     try:
         import termios
 
@@ -155,12 +182,28 @@ def _read_answer(prompt: str) -> str:
         pass
     while True:
         answer = input(prompt).strip().lower()
-        if answer:
+        if answer in choices:
             return answer
         ux.say(
-            "(empty answer ignored — type yes, no, all, or always)",
+            f"(type {', '.join(choices)})",
             style=ux.S_INFO,
         )
+
+
+def _persistent_allow_rules(tool_name: str, tool_input: dict) -> list[str]:
+    """Derive the bounded local rules offered by a persistent approval."""
+    if not config.current_settings().local_project_grants_enabled:
+        return []
+    if tool_name == "bash":
+        command = str(tool_input.get("command", ""))
+        return [f"Bash({pattern})" for pattern in derive_rules(command)]
+    if tool_name == "web_fetch":
+        url = str(tool_input.get("url", ""))
+        if not url.startswith(("http://", "https://")):
+            return []
+        domain = rules.web_fetch_domain(url)
+        return [f"WebFetch(domain:{domain})"] if domain else []
+    return []
 
 
 def _prompt(
@@ -170,33 +213,32 @@ def _prompt(
     one_time_only: bool,
     requested_by: str | None = None,
 ) -> bool:
-    """Prompt for one call and record any session or persistent grant."""
+    """Prompt with the approval scopes supported by this specific tool."""
     ux.say(_format_args(tool_name, tool_input))
+    session_grant = None if one_time_only else _SESSION_GRANT_BY_TOOL.get(tool_name)
     save_rules = (
-        derive_rules(str(tool_input.get("command", "")))
-        if (
-            tool_name == "bash"
-            and not one_time_only
-            and config.current_settings().local_project_grants_enabled
-        )
-        else []
+        [] if one_time_only else _persistent_allow_rules(tool_name, tool_input)
     )
-    options = "[yes/no]" if one_time_only else "[yes/no/all]"
-    if save_rules and not one_time_only:
+    choices = ["yes"]
+    if session_grant is not None:
+        ux.say(f"all = {session_grant.label}", style=ux.S_INFO)
+        choices.append("all")
+    if save_rules:
         ux.say(
             f"always = don't ask again for: {', '.join(save_rules)}  "
             "(saved to local settings)",
             style=ux.S_INFO,
         )
-        options = "[yes/no/all/always]"
+        choices.append("always")
+    choices.append("no")
     source = f" ({requested_by})" if requested_by else ""
-    answer = _read_answer(f"Approve{source}? {options}: ")
-    if answer == "all" and not one_time_only:
-        _ALLOWED.add(tool_name)
+    accepted = tuple(choices)
+    answer = _read_answer(f"Approve{source}? [{'/'.join(accepted)}]: ", accepted)
+    if answer == "all" and session_grant is not None:
+        _SESSION_GRANTS.add(session_grant.key)
         return True
     if answer == "always" and save_rules:
-        for rule in save_rules:
-            config.add_allow_rule(rule)
+        config.add_local_allow_rules(save_rules)
         return True
     return answer == "yes"
 
@@ -284,7 +326,8 @@ def clear_skill_grants() -> None:
 
 def reset() -> None:
     """Clear session grants, Skill grants, and the compiled settings cache."""
-    _ALLOWED.clear()
+    _PREAPPROVED_TOOLS.clear()
+    _SESSION_GRANTS.clear()
     rules.reset_cache()
     clear_skill_grants()
 
@@ -296,5 +339,5 @@ def preload(tools) -> set:
         for tool in tools
         if tool in GATED_TOOLS and tool not in NO_PRELOAD
     }
-    _ALLOWED.update(applied)
+    _PREAPPROVED_TOOLS.update(applied)
     return applied

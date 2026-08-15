@@ -155,17 +155,18 @@ def _print_startup_banner(
             f"pre-approved (no prompt) from settings: {', '.join(sorted(pre_approved))}",
             style=ux.S_INFO,
         )
-    if bash_rules := config.permission_allow_rules():
+    if allow_rules := config.permission_allow_rules():
         ux.say(  # persistent trust stays visible (PERMISSIONS.md principle)
-            f"bash allow rules from settings: {', '.join(bash_rules)}", style=ux.S_INFO
+            f"permission allow rules from settings: {', '.join(allow_rules)}",
+            style=ux.S_INFO,
         )
     if skill_names := sorted(skills.discover()):
         ux.say(
             f"skills: {', '.join('/' + n for n in skill_names)}", style=ux.S_INFO)
     if refused:
         ux.say(
-            f"settings list {', '.join(refused)} but it can't be pre-approved "
-            "(approve per session — see PERMISSIONS.md)",
+            f"settings list {', '.join(refused)} for whole-tool pre-approval, "
+            "which is ignored; approve bounded rules instead (see PERMISSIONS.md)",
             style=ux.S_INFO,
         )
     if resumed:

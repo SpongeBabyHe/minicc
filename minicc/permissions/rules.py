@@ -235,9 +235,10 @@ def _domain_matches(host: str, pattern: str) -> bool:
     )
 
 
-def _url_host(url: object) -> str:
+def web_fetch_domain(url: object) -> str:
+    """Return the canonical hostname used by WebFetch permission rules."""
     try:
-        return urllib.parse.urlparse(str(url)).hostname or ""
+        return (urllib.parse.urlparse(str(url)).hostname or "").casefold().rstrip(".")
     except ValueError:
         return ""
 
@@ -275,7 +276,10 @@ def _argument_matches(
     if pattern is None:
         return True
     if tool_name == "web_fetch" and pattern.startswith("domain:"):
-        return _domain_matches(_url_host(tool_input.get("url", "")), pattern[7:])
+        return _domain_matches(
+            web_fetch_domain(tool_input.get("url", "")),
+            pattern[7:],
+        )
     if tool_name in _PATH_INPUTS:
         raw_path = str(tool_input.get(_PATH_INPUTS[tool_name], ""))
         target = Path(raw_path).expanduser()

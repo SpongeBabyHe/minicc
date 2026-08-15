@@ -20,7 +20,6 @@ source selection instead of reading project files independently.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -407,17 +406,12 @@ def load_hooks() -> tuple[dict, bool]:
     return merged, bool(view.scalar("disableAllHooks", False))
 
 
-_BASH_RULE = re.compile(r"^[Bb]ash\((.+)\)$")
-
-
 def permission_allow_rules() -> list[str]:
-    """Bash patterns from merged ``permissions.allow`` settings."""
-    rules: list[str] = []
-    for entry in current_settings().array(("permissions", "allow")):
-        match = _BASH_RULE.match(str(entry).strip())
-        if match and match.group(1) not in rules:
-            rules.append(match.group(1))
-    return rules
+    """Merged permission allow rules shown in startup diagnostics."""
+    return [
+        str(entry).strip()
+        for entry in current_settings().array(("permissions", "allow"))
+    ]
 
 
 def allowed_tools() -> list[str]:
@@ -477,8 +471,8 @@ def set_default_model(model_id: str, scope: str = "user") -> Path:
     return path
 
 
-def add_allow_rule(pattern: str) -> Path:
-    """Persist one Bash allow rule to machine-local project settings."""
+def add_local_allow_rules(new_rules: Iterable[str]) -> Path:
+    """Persist exact permission rules to machine-local project settings."""
     path = _local_project_settings_path()
     data = _read(path)
     permissions = data.get("permissions")
@@ -489,8 +483,11 @@ def add_allow_rule(pattern: str) -> Path:
     if not isinstance(allow, list):
         allow = []
         permissions["allow"] = allow
-    rule = f"bash({pattern})"
-    if rule not in allow:
-        allow.append(rule)
+    changed = False
+    for rule in new_rules:
+        if rule not in allow:
+            allow.append(rule)
+            changed = True
+    if changed:
         _write(path, data)
     return path
