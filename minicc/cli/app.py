@@ -326,6 +326,26 @@ def _friendly_error(e: Exception) -> str:
     return f"agent error: {e!r}"
 
 
+def _run_builtin(handler) -> None:
+    """Run one slash command without letting a nested model call kill the REPL.
+
+    Commands such as ``/compact``, ``/recap``, and ``/memory consolidate`` call
+    the model outside the normal agent-turn rollback boundary. The core loop
+    deliberately lets operational failures escape; this is their caller-owned
+    UX boundary.
+    """
+    try:
+        handler()
+    except hooks.HookStop as error:
+        ux.say(str(error), style=ux.S_ERROR)
+    except KeyboardInterrupt:
+        ux.say("interrupted", style=ux.S_INFO)
+    except checkpoints.CheckpointError as error:
+        ux.say(str(error), style=ux.S_ERROR)
+    except Exception as error:
+        ux.say(_friendly_error(error), style=ux.S_ERROR)
+
+
 def _main():
     parser, args = _parse_startup_args()
     trusted = activate_workspace_settings()
@@ -417,10 +437,7 @@ def _main():
                 ctx = context_management.ContextState()
                 turn = 0
             elif cmd in builtins:
-                try:
-                    builtins[cmd]()
-                except hooks.HookStop as error:
-                    ux.say(str(error), style=ux.S_ERROR)
+                _run_builtin(builtins[cmd])
             else:
                 # not a built-in — try a skill (built-ins win a name clash, like
                 # CC's built-in commands; skills can't shadow /clear or /help)
@@ -492,7 +509,7 @@ def _main():
         checkpoints.start(turn, query, events=events)
 
         try:
-            agent_loop(
+            outcome = agent_loop(
                 history, session_id=session_id, ctx=ctx
             )  # streams; records incrementally
         except hooks.HookStop as error:
@@ -510,6 +527,11 @@ def _main():
         except Exception as e:
             del history[mark:]  # same: don't leave a half-finished turn behind
             ux.say(_friendly_error(e), style=ux.S_ERROR)
+            continue
+        if not outcome.completed:
+            # Typed non-completion is an expected terminal result, not an
+            # exception transaction: keep its valid partial history/transcript
+            # so the user can explicitly continue or rephrase.
             continue
         # No post-loop re-print: streaming already rendered the assistant text.
         # The transcript is written incrementally (sessions.append_message +

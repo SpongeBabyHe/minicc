@@ -216,7 +216,7 @@ def consolidate() -> str:
 
     mem_tools = [t for t in TOOLS if t["name"] == "memory"]
     msgs = [{"role": "user", "content": _CONSOLIDATE_PROMPT.format(today=date.today().isoformat())}]
-    agent_loop(
+    outcome = agent_loop(
         msgs,
         system=_CONSOLIDATOR_SYSTEM,
         stream=False,                # nested run; tool lines are shown indented
@@ -224,9 +224,18 @@ def consolidate() -> str:
         max_turns=15,                # a tidy pass, not an open-ended session
         indent="  ",
     )
-    for m in reversed(msgs):         # the final assistant text = the change summary
-        if m.get("role") == "assistant":
-            for b in m["content"]:
-                if getattr(b, "type", None) == "text":
-                    return b.text
-    return "(no summary produced)"
+    if outcome.completed and outcome.output_text:
+        return outcome.output_text
+    if outcome.completed:
+        return "Error: memory consolidation completed without a summary."
+
+    result = (
+        f"Error: memory consolidation ended {outcome.status.value} "
+        f"({outcome.reason}); filesystem changes may be partial."
+    )
+    if outcome.output_text:
+        result += (
+            "\n\nPartial output — not a completed result:\n"
+            + outcome.output_text
+        )
+    return result

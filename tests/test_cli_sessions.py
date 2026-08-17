@@ -7,7 +7,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import pytest
 
-from minicc import sessions
+from minicc import hooks, sessions
 from minicc.cli import app as cli
 
 
@@ -55,3 +55,25 @@ def test_new_session_reports_startup_not_resume(tmp_path, monkeypatch):
     assert history == []
     assert resumed is False
     assert sessions.validate_id(session_id) == session_id
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (hooks.HookStop("Stop", "halted"), "Stop hook stopped processing: halted"),
+        (KeyboardInterrupt(), "interrupted"),
+        (RuntimeError("boom"), "agent error: RuntimeError('boom')"),
+    ],
+)
+def test_builtin_model_failures_return_to_the_repl(monkeypatch, error, expected):
+    said = []
+    monkeypatch.setattr(
+        cli.ux, "say", lambda text, style="": said.append(str(text))
+    )
+
+    def fail():
+        raise error
+
+    cli._run_builtin(fail)
+
+    assert said == [expected]

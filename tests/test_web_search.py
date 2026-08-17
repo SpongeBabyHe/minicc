@@ -58,21 +58,30 @@ def test_agent_loop_continues_on_pause_turn(monkeypatch):
     calls = {"n": 0}
 
     class _Blk:
-        type, text = "text", "searching…"
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
 
     class _Resp:
-        def __init__(self, stop):
+        def __init__(self, stop, text):
             self.stop_reason = stop
-            self.content = [_Blk()]
+            self.content = [_Blk(text)]
 
     def fake_llm(messages, system=None, stream=True, tools=None, model=None, session_id=None, ctx=None):
         calls["n"] += 1
-        return _Resp("pause_turn" if calls["n"] == 1 else "end_turn")
+        if calls["n"] == 1:
+            return _Resp("pause_turn", "searching…")
+        return _Resp("end_turn", "final search summary")
 
     monkeypatch.setattr(engine, "llm_response", fake_llm)
     msgs = [{"role": "user", "content": "search something"}]
-    engine.agent_loop(msgs, stream=False)
+    outcome = engine.agent_loop(msgs, stream=False)
     assert calls["n"] == 2                             # paused once, resumed, finished
+    assert outcome.status is engine.TurnStatus.COMPLETED
+    assert outcome.reason == "end_turn"
+    assert outcome.output_text == "final search summary"
+    assert outcome.model_turns == 2
     # both assistant messages are in history (the paused one resent unchanged)
     assert [m["role"] for m in msgs] == ["user", "assistant", "assistant"]
 

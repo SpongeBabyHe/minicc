@@ -15,6 +15,8 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import json
 
+import pytest
+
 from minicc import query_engine as engine, sessions
 
 
@@ -46,11 +48,20 @@ class _Resp:
 def test_max_tokens_partial_tool_use_discarded(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # sessions write under cwd/.minicc
     monkeypatch.setattr(
+        engine,
+        "_stop_gate",
+        lambda *a, **k: pytest.fail("truncation must not run the Stop gate"),
+    )
+    monkeypatch.setattr(
         engine, "llm_response",
         lambda *a, **k: _Resp([_Text("half-done"), _ToolUse()], "max_tokens"),
     )
     messages = [{"role": "user", "content": "go"}]
-    engine.agent_loop(messages, session_id="trunc1")
+    outcome = engine.agent_loop(messages, session_id="trunc1")
+
+    assert outcome.status is engine.TurnStatus.INCOMPLETE
+    assert outcome.reason == "max_tokens"
+    assert outcome.output_text == "half-done"
 
     def _btype(b):
         return b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
@@ -72,10 +83,13 @@ def test_all_tool_use_content_gets_placeholder(monkeypatch, tmp_path):
         engine, "llm_response", lambda *a, **k: _Resp([_ToolUse()], "max_tokens")
     )
     messages = [{"role": "user", "content": "go"}]
-    engine.agent_loop(messages, session_id=None)
+    outcome = engine.agent_loop(messages, session_id=None)
+    assert outcome.status is engine.TurnStatus.INCOMPLETE
+    assert outcome.reason == "max_tokens"
     assert messages[-1]["content"] == [
         {"type": "text", "text": "[response truncated at the output-token limit]"}
     ]
+    assert outcome.output_text == "[response truncated at the output-token limit]"
 
 
 def test_replay_repairs_dangling_tool_use(tmp_path, monkeypatch):
@@ -136,20 +150,25 @@ def test_refusal_never_enters_history_or_transcript(monkeypatch, tmp_path):
     monkeypatch.setattr(sessions, "append_message",
                         lambda *a, **k: recorded.append(a))
     monkeypatch.setattr(
+        engine,
+        "_stop_gate",
+        lambda *a, **k: pytest.fail("refusal must not run the Stop gate"),
+    )
+    monkeypatch.setattr(
         engine, "llm_response",
         lambda *a, **k: types.SimpleNamespace(
             stop_reason="refusal", content=[], usage=None),
     )
 
     msgs = [{"role": "user", "content": "something"}]
-    engine.agent_loop(msgs, session_id="s1")
+    outcome = engine.agent_loop(msgs, session_id="s1")
 
     assert msgs == [{"role": "user", "content": "something"}]  # rolled back
     assert recorded == []                                      # nothing persisted
     assert any("declined" in s for s in said), said
-
-
-import pytest
+    assert outcome.status is engine.TurnStatus.REFUSED
+    assert outcome.reason == "refusal"
+    assert outcome.output_text == ""
 
 
 @pytest.mark.parametrize("reason", ["max_tokens", "model_context_window_exceeded"])
@@ -170,5 +189,114 @@ def test_text_only_truncation_is_announced(monkeypatch, reason):
             usage=None),
     )
 
-    engine.agent_loop([{"role": "user", "content": "write an essay"}])
+    outcome = engine.agent_loop(
+        [{"role": "user", "content": "write an essay"}]
+    )
     assert any("cut off" in s and reason in s for s in said), said
+    assert outcome.status is engine.TurnStatus.INCOMPLETE
+    assert outcome.reason == reason
+    assert outcome.output_text == "half a sen"
+
+
+@pytest.mark.parametrize(
+    "provider_reason, outcome_reason",
+    [("future_reason", "future_reason"), (None, "unknown_stop_reason")],
+)
+def test_unknown_stop_reason_is_not_treated_as_completed(
+    monkeypatch, provider_reason, outcome_reason
+):
+    import types
+    from minicc import query_engine as engine, ux
+
+    said = []
+    monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
+    monkeypatch.setattr(
+        engine,
+        "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason=provider_reason,
+            content=[types.SimpleNamespace(type="text", text="possibly partial")],
+            usage=None,
+        ),
+    )
+
+    outcome = engine.agent_loop([{"role": "user", "content": "go"}])
+
+    assert outcome.status is engine.TurnStatus.INCOMPLETE
+    assert outcome.reason == outcome_reason
+    assert outcome.output_text == "possibly partial"
+    assert any(outcome_reason in line for line in said)
+
+
+def test_stop_sequence_is_a_normal_protocol_completion(monkeypatch):
+    import types
+    from minicc import query_engine as engine
+
+    monkeypatch.setattr(
+        engine,
+        "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason="stop_sequence",
+            content=[types.SimpleNamespace(type="text", text="done")],
+            usage=None,
+        ),
+    )
+
+    outcome = engine.agent_loop([{"role": "user", "content": "go"}])
+
+    assert outcome == engine.TurnOutcome(
+        engine.TurnStatus.COMPLETED,
+        "stop_sequence",
+        "done",
+        1,
+    )
+
+
+def test_outcome_text_supports_serialized_multiple_blocks(monkeypatch):
+    import types
+    from minicc import query_engine as engine
+
+    monkeypatch.setattr(
+        engine,
+        "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason="end_turn",
+            content=[
+                {"type": "text", "text": " first "},
+                {"type": "thinking", "thinking": "hidden"},
+                {"type": "text", "text": "second"},
+            ],
+            usage=None,
+        ),
+    )
+
+    outcome = engine.agent_loop([{"role": "user", "content": "go"}])
+
+    assert outcome.status is engine.TurnStatus.COMPLETED
+    assert outcome.output_text == "first \nsecond"
+
+
+def test_tool_use_stop_without_tool_block_is_incomplete(monkeypatch):
+    import types
+    from minicc import query_engine as engine, ux
+
+    said = []
+    monkeypatch.setattr(ux, "say", lambda text, style="": said.append(str(text)))
+    monkeypatch.setattr(
+        engine,
+        "llm_response",
+        lambda *a, **k: types.SimpleNamespace(
+            stop_reason="tool_use",
+            content=[types.SimpleNamespace(type="text", text="no call supplied")],
+            usage=None,
+        ),
+    )
+    messages = [{"role": "user", "content": "go"}]
+
+    outcome = engine.agent_loop(messages)
+
+    assert outcome.status is engine.TurnStatus.INCOMPLETE
+    assert outcome.reason == "tool_use_without_tool_block"
+    assert outcome.output_text == "no call supplied"
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert any("no tool call" in line for line in said)

@@ -613,7 +613,11 @@ class _Resp:
 
 
 def _drive(monkeypatch, replies, session_id="s1"):
-    """Run agent_loop against canned end_turn replies; returns (messages, calls)."""
+    """Run agent_loop against canned end_turn replies.
+
+    Returns ``(messages, calls, outcome)`` so tests pin both hook behavior and
+    the loop's public terminal contract.
+    """
     from minicc import query_engine as engine
 
     queue = list(replies)
@@ -626,8 +630,8 @@ def _drive(monkeypatch, replies, session_id="s1"):
     monkeypatch.setattr(engine, "llm_response", fake_llm)
     monkeypatch.setattr(engine.sessions, "append_message", lambda *a, **k: None)
     messages = [{"role": "user", "content": "hi"}]
-    engine.agent_loop(messages, session_id=session_id)
-    return messages, calls
+    outcome = engine.agent_loop(messages, session_id=session_id)
+    return messages, calls, outcome
 
 
 def test_pretool_continue_false_aborts_before_event_decision(monkeypatch):
@@ -660,17 +664,48 @@ def test_stop_payload_includes_stop_hook_active(
     _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
     monkeypatch.setattr(engine.sessions, "append_message", lambda *a, **k: None)
 
-    assert not engine._stop_gate(
+    decision = engine._stop_gate(
         _Resp("done"),
         [{"role": "user", "content": "hi"}],
         "s1",
         "",
         blocks_so_far,
     )
+    assert decision.action is engine._StopAction.ACCEPT
     assert seen.read_text() == str(expected).lower()
 
 
+def test_stop_payload_preserves_exact_text_block_concatenation(
+    tmp_path, monkeypatch
+):
+    from minicc import query_engine as engine
+
+    seen = tmp_path / "last-assistant.txt"
+    cmd = (
+        f"{sys.executable} -c \"import sys,json,pathlib; "
+        f"d=json.load(sys.stdin); pathlib.Path(r'{seen}').write_text("
+        "d['last_assistant_message'])\""
+    )
+    _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(engine.sessions, "append_message", lambda *a, **k: None)
+    response = _Resp("ignored")
+    response.content = [_Text(" left "), _Text("right\n")]
+
+    decision = engine._stop_gate(
+        response,
+        [{"role": "user", "content": "hi"}],
+        "s1",
+        "",
+        0,
+    )
+
+    assert decision.action is engine._StopAction.ACCEPT
+    assert seen.read_text() == " left right\n"
+
+
 def test_stop_block_feeds_reason_and_continues(tmp_path, monkeypatch):
+    from minicc import query_engine as engine
+
     # Stateful hook: blocks the FIRST stop (creates a marker), allows the second —
     # also proves last_assistant_message reaches stdin (written to a file).
     mark, seen = tmp_path / "mark", tmp_path / "seen.txt"
@@ -687,40 +722,66 @@ def test_stop_block_feeds_reason_and_continues(tmp_path, monkeypatch):
         "sys.exit(2)\""
     )
     _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
-    messages, calls = _drive(monkeypatch, ["first answer", "second answer"])
+    messages, calls, outcome = _drive(
+        monkeypatch, ["first answer", "second answer"]
+    )
     assert len(calls) == 2                       # blocked once → one extra model call
     assert messages[2]["role"] == "user"
     assert "run the tests first" in messages[2]["content"]   # reason fed back
     assert seen.read_text() == "second answer"   # CC payload field, latest turn
     assert messages[-1]["content"][0].text == "second answer"
+    assert outcome.status is engine.TurnStatus.COMPLETED
 
 
 def test_stop_block_capped_after_8(monkeypatch):
+    from minicc import query_engine as engine
+
     _use({"Stop": [_group("echo never >&2; exit 2")]}, monkeypatch=monkeypatch)
-    messages, calls = _drive(monkeypatch, [])
-    assert len(calls) == 9  # 8 blocks honored, 9th attempt overridden (CC cap)
+    messages, calls, outcome = _drive(monkeypatch, [])
+    # Eight blocks are honored and fed back. The ninth candidate completion is
+    # where an additional block is overridden by the cap.
+    assert len(calls) == 9
+    feedback = [
+        message for message in messages
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        and message["content"].startswith("[Stop hook]:")
+    ]
+    assert len(feedback) == 8
+    assert outcome.status is engine.TurnStatus.LIMIT_REACHED
+    assert outcome.reason == "stop_hook_limit"
 
 
 def test_stop_skipped_for_subagents(monkeypatch):
+    from minicc import query_engine as engine
+
     _use({"Stop": [_group("exit 2")]}, monkeypatch=monkeypatch)
-    _messages, calls = _drive(monkeypatch, [], session_id=None)
+    _messages, calls, outcome = _drive(monkeypatch, [], session_id=None)
     assert len(calls) == 1  # no Stop surface in sub-agent loops → ends immediately
+    assert outcome.status is engine.TurnStatus.COMPLETED
 
 
 def test_stop_additional_context_without_block_ends_turn(monkeypatch):
+    from minicc import query_engine as engine
+
     cmd = (
         'echo \'{"hookSpecificOutput":'
         '{"hookEventName":"Stop","additionalContext":"deploy succeeded"}}\''
     )
     _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
-    messages, calls = _drive(monkeypatch, ["answer"])
+    messages, calls, outcome = _drive(monkeypatch, ["answer"])
     assert len(calls) == 1                        # turn ended (no block)
     assert messages[-1]["role"] == "user"         # context trails for next turn
     assert messages[-1]["content"] == "deploy succeeded"
+    assert outcome.status is engine.TurnStatus.COMPLETED
 
 
 def test_stop_continue_false_overrides_block(monkeypatch):
+    from minicc import query_engine as engine
+
     cmd = 'echo \'{"decision":"block","reason":"more!","continue":false,"stopReason":"halted"}\''
     _use({"Stop": [_group(cmd)]}, monkeypatch=monkeypatch)
-    _messages, calls = _drive(monkeypatch, ["answer"])
+    _messages, calls, outcome = _drive(monkeypatch, ["answer"])
     assert len(calls) == 1  # continue:false wins over decision:block (CC precedence)
+    assert outcome.status is engine.TurnStatus.STOPPED
+    assert outcome.reason == "halted"

@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from enum import Enum
+
 from minicc.llm import llm_response
 from minicc.tools import TOOLS, TOOL_HANDLERS
 from minicc import context_management, permissions, ux
@@ -6,9 +9,70 @@ from minicc import sessions
 from minicc import hooks
 from minicc import session_limits
 
+
 # Runaway guard for the Stop hook, straight from CC's best-practices doc: "Claude
 # Code overrides the hook and ends the turn after 8 consecutive blocks."
 MAX_STOP_BLOCKS = 8
+
+
+class TurnStatus(str, Enum):
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    REFUSED = "refused"
+    LIMIT_REACHED = "limit_reached"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    status: TurnStatus
+    reason: str
+    output_text: str = ""
+    model_turns: int = 0
+
+    @property
+    def completed(self) -> bool:
+        return self.status is TurnStatus.COMPLETED
+
+
+class _StopAction(str, Enum):
+    ACCEPT = "accept"
+    RETRY = "retry"
+    STOPPED = "stopped"
+    LIMIT_REACHED = "limit_reached"
+
+
+@dataclass(frozen=True)
+class _StopDecision:
+    action: _StopAction
+    reason: str = ""
+
+
+def _block_type(block) -> str | None:
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def _content_text(
+    content, *, separator: str = "\n", strip: bool = True
+) -> str:
+    """Extract text from SDK or serialized blocks.
+
+    Outcomes use newline-separated, trimmed display text. Stop hooks opt into
+    the provider's former exact concatenation shape for compatibility.
+    """
+    parts = []
+    for block in content or []:
+        if _block_type(block) != "text":
+            continue
+        text = block.get("text", "") if isinstance(block, dict) else getattr(
+            block, "text", ""
+        )
+        if text:
+            parts.append(str(text))
+    result = separator.join(parts)
+    return result.strip() if strip else result
 
 
 def agent_loop(
@@ -21,8 +85,13 @@ def agent_loop(
     model: str | None = None,
     session_id: str | None = None,
     ctx: context_management.ContextState | None = None,
-):
-    """Run the agent loop until the model stops requesting tools.
+) -> TurnOutcome:
+    """Run until the model reaches a typed terminal outcome.
+
+    ``COMPLETED`` means the model protocol ended normally and the Stop gate
+    accepted it. It does not claim that the user's task was verified correct.
+    Operational failures and interrupts still raise so the caller keeps its
+    existing rollback boundary.
 
     tools     : tool schemas to advertise (default: all TOOLS). Sub-agents pass
                 a read-only subset.
@@ -41,20 +110,27 @@ def agent_loop(
     tools = permissions.filter_tools(tools if tools is not None else TOOLS)
     ctx = ctx if ctx is not None else context_management.ContextState()
     limits = session_limits.SessionLimits.load(session_id)
-    allowed = {t["name"] for t in tools}  # guard: model can't call un-advertised tools
+    # guard: model can't call un-advertised tools
+    allowed = {t["name"] for t in tools}
+    # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
+    stop_blocks = 0
     turns = 0
-    stop_blocks = 0  # consecutive Stop-hook blocks this turn (capped, see _stop_gate)
+    last_output = ""
     while True:
         if max_turns is not None and turns >= max_turns:
             # Say it out loud: a sub-agent cut off here may still have emitted
-            # text last turn, and the caller's _final_text would then hand that
-            # partial work up as if it were a finished summary.
+            # text last turn. The typed result keeps that text explicitly partial.
             ux.say(
                 f"{indent}[stopped at the {max_turns}-turn limit — "
                 "the work may be incomplete]",
                 style=ux.S_ERROR,
             )
-            return
+            return TurnOutcome(
+                TurnStatus.LIMIT_REACHED,
+                "max_turns",
+                last_output,
+                turns,
+            )
         turns += 1
         # streaming shows its own spinner-until-first-token, so no ux.thinking()
         response = llm_response(
@@ -69,12 +145,14 @@ def agent_loop(
         limits.record_response(response)
         assistant_msg = {"role": "assistant", "content": response.content}
         messages.append(assistant_msg)
+        last_output = _content_text(response.content)
         if response.stop_reason == "pause_turn":
             # A long-running SERVER tool turn (web_search) was paused mid-flight.
             # Contract: send the paused assistant message back unchanged and the
             # API resumes it — so record it and loop again without tool results.
             if session_id:
-                sessions.append_message(session_id, assistant_msg, usage=response.usage)
+                sessions.append_message(
+                    session_id, assistant_msg, usage=response.usage)
             continue
         if response.stop_reason == "refusal":
             # A safety classifier declined (HTTP 200, not an error). A pre-output
@@ -89,7 +167,7 @@ def agent_loop(
                 "(stop_reason=refusal) — nothing was recorded; try rephrasing",
                 style=ux.S_ERROR,
             )
-            return
+            return TurnOutcome(TurnStatus.REFUSED, "refusal", "", turns)
         if response.stop_reason != "tool_use":
             # A non-tool_use stop can still CARRY tool_use blocks: max_tokens
             # cutting the stream mid tool-call leaves a partial call with
@@ -98,16 +176,26 @@ def agent_loop(
             # without tool_result blocks"; dogfood R5, output=16000 exactly at
             # the cap). Drop the partial call, keep what streamed before it,
             # and say so out loud instead of ending the turn silently.
-            if any(getattr(b, "type", None) == "tool_use" for b in response.content):
-                kept = [b for b in response.content if getattr(b, "type", None) != "tool_use"]
+            discarded_tool_call = any(
+                _block_type(block) == "tool_use" for block in response.content
+            )
+            if discarded_tool_call:
+                kept = [
+                    block for block in response.content
+                    if _block_type(block) != "tool_use"
+                ]
                 assistant_msg["content"] = kept or [
-                    {"type": "text", "text": "[response truncated at the output-token limit]"}
+                    {
+                        "type": "text",
+                        "text": "[response truncated at the output-token limit]",
+                    }
                 ]
                 ux.say(
                     f"{indent}response stopped ({response.stop_reason}) mid tool-call; "
                     "the partial call was discarded — say 'continue' to resume",
                     style=ux.S_ERROR,
                 )
+                last_output = _content_text(assistant_msg["content"])
             elif response.stop_reason in ("max_tokens", "model_context_window_exceeded"):
                 # Output was truncated — max_tokens (the output cap) or
                 # model_context_window_exceeded (generation ran into the context
@@ -120,34 +208,122 @@ def agent_loop(
                     style=ux.S_ERROR,
                 )
             if session_id:  # terminal assistant → record alone
-                sessions.append_message(session_id, assistant_msg, usage=response.usage)
-            # Stop hook: the deterministic turn-end gate (the enforced complement to
-            # the verify-work stance). A block feeds its reason back and keeps the
-            # turn going; MAX_STOP_BLOCKS caps a hook that never lets go.
-            if _stop_gate(response, messages, session_id, indent, stop_blocks):
+                sessions.append_message(
+                    session_id, assistant_msg, usage=response.usage)
+
+            # Truncation and malformed/unknown terminal responses are not
+            # completion candidates, so they do not run the normal Stop gate.
+            if discarded_tool_call:
+                reason = response.stop_reason or "partial_tool_use"
+                if reason not in (
+                    "max_tokens",
+                    "model_context_window_exceeded",
+                ):
+                    reason = f"{reason}_with_tool_use"
+                return TurnOutcome(
+                    TurnStatus.INCOMPLETE, reason, last_output, turns
+                )
+            if response.stop_reason in (
+                "max_tokens",
+                "model_context_window_exceeded",
+            ):
+                return TurnOutcome(
+                    TurnStatus.INCOMPLETE,
+                    response.stop_reason,
+                    last_output,
+                    turns,
+                )
+            if response.stop_reason not in ("end_turn", "stop_sequence"):
+                reason = response.stop_reason or "unknown_stop_reason"
+                ux.say(
+                    f"{indent}response stopped with an unrecognized reason "
+                    f"({reason}) — the work may be incomplete",
+                    style=ux.S_ERROR,
+                )
+                return TurnOutcome(
+                    TurnStatus.INCOMPLETE, reason, last_output, turns
+                )
+
+            # Stop is a completion gate only. A block feeds its reason back and
+            # continues; typed decisions distinguish acceptance, hook stop, and
+            # the runaway-block limit.
+            decision = _stop_gate(
+                response, messages, session_id, indent, stop_blocks
+            )
+            if decision.action is _StopAction.RETRY:
                 stop_blocks += 1
                 continue
-            return
+            if decision.action is _StopAction.STOPPED:
+                return TurnOutcome(
+                    TurnStatus.STOPPED,
+                    decision.reason or "stop_hook",
+                    last_output,
+                    turns,
+                )
+            if decision.action is _StopAction.LIMIT_REACHED:
+                return TurnOutcome(
+                    TurnStatus.LIMIT_REACHED,
+                    decision.reason or "stop_hook_limit",
+                    last_output,
+                    turns,
+                )
+            return TurnOutcome(
+                TurnStatus.COMPLETED,
+                response.stop_reason,
+                last_output,
+                turns,
+            )
+
+        tool_blocks = [
+            block for block in response.content
+            if _block_type(block) == "tool_use"
+        ]
+        if not tool_blocks:
+            # Never append an empty tool_result message: it would make the next
+            # API request invalid and disguise a provider-protocol mismatch as a
+            # productive round.
+            if response.content:
+                if session_id:
+                    sessions.append_message(
+                        session_id, assistant_msg, usage=response.usage
+                    )
+            else:
+                messages.pop()
+            ux.say(
+                f"{indent}response stopped for tool use but supplied no tool call "
+                "— the work may be incomplete",
+                style=ux.S_ERROR,
+            )
+            return TurnOutcome(
+                TurnStatus.INCOMPLETE,
+                "tool_use_without_tool_block",
+                last_output,
+                turns,
+            )
+
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                ux.say(
-                    f"{indent}→ {block.name}({ux.fmt_dict(block.input)})",
-                    style=ux.S_CALL,
-                )
-                output = _run_tool(
-                    block,
-                    allowed,
-                    session_id,
-                    indent,
-                    limits=limits,
-                )
-                result = ux.truncate(output, 300)
-                prefixed = f"{indent}← " + result.replace("\n", f"\n{indent}  ")
-                ux.say(prefixed, style=ux.S_RESULT)
-                results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                )
+        for block in tool_blocks:
+            ux.say(
+                f"{indent}→ {block.name}({ux.fmt_dict(block.input)})",
+                style=ux.S_CALL,
+            )
+            output = _run_tool(
+                block,
+                allowed,
+                session_id,
+                indent,
+                limits=limits,
+            )
+            result = ux.truncate(output, 300)
+            prefixed = f"{indent}← " + result.replace("\n", f"\n{indent}  ")
+            ux.say(prefixed, style=ux.S_RESULT)
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                }
+            )
         tool_msg = {"role": "user", "content": results}
         messages.append(tool_msg)
         # A productive round breaks the Stop-hook block CHAIN: CC's guard is "8
@@ -157,14 +333,15 @@ def agent_loop(
         # Record assistant + its tool_results together, only now that both exist —
         # so a Ctrl-C mid-tool never persists a dangling tool_use to the transcript.
         if session_id:
-            sessions.append_message(session_id, assistant_msg, usage=response.usage)
+            sessions.append_message(
+                session_id, assistant_msg, usage=response.usage)
             sessions.append_message(session_id, tool_msg)
 
 
-def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
-    """Run Stop hooks when a turn is about to end. Returns True if the turn must
-    CONTINUE (a hook blocked the stop; its reason is appended to `messages` as a
-    user message the model answers next iteration), False to end the turn.
+def _stop_gate(
+    response, messages, session_id, indent, blocks_so_far
+) -> _StopDecision:
+    """Run Stop hooks for a candidate completion and return a typed decision.
 
     CC contract: stdin carries `last_assistant_message` (the final assistant text —
     hooks read it instead of tailing the transcript); exit 2 / decision:"block"
@@ -177,10 +354,8 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
     turn-end is CC's separate SubagentStop event, which minicc doesn't wire.
     """
     if not session_id:  # sub-agents skip this
-        return False
-    last_text = "".join(
-        b.text for b in response.content if getattr(b, "type", "") == "text"
-    )
+        return _StopDecision(_StopAction.ACCEPT)
+    last_text = _content_text(response.content, separator="", strip=False)
     d = hooks.run(
         "Stop",
         session_id=session_id,
@@ -192,25 +367,38 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
         ux.say(f"{indent}[Stop hook: {d.stop_reason}]", style=ux.S_INFO)
 
     # continue:false is universal and therefore wins over Stop's event-specific
-    # block decision.
-    if d.block and not d.stop and blocks_so_far >= MAX_STOP_BLOCKS:
+    # block decision. Preserve additional context just as the former bool path
+    # did, but report that this was not a normal accepted completion.
+    if d.stop:
+        if d.additional_context:
+            ctx = {"role": "user", "content": "\n".join(d.additional_context)}
+            messages.append(ctx)
+            sessions.append_message(session_id, ctx)
+        return _StopDecision(
+            _StopAction.STOPPED, d.stop_reason or "stop_hook"
+        )
+
+    if d.block and blocks_so_far >= MAX_STOP_BLOCKS:
         ux.say(
             f"{indent}[Stop hook still blocking after {MAX_STOP_BLOCKS} attempts — "
-            "ending the turn anyway]",
+            "ending the turn as incomplete]",
             style=ux.S_INFO,
         )
-        return False
+        return _StopDecision(
+            _StopAction.LIMIT_REACHED, "stop_hook_limit"
+        )
 
-    if d.block and not d.stop:  # continue:false wins over a block (CC precedence)
+    if d.block:
         reason = d.reason or "A Stop hook blocked ending the turn (no reason given)."
         note = f"[Stop hook]: {reason}"
         if d.additional_context:
             note += "\n\n" + "\n".join(d.additional_context)
-        ux.say(f"{indent}[Stop hook blocked stopping — continuing]", style=ux.S_INFO)
+        ux.say(
+            f"{indent}[Stop hook blocked stopping — continuing]", style=ux.S_INFO)
         fb = {"role": "user", "content": note}
         messages.append(fb)
         sessions.append_message(session_id, fb)  # session_id is non-empty here
-        return True
+        return _StopDecision(_StopAction.RETRY, "stop_hook_block")
 
     if d.additional_context:
         # Not blocked: context still enters the conversation (visible to the model
@@ -219,7 +407,7 @@ def _stop_gate(response, messages, session_id, indent, blocks_so_far) -> bool:
         ctx = {"role": "user", "content": "\n".join(d.additional_context)}
         messages.append(ctx)
         sessions.append_message(session_id, ctx)
-    return False
+    return _StopDecision(_StopAction.ACCEPT)
 
 
 def _run_tool(

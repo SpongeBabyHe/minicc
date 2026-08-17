@@ -170,6 +170,12 @@ def test_consolidate_runs_agent_loop_with_memory_tool_only(store, monkeypatch):
             "role": "assistant",
             "content": [type("T", (), {"type": "text", "text": "merged 2, deleted 1"})()],
         })
+        return agent_mod.TurnOutcome(
+            agent_mod.TurnStatus.COMPLETED,
+            "end_turn",
+            "merged 2, deleted 1",
+            1,
+        )
 
     monkeypatch.setattr(agent_mod, "agent_loop", fake_loop)
     out = memory.consolidate()
@@ -177,6 +183,45 @@ def test_consolidate_runs_agent_loop_with_memory_tool_only(store, monkeypatch):
     assert captured["max_turns"] == 15
     assert "memory maintainer" in captured["system"]
     assert out == "merged 2, deleted 1"
+
+
+def test_consolidate_does_not_present_partial_output_as_success(store, monkeypatch):
+    import minicc.query_engine as agent_mod
+
+    def fake_loop(*args, **kwargs):
+        return agent_mod.TurnOutcome(
+            agent_mod.TurnStatus.INCOMPLETE,
+            "max_tokens",
+            "deleted old index; still merging topics",
+            15,
+        )
+
+    monkeypatch.setattr(agent_mod, "agent_loop", fake_loop)
+
+    out = memory.consolidate()
+
+    assert out.startswith(
+        "Error: memory consolidation ended incomplete (max_tokens)"
+    )
+    assert "filesystem changes may be partial" in out
+    assert "Partial output — not a completed result:" in out
+    assert "deleted old index; still merging topics" in out
+
+
+def test_consolidate_completed_without_summary_is_an_error(store, monkeypatch):
+    import minicc.query_engine as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod,
+        "agent_loop",
+        lambda *a, **k: agent_mod.TurnOutcome(
+            agent_mod.TurnStatus.COMPLETED, "end_turn", "", 1
+        ),
+    )
+
+    assert memory.consolidate() == (
+        "Error: memory consolidation completed without a summary."
+    )
 
 
 def test_disabled_blocks_writes_and_index(store):

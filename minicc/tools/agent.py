@@ -49,23 +49,6 @@ SCHEMA = {
 }
 
 
-def _final_text(messages) -> str:
-    """Pull the last assistant text out of the sub-agent's messages."""
-    for m in reversed(messages):
-        if m.get("role") != "assistant":
-            continue
-        content = m.get("content")
-        if not isinstance(content, list):
-            continue
-        text = "\n".join(
-            getattr(b, "text", "") for b in content
-            if getattr(b, "type", None) == "text"
-        ).strip()
-        if text:
-            return text
-    return "(sub-agent returned no summary — it may have hit its turn limit)"
-
-
 def _tool_schemas(names):
     """A sub-agent's tool schemas: its allowlist (or all tools if None), always
     minus `agent` — no nested sub-agents (D6). Read-only sub-agents thus never
@@ -89,7 +72,7 @@ def agent(prompt: str, subagent_type: str | None = None) -> str:
         )
     sub = [{"role": "user", "content": prompt}]
     ux.say(f"  [sub-agent '{adef.name}' started]", style=ux.S_INFO)
-    agent_loop(
+    outcome = agent_loop(
         sub,
         system=adef.prompt,           # the definition's body / built-in prompt
         stream=False,                 # don't stream the sub-agent's internal turns
@@ -98,5 +81,29 @@ def agent(prompt: str, subagent_type: str | None = None) -> str:
         indent="  ",                  # nest its tool lines under the parent
         model=adef.model,             # None = inherit the session model
     )
-    ux.say(f"  [sub-agent '{adef.name}' done]", style=ux.S_INFO)
-    return _final_text(sub)
+    if outcome.completed and outcome.output_text:
+        ux.say(f"  [sub-agent '{adef.name}' done]", style=ux.S_INFO)
+        return outcome.output_text
+
+    if outcome.completed:
+        ux.say(
+            f"  [sub-agent '{adef.name}' ended without a final summary]",
+            style=ux.S_ERROR,
+        )
+        return "Error: sub-agent completed without a final summary."
+
+    ux.say(
+        f"  [sub-agent '{adef.name}' ended: {outcome.status.value} "
+        f"({outcome.reason})]",
+        style=ux.S_ERROR,
+    )
+    result = (
+        f"Error: sub-agent ended {outcome.status.value} ({outcome.reason}); "
+        "the result is not complete."
+    )
+    if outcome.output_text:
+        result += (
+            "\n\nPartial output — not a completed result:\n"
+            + outcome.output_text
+        )
+    return result
