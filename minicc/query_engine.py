@@ -14,6 +14,14 @@ from minicc import session_limits
 # Code overrides the hook and ends the turn after 8 consecutive blocks."
 MAX_STOP_BLOCKS = 8
 
+# Provider-level reasons that map to the same agent-loop transition. A normal
+# model stop is only a completion *candidate*: the Stop hook still decides
+# whether the loop may actually end.
+_COMPLETION_CANDIDATE_REASONS = frozenset({"end_turn", "stop_sequence"})
+_TRUNCATION_REASONS = frozenset(
+    {"max_tokens", "model_context_window_exceeded"}
+)
+
 
 class TurnStatus(str, Enum):
     COMPLETED = "completed"
@@ -73,6 +81,18 @@ def _content_text(
             parts.append(str(text))
     result = separator.join(parts)
     return result.strip() if strip else result
+
+
+def _split_tool_use_blocks(content) -> tuple[list, list]:
+    """Return client tool calls and all remaining content, in original order."""
+    tool_blocks = []
+    other_blocks = []
+    for block in content:
+        if _block_type(block) == "tool_use":
+            tool_blocks.append(block)
+        else:
+            other_blocks.append(block)
+    return tool_blocks, other_blocks
 
 
 def agent_loop(
@@ -146,7 +166,12 @@ def agent_loop(
         assistant_msg = {"role": "assistant", "content": response.content}
         messages.append(assistant_msg)
         last_output = _content_text(response.content)
-        if response.stop_reason == "pause_turn":
+        stop_reason = response.stop_reason
+
+        # The provider exposes several stop reasons, but the loop has four
+        # transitions: resume a server turn, refuse, run client tools, or finish
+        # a non-tool response. Keep that state-machine split visible here.
+        if stop_reason == "pause_turn":
             # A long-running SERVER tool turn (web_search) was paused mid-flight.
             # Contract: send the paused assistant message back unchanged and the
             # API resumes it — so record it and loop again without tool results.
@@ -154,7 +179,8 @@ def agent_loop(
                 sessions.append_message(
                     session_id, assistant_msg, usage=response.usage)
             continue
-        if response.stop_reason == "refusal":
+
+        if stop_reason == "refusal":
             # A safety classifier declined (HTTP 200, not an error). A pre-output
             # refusal carries an EMPTY content array, and an empty assistant
             # message is invalid as next-turn input — letting it into history (or
@@ -168,85 +194,106 @@ def agent_loop(
                 style=ux.S_ERROR,
             )
             return TurnOutcome(TurnStatus.REFUSED, "refusal", "", turns)
-        if response.stop_reason != "tool_use":
-            # A non-tool_use stop can still CARRY tool_use blocks: max_tokens
-            # cutting the stream mid tool-call leaves a partial call with
-            # truncated (often empty) input and no result can ever answer it —
-            # sending it back 400s the next request ("tool_use ids were found
-            # without tool_result blocks"; dogfood R5, output=16000 exactly at
-            # the cap). Drop the partial call, keep what streamed before it,
-            # and say so out loud instead of ending the turn silently.
-            discarded_tool_call = any(
-                _block_type(block) == "tool_use" for block in response.content
-            )
-            if discarded_tool_call:
-                kept = [
-                    block for block in response.content
-                    if _block_type(block) != "tool_use"
-                ]
-                assistant_msg["content"] = kept or [
-                    {
-                        "type": "text",
-                        "text": "[response truncated at the output-token limit]",
-                    }
-                ]
-                ux.say(
-                    f"{indent}response stopped ({response.stop_reason}) mid tool-call; "
-                    "the partial call was discarded — say 'continue' to resume",
-                    style=ux.S_ERROR,
-                )
-                last_output = _content_text(assistant_msg["content"])
-            elif response.stop_reason in ("max_tokens", "model_context_window_exceeded"):
-                # Output was truncated — max_tokens (the output cap) or
-                # model_context_window_exceeded (generation ran into the context
-                # window; 4.5+ models return this string, which the SDK enum
-                # doesn't list yet). Content stays valid — nothing to discard —
-                # but ending silently hides a cut-off answer from a finished one.
-                ux.say(
-                    f"{indent}response was cut off ({response.stop_reason}) "
-                    "— say 'continue' to resume",
-                    style=ux.S_ERROR,
-                )
-            if session_id:  # terminal assistant → record alone
-                sessions.append_message(
-                    session_id, assistant_msg, usage=response.usage)
 
-            # Truncation and malformed/unknown terminal responses are not
-            # completion candidates, so they do not run the normal Stop gate.
-            if discarded_tool_call:
-                reason = response.stop_reason or "partial_tool_use"
-                if reason not in (
-                    "max_tokens",
-                    "model_context_window_exceeded",
-                ):
-                    reason = f"{reason}_with_tool_use"
-                return TurnOutcome(
-                    TurnStatus.INCOMPLETE, reason, last_output, turns
+        tool_blocks, non_tool_blocks = _split_tool_use_blocks(response.content)
+
+        if stop_reason == "tool_use":
+            if not tool_blocks:
+                # Never append an empty tool_result message: it would make the
+                # next API request invalid and disguise a provider-protocol
+                # mismatch as a productive round.
+                if response.content:
+                    if session_id:
+                        sessions.append_message(
+                            session_id, assistant_msg, usage=response.usage
+                        )
+                else:
+                    messages.pop()
+                ux.say(
+                    f"{indent}response stopped for tool use but supplied no "
+                    "tool call — the work may be incomplete",
+                    style=ux.S_ERROR,
                 )
-            if response.stop_reason in (
-                "max_tokens",
-                "model_context_window_exceeded",
-            ):
                 return TurnOutcome(
                     TurnStatus.INCOMPLETE,
-                    response.stop_reason,
+                    "tool_use_without_tool_block",
                     last_output,
                     turns,
                 )
-            if response.stop_reason not in ("end_turn", "stop_sequence"):
-                reason = response.stop_reason or "unknown_stop_reason"
-                ux.say(
-                    f"{indent}response stopped with an unrecognized reason "
-                    f"({reason}) — the work may be incomplete",
-                    style=ux.S_ERROR,
-                )
-                return TurnOutcome(
-                    TurnStatus.INCOMPLETE, reason, last_output, turns
-                )
 
-            # Stop is a completion gate only. A block feeds its reason back and
-            # continues; typed decisions distinguish acceptance, hook stop, and
-            # the runaway-block limit.
+            results = _execute_tool_blocks(
+                tool_blocks,
+                allowed,
+                session_id,
+                indent,
+                limits,
+            )
+            tool_msg = {"role": "user", "content": results}
+            messages.append(tool_msg)
+            # A productive round breaks the Stop-hook block CHAIN: CC's guard is
+            # "8 CONSECUTIVE blocks", so real work restores the hook's budget.
+            stop_blocks = 0
+            # Persist assistant + tool results only after every tool completed,
+            # so an interrupt cannot leave a dangling tool_use in the transcript.
+            if session_id:
+                sessions.append_message(
+                    session_id, assistant_msg, usage=response.usage
+                )
+                sessions.append_message(session_id, tool_msg)
+            continue
+
+        # Every remaining stop reason ends this provider response without a
+        # legitimate client-tool round. It may still carry a partial tool_use if
+        # generation was cut off mid-call; remove that block before persistence.
+        discarded_tool_call = bool(tool_blocks)
+        if discarded_tool_call:
+            assistant_msg["content"] = non_tool_blocks or [
+                {
+                    "type": "text",
+                    "text": "[response truncated at the output-token limit]",
+                }
+            ]
+            ux.say(
+                f"{indent}response stopped ({stop_reason}) mid tool-call; "
+                "the partial call was discarded — say 'continue' to resume",
+                style=ux.S_ERROR,
+            )
+            last_output = _content_text(assistant_msg["content"])
+        elif stop_reason in _TRUNCATION_REASONS:
+            # Content is valid, but ending silently would disguise a cut-off
+            # response as a finished one.
+            ux.say(
+                f"{indent}response was cut off ({stop_reason}) "
+                "— say 'continue' to resume",
+                style=ux.S_ERROR,
+            )
+
+        if session_id:  # terminal assistant → record alone
+            sessions.append_message(
+                session_id, assistant_msg, usage=response.usage
+            )
+
+        # Partial tool calls and truncation are never completion candidates.
+        if discarded_tool_call:
+            reason = stop_reason or "partial_tool_use"
+            if reason not in _TRUNCATION_REASONS:
+                reason = f"{reason}_with_tool_use"
+            return TurnOutcome(
+                TurnStatus.INCOMPLETE, reason, last_output, turns
+            )
+
+        if stop_reason in _TRUNCATION_REASONS:
+            return TurnOutcome(
+                TurnStatus.INCOMPLETE,
+                stop_reason,
+                last_output,
+                turns,
+            )
+
+        if stop_reason in _COMPLETION_CANDIDATE_REASONS:
+            # A normal provider stop is only a completion candidate. A Stop hook
+            # may feed back a reason and continue, stop explicitly, or hit its
+            # bounded retry limit.
             decision = _stop_gate(
                 response, messages, session_id, indent, stop_blocks
             )
@@ -269,73 +316,60 @@ def agent_loop(
                 )
             return TurnOutcome(
                 TurnStatus.COMPLETED,
-                response.stop_reason,
+                stop_reason,
                 last_output,
                 turns,
             )
 
-        tool_blocks = [
-            block for block in response.content
-            if _block_type(block) == "tool_use"
-        ]
-        if not tool_blocks:
-            # Never append an empty tool_result message: it would make the next
-            # API request invalid and disguise a provider-protocol mismatch as a
-            # productive round.
-            if response.content:
-                if session_id:
-                    sessions.append_message(
-                        session_id, assistant_msg, usage=response.usage
-                    )
-            else:
-                messages.pop()
-            ux.say(
-                f"{indent}response stopped for tool use but supplied no tool call "
-                "— the work may be incomplete",
-                style=ux.S_ERROR,
-            )
-            return TurnOutcome(
-                TurnStatus.INCOMPLETE,
-                "tool_use_without_tool_block",
-                last_output,
-                turns,
-            )
+        # Unknown provider values fail closed: preserve the raw reason for UX,
+        # but never let a newly introduced value silently mean success.
+        reason = stop_reason or "unknown_stop_reason"
+        ux.say(
+            f"{indent}response stopped with an unrecognized reason "
+            f"({reason}) — the work may be incomplete",
+            style=ux.S_ERROR,
+        )
+        return TurnOutcome(
+            TurnStatus.INCOMPLETE, reason, last_output, turns
+        )
 
-        results = []
-        for block in tool_blocks:
-            ux.say(
-                f"{indent}→ {block.name}({ux.fmt_dict(block.input)})",
-                style=ux.S_CALL,
-            )
-            output = _run_tool(
-                block,
-                allowed,
-                session_id,
-                indent,
-                limits=limits,
-            )
-            result = ux.truncate(output, 300)
-            prefixed = f"{indent}← " + result.replace("\n", f"\n{indent}  ")
-            ux.say(prefixed, style=ux.S_RESULT)
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                }
-            )
-        tool_msg = {"role": "user", "content": results}
-        messages.append(tool_msg)
-        # A productive round breaks the Stop-hook block CHAIN: CC's guard is "8
-        # CONSECUTIVE blocks", so real work between blocks restores the hook's
-        # full budget instead of letting a cumulative count silently retire it.
-        stop_blocks = 0
-        # Record assistant + its tool_results together, only now that both exist —
-        # so a Ctrl-C mid-tool never persists a dangling tool_use to the transcript.
-        if session_id:
-            sessions.append_message(
-                session_id, assistant_msg, usage=response.usage)
-            sessions.append_message(session_id, tool_msg)
+
+def _execute_tool_blocks(
+    tool_blocks,
+    allowed,
+    session_id,
+    indent,
+    limits: session_limits.SessionLimits,
+) -> list[dict]:
+    """Execute one complete client-tool round and build its tool results.
+
+    Transcript persistence deliberately remains in ``agent_loop`` and is
+    deferred until every tool has returned successfully.
+    """
+    results = []
+    for block in tool_blocks:
+        ux.say(
+            f"{indent}→ {block.name}({ux.fmt_dict(block.input)})",
+            style=ux.S_CALL,
+        )
+        output = _run_tool(
+            block,
+            allowed,
+            session_id,
+            indent,
+            limits=limits,
+        )
+        result = ux.truncate(output, 300)
+        prefixed = f"{indent}← " + result.replace("\n", f"\n{indent}  ")
+        ux.say(prefixed, style=ux.S_RESULT)
+        results.append(
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            }
+        )
+    return results
 
 
 def _stop_gate(

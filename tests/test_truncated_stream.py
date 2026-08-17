@@ -228,25 +228,44 @@ def test_unknown_stop_reason_is_not_treated_as_completed(
     assert any(outcome_reason in line for line in said)
 
 
-def test_stop_sequence_is_a_normal_protocol_completion(monkeypatch):
+@pytest.mark.parametrize("reason", ["end_turn", "stop_sequence"])
+def test_normal_stop_is_persisted_before_completion_gate(
+    monkeypatch, tmp_path, reason
+):
     import types
     from minicc import query_engine as engine
 
+    monkeypatch.chdir(tmp_path)
+    recorded = []
+    monkeypatch.setattr(
+        engine.sessions,
+        "append_message",
+        lambda _sid, message, **_kwargs: recorded.append(message),
+    )
+
+    def accept_after_persistence(response, *_args, **_kwargs):
+        assert response.stop_reason == reason
+        assert [message["role"] for message in recorded] == ["assistant"]
+        return engine._StopDecision(engine._StopAction.ACCEPT)
+
+    monkeypatch.setattr(engine, "_stop_gate", accept_after_persistence)
     monkeypatch.setattr(
         engine,
         "llm_response",
         lambda *a, **k: types.SimpleNamespace(
-            stop_reason="stop_sequence",
+            stop_reason=reason,
             content=[types.SimpleNamespace(type="text", text="done")],
             usage=None,
         ),
     )
 
-    outcome = engine.agent_loop([{"role": "user", "content": "go"}])
+    outcome = engine.agent_loop(
+        [{"role": "user", "content": "go"}], session_id="s1"
+    )
 
     assert outcome == engine.TurnOutcome(
         engine.TurnStatus.COMPLETED,
-        "stop_sequence",
+        reason,
         "done",
         1,
     )
@@ -300,3 +319,68 @@ def test_tool_use_stop_without_tool_block_is_incomplete(monkeypatch):
     assert outcome.output_text == "no call supplied"
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert any("no tool call" in line for line in said)
+
+
+def test_tool_round_persistence_waits_for_every_result(monkeypatch, tmp_path):
+    """A tool round is recorded only after every result exists, then in the
+    provider-required assistant → user(tool_result) order."""
+    import types
+    from minicc import query_engine as engine
+
+    monkeypatch.chdir(tmp_path)
+    tool_blocks = [
+        types.SimpleNamespace(
+            type="tool_use", id=tool_id, name="fake", input={"id": tool_id}
+        )
+        for tool_id in ("t1", "t2")
+    ]
+    responses = iter(
+        [
+            types.SimpleNamespace(
+                stop_reason="tool_use", content=tool_blocks, usage=None
+            ),
+            types.SimpleNamespace(
+                stop_reason="end_turn",
+                content=[types.SimpleNamespace(type="text", text="done")],
+                usage=None,
+            ),
+        ]
+    )
+    recorded = []
+    executed = []
+
+    monkeypatch.setattr(engine, "llm_response", lambda *a, **k: next(responses))
+    monkeypatch.setattr(
+        engine.sessions,
+        "append_message",
+        lambda _sid, message, **_kwargs: recorded.append(message),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_stop_gate",
+        lambda *a, **k: engine._StopDecision(engine._StopAction.ACCEPT),
+    )
+
+    def run_tool(block, *_args, **_kwargs):
+        assert recorded == []
+        executed.append(block.id)
+        return f"result-{block.id}"
+
+    monkeypatch.setattr(engine, "_run_tool", run_tool)
+
+    outcome = engine.agent_loop(
+        [{"role": "user", "content": "go"}],
+        tools=[{"name": "fake", "input_schema": {}}],
+        session_id="s1",
+    )
+
+    assert outcome.completed
+    assert executed == ["t1", "t2"]
+    assert [message["role"] for message in recorded] == [
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [
+        block["tool_use_id"] for block in recorded[1]["content"]
+    ] == ["t1", "t2"]
